@@ -1,0 +1,7 @@
+{
+  "name": "magic-acm-context",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ]
+}
