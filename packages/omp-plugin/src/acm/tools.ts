@@ -640,7 +640,7 @@ function fixOrphanedToolUse(messages: AgentMessage[]): AgentMessage[] {
 
 // ── Extension factory ─────────────────────────────────────────
 
-export default function(pi: ExtensionAPI): void {
+export default function registerACMExtension(pi: ExtensionAPI): void {
  const zod = pi.zod;
  /** Per-extension-instance refresh state (avoids cross-instance sharing on hot reload). */
  const contextRefresh = new ContextRefreshRegistry();
