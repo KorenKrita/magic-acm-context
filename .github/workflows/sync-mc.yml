@@ -1,12 +1,7 @@
-name: Sync Magic Context Upstream
+name: Sync Upstream (MC + ACM)
 
 on:
-  # Triggered by magic-context repo via repository_dispatch
-  repository_dispatch:
-    types: [mc-upstream-updated]
-  # Manual trigger
   workflow_dispatch:
-  # Or schedule daily check
   schedule:
     - cron: "0 8 * * *"
 
@@ -23,17 +18,22 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Clone magic-context upstream
+      - name: Clone upstream repos
         run: |
           git clone --depth=1 --branch master https://github.com/KorenKrita/magic-context.git /tmp/magic-context
+          git clone --depth=1 https://github.com/KorenKrita/pi-context.git /tmp/pi-context
+          git clone --depth=1 https://github.com/KorenKrita/omp-context.git /tmp/omp-context
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Run sync script
+      - name: Sync MC packages
         run: ./scripts/sync-mc.sh /tmp/magic-context
+
+      - name: Sync ACM code
+        run: ./scripts/sync-acm.sh /tmp/pi-context /tmp/omp-context
 
       - name: Check for changes
         id: changes
@@ -52,13 +52,16 @@ jobs:
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "sync: update MC packages from magic-context"
-          branch: auto/sync-mc
-          title: "sync: update MC packages from magic-context"
+          commit-message: "sync: update from upstream (MC + ACM)"
+          branch: auto/sync-upstream
+          title: "sync: update from upstream (MC + ACM)"
           body: |
-            Automated sync from [magic-context](https://github.com/KorenKrita/magic-context) `feat/omp-adapter` branch.
+            Daily automated sync from upstream repos:
+            - [magic-context](https://github.com/KorenKrita/magic-context) `master`
+            - [pi-context](https://github.com/KorenKrita/pi-context) `main`
+            - [omp-context](https://github.com/KorenKrita/omp-context) `main`
 
-            ACM glue code (import + registration) has been re-injected automatically.
+            ACM glue code (import + registration + prompt.ts) is preserved automatically.
 
             Please verify:
             - [ ] `bun install`
