@@ -246,7 +246,7 @@ function getMsgContent(entry: SessionEntry, verbose: boolean): string {
   let toolCallsText = "";
   if (msg.role === "assistant" && Array.isArray(msg.content)) {
    const toolCalls = msg.content.filter(
-    (c): c is ToolCall => c.type === "toolCall",
+    (c: AssistantContentPart): c is ToolCall => c.type === "toolCall",
    );
    toolCallsText = toolCalls
     .filter((tc: ToolCall) => verbose || !INTERNAL_TOOLS.has(tc.name))
@@ -595,13 +595,13 @@ function fixOrphanedToolUse(messages: AgentMessage[]): AgentMessage[] {
 
  // Pass 2: Inject synthetic toolResults for orphaned tool_use blocks
  // (assistant has tool_use but no subsequent toolResult with matching ID).
- // Skip error/aborted assistants — the provider's transformMessages strips
- // them entirely, so injecting a synthetic result here would create an
- // orphaned toolResult referencing a tool_use that never reaches the API.
+ // Skip error/aborted assistants — pi-ai's transformMessages strips them
+ // entirely, so injecting a synthetic result here would create an orphaned
+ // toolResult referencing a tool_use that never reaches the API.
  for (let i = 0; i < result.length; i++) {
   const msg = result[i];
   if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
-  if ((msg as any).stopReason === "error" || (msg as any).stopReason === "aborted") continue;
+  if (msg.stopReason === "error" || msg.stopReason === "aborted") continue;
 
   const toolUseIds: { id: string; name: string }[] = [];
   for (const block of msg.content as unknown[]) {
@@ -644,7 +644,7 @@ function fixOrphanedToolUse(messages: AgentMessage[]): AgentMessage[] {
 
 // ── Extension factory ─────────────────────────────────────────
 
-export default function registerACMExtension(pi: ExtensionAPI): void {
+export default function(pi: ExtensionAPI): void {
  const zod = pi.zod;
  /** Per-extension-instance refresh state (avoids cross-instance sharing on hot reload). */
  const contextRefresh = new ContextRefreshRegistry();

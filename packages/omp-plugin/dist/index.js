@@ -155029,6 +155029,13 @@ function setSessionWorkMetrics(db, sessionId, newWorkTokens, totalInputTokens) {
          SET new_work_tokens = ?, total_input_tokens = ?
          WHERE session_id = ?`).run(Math.max(0, Math.floor(newWorkTokens)), Math.max(0, Math.floor(totalInputTokens)), sessionId);
 }
+function getSessionWorkMetrics(db, sessionId) {
+  const row = db.prepare("SELECT new_work_tokens, total_input_tokens FROM session_meta WHERE session_id = ?").get(sessionId);
+  return {
+    newWorkTokens: typeof row?.new_work_tokens === "number" ? row.new_work_tokens : 0,
+    totalInputTokens: typeof row?.total_input_tokens === "number" ? row.total_input_tokens : 0
+  };
+}
 // ../plugin/src/features/magic-context/storage-meta-session.ts
 import { Buffer as Buffer3 } from "buffer";
 
@@ -157977,7 +157984,8 @@ function registerCtxAugCommand(pi, config) {
       const branch = ctx.sessionManager.getBranch();
       const lastEntryId = branch.length > 0 ? branch[branch.length - 1]?.id : "unknown";
       const sessionLabel = `pi-session-${lastEntryId}`;
-      if (!config) {
+      const currentConfig = typeof config === "function" ? config(ctx) : config;
+      if (!currentConfig) {
         ctx.ui.notify("/ctx-aug: Sidekick is not configured. Add `sidekick.model` to your magic-context.jsonc to enable this command.", "warning");
         return;
       }
@@ -157989,20 +157997,20 @@ function registerCtxAugCommand(pi, config) {
         ctx.ui.notify("\uD83D\uDD0D Preparing augmentation\u2026 2-10s depending on your sidekick provider.", "info");
       }
       sessionLog(sessionLabel, "/ctx-aug: spawning sidekick", {
-        model: config.model
+        model: currentConfig.model
       });
       const projectIdentity = resolveProjectIdentity(ctx.cwd);
       sessionLog(sessionLabel, "/ctx-aug: project identity", projectIdentity);
       const result = await runner.run({
         agent: "sidekick",
-        systemPrompt: withContentLanguageDirective(config.systemPrompt ?? SIDEKICK_SYSTEM_PROMPT, config.language),
+        systemPrompt: withContentLanguageDirective(currentConfig.systemPrompt ?? SIDEKICK_SYSTEM_PROMPT, currentConfig.language),
         userMessage: prompt,
-        model: config.model,
-        fallbackModels: config.fallbackModels,
-        timeoutMs: config.timeoutMs ?? 30000,
+        model: currentConfig.model,
+        fallbackModels: currentConfig.fallbackModels,
+        timeoutMs: currentConfig.timeoutMs ?? 30000,
         cwd: ctx.cwd,
         signal: ctx.signal,
-        thinkingLevel: config.thinking_level,
+        thinkingLevel: currentConfig.thinking_level,
         accountingSessionId: sessionLabel,
         accountingSubagent: "sidekick"
       });
@@ -173232,6 +173240,10 @@ var MagicContextConfigSchema = exports_external.object({
   }).describe("Embedding provider configuration"),
   temporal_awareness: exports_external.boolean().default(true).describe('Inject wall-clock gap markers (<!-- +Xm -->) between user messages where > 5 min elapsed since the previous message, and add start/end date attributes on compartments. Gives the agent a sense of session pacing and "how long ago" across multi-day sessions. Graduated from experimental.temporal_awareness; default: true (set false to opt out).'),
   keep_subagents: exports_external.boolean().default(false).describe("Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection \u2014 their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect."),
+  todowrite: exports_external.object({
+    enabled: exports_external.boolean().default(true).describe("Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there."),
+    overlay: exports_external.boolean().default(true).describe("Pi only: show the persistent todo overlay above the editor while tasks are active.")
+  }).default({ enabled: true, overlay: true }).describe("Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart."),
   smart_drops: exports_external.boolean().default(false).describe("Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 5), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart."),
   caveman_text_compression: exports_external.object({
     enabled: exports_external.boolean().default(false).describe("Apply deterministic caveman-style text compression to old conversation text. Active for primary sessions when enabled; never for subagents. Compresses user/assistant text in oldest-first tiers: ultra (oldest 20%), full, lite, untouched (newest 40%)."),
@@ -176771,9 +176783,11 @@ import path7 from "path";
 import { promisify } from "util";
 var execFileAsync = promisify(execFile);
 var GIT_TIMEOUT_MS2 = 1e4;
+var defaultExecFileForVerificationPaths = async (file2, args, options) => await execFileAsync(file2, [...args], options);
+var execFileForVerificationPaths = defaultExecFileForVerificationPaths;
 async function runGit(cwd, args) {
   try {
-    const result = await execFileAsync("git", [...args], {
+    const result = await execFileForVerificationPaths("git", args, {
       cwd,
       timeout: GIT_TIMEOUT_MS2,
       maxBuffer: 16 * 1024 * 1024,
@@ -178369,7 +178383,9 @@ function requestValidatedAddress(validation, candidate, options) {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         bytes += buf.byteLength;
         if (bytes > options.bodyLimitBytes) {
-          request2.destroy(new SmartNoteNetworkError("SMART_NOTE_NETWORK: response body too large"));
+          reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: response body too large"));
+          response.destroy();
+          request2.destroy();
           return;
         }
         chunks.push(buf);
@@ -178386,10 +178402,14 @@ function requestValidatedAddress(validation, candidate, options) {
         resolve({ status, body: Buffer.concat(chunks).toString("utf8") });
       });
     });
-    const onAbort = () => request2.destroy(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted"));
+    const onAbort = () => {
+      reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted"));
+      request2.destroy();
+    };
     options.signal.addEventListener("abort", onAbort, { once: true });
     request2.on("timeout", () => {
-      request2.destroy(new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out"));
+      reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out"));
+      request2.destroy();
     });
     request2.on("error", (error51) => {
       options.signal.removeEventListener("abort", onAbort);
@@ -184712,6 +184732,7 @@ function registerCtxDreamCommand(pi, deps) {
         projectDir: deps.projectDir,
         projectIdentity: deps.projectIdentity
       };
+      const dreamerEnabled = deps.resolveDreamerEnabled?.(ctx) ?? deps.dreamerEnabled;
       deps.onProjectSeen?.(project.projectIdentity);
       const requested = typeof args === "string" ? args.trim() : String(args ?? "").trim();
       let task;
@@ -184731,7 +184752,7 @@ Unknown task "${requested}".`,
         }
         task = requested;
       }
-      if (deps.dreamerEnabled === false) {
+      if (dreamerEnabled === false) {
         sendCtxStatusMessage(pi, {
           title: "/ctx-dream",
           text: "## /ctx-dream\n\nDreamer is disabled for this project (`dreamer.disable=true`).",
@@ -184846,6 +184867,8 @@ function formatEmbedStatusText(coverage, drain) {
 }
 
 // src/commands/ctx-embed.ts
+var EMBED_PROGRESS_COMPARTMENT_STEP = 8;
+var EMBED_PROGRESS_MIN_INTERVAL_MS = 1e4;
 function clearPiEmbedSessionState(sessionId) {
   embedPauseBySession.delete(sessionId);
   const ctrl = embedRunStateBySession.get(sessionId);
@@ -184855,7 +184878,7 @@ function clearPiEmbedSessionState(sessionId) {
   }
   autoEmbedAttemptedBySession.delete(sessionId);
 }
-async function runEmbedDrain(db, projectIdentity, sessionId) {
+async function runEmbedDrain(db, projectIdentity, sessionId, options = {}) {
   const activeCtrl = embedRunStateBySession.get(sessionId);
   if (activeCtrl && !activeCtrl.signal.aborted) {
     return {
@@ -184871,10 +184894,46 @@ Embedding is already running for this session.`,
     prior.abort();
   const controller = new AbortController;
   embedRunStateBySession.set(sessionId, controller);
+  const now = options.now ?? Date.now;
+  let startEmitted = false;
+  let lastProgressEmbedded = 0;
+  let lastProgressAt = 0;
+  const emitProgress = (progress) => {
+    if (progress.total <= 0)
+      return;
+    if (!startEmitted) {
+      startEmitted = true;
+      lastProgressAt = now();
+      options.onStatus?.({
+        text: `## /ctx-embed
+
+Embedding ${progress.total} compartment${progress.total === 1 ? "" : "s"} of history\u2026`,
+        level: "info"
+      });
+      return;
+    }
+    if (progress.embedded <= 0 || progress.embedded >= progress.total)
+      return;
+    const currentTime = now();
+    const enoughCompartments = progress.embedded - lastProgressEmbedded >= EMBED_PROGRESS_COMPARTMENT_STEP;
+    const enoughTime = currentTime - lastProgressAt >= EMBED_PROGRESS_MIN_INTERVAL_MS && progress.embedded > lastProgressEmbedded;
+    if (!enoughCompartments && !enoughTime)
+      return;
+    lastProgressEmbedded = progress.embedded;
+    lastProgressAt = currentTime;
+    options.onStatus?.({
+      text: `## /ctx-embed
+
+Embedded ${progress.embedded}/${progress.total} compartments so far\u2026`,
+      level: "info"
+    });
+  };
   let outcome;
   try {
     outcome = await embedSessionCompartmentChunks(db, projectIdentity, sessionId, {
-      signal: controller.signal
+      signal: controller.signal,
+      onProgress: emitProgress,
+      ...options.batchSize !== undefined ? { batchSize: options.batchSize } : {}
     });
   } finally {
     if (embedRunStateBySession.get(sessionId) === controller) {
@@ -184947,6 +185006,7 @@ No active Pi session is available.`,
         projectDir: deps.projectDir,
         projectIdentity: deps.projectIdentity
       };
+      const memoryEnabled = deps.resolveMemoryEnabled?.(ctx) ?? deps.memoryEnabled;
       const sub = args.trim().toLowerCase();
       if (sub === "pause") {
         embedPauseBySession.add(sessionId);
@@ -184963,7 +185023,7 @@ Paused at ${cov.session.embedded}/${cov.session.total} compartments embedded.`,
         });
         return;
       }
-      if (deps.memoryEnabled === false) {
+      if (memoryEnabled === false) {
         sendCtxStatusMessage(pi, {
           title: "/ctx-embed",
           text: `## /ctx-embed
@@ -184975,7 +185035,12 @@ Memory is disabled for this project, so there is no semantic embedding to backfi
       }
       await ensureProjectRegisteredFromPiDirectory(project.projectDir, deps.db);
       if (sub === "start") {
-        const { text, level } = await runEmbedDrain(deps.db, project.projectIdentity, sessionId);
+        const { text, level } = await runEmbedDrain(deps.db, project.projectIdentity, sessionId, {
+          onStatus: (status) => sendCtxStatusMessage(pi, {
+            title: "/ctx-embed",
+            ...status
+          })
+        });
         sendCtxStatusMessage(pi, { title: "/ctx-embed", text, level });
         return;
       }
@@ -188008,6 +188073,11 @@ function renderMemoryBlockV2(memories, wrapper = "project-memory", renderOptions
 `);
 }
 
+// ../plugin/src/hooks/magic-context/sentinel.ts
+function modelAcceptsEmptyContent(providerID) {
+  return providerID === "anthropic";
+}
+
 // ../plugin/src/hooks/magic-context/supersession-reclaim.ts
 var TODOWRITE_KEEP = 1;
 var CTX_REDUCE_KEEP = 5;
@@ -190508,8 +190578,8 @@ function applyPiHeuristicCleanup(sessionId, db, targets, piMessages, config2, pr
       sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
     }
   }
-  const staleReduce = collectStaleReduceCallIds(piMessages, buildMessageIdToMaxTagFromTargets(targets), toolAgeCutoff, resolveStableId);
-  if (staleReduce.composite.size > 0 || staleReduce.bareCallIds.size > 0) {
+  const staleReduce = config2.staleReduceStripEnabled ? collectStaleReduceCallIds(piMessages, buildMessageIdToMaxTagFromTargets(targets), toolAgeCutoff, resolveStableId) : { composite: new Set, bareCallIds: new Set };
+  if (config2.staleReduceStripEnabled && (staleReduce.composite.size > 0 || staleReduce.bareCallIds.size > 0)) {
     db.transaction(() => {
       for (const tag of tags) {
         if (tag.status !== "active")
@@ -191426,6 +191496,15 @@ function findCompartmentBoundaryForSnapshot(markers) {
     return null;
   return markers.lastBaselineEndMessageId;
 }
+function resolveRenderedCompartmentBoundary(compartments, boundaryId) {
+  if (!boundaryId)
+    return { endMessageId: null, ordinal: null };
+  const boundary = compartments.find((compartment) => compartment.endMessageId === boundaryId);
+  return {
+    endMessageId: boundaryId,
+    ordinal: typeof boundary?.endMessage === "number" ? boundary.endMessage : null
+  };
+}
 function prependM0M1Messages(piMessages, m0, m1) {
   const firstTimestamp = piMessages[0]?.timestamp;
   const baseTimestamp = typeof firstTimestamp === "number" ? firstTimestamp : Date.now();
@@ -191555,6 +191634,7 @@ function injectM0M1Pi(state, db, piMessages, entryIds, recomputeM1ThisPass = fal
     }
   }
   const boundaryId = findCompartmentBoundaryForSnapshot(markers);
+  const renderedBoundary = resolveRenderedCompartmentBoundary(currentCompartments, boundaryId);
   const skippedVisibleMessages = boundaryId ? trimPiMessagesToBoundary(piMessages, entryIds, boundaryId) : 0;
   prependM0M1Messages(piMessages, m0, m1);
   sessionLog(state.sessionId, `injected m[0]/m[1] into Pi messages (${m0.length} + ${m1.length} bytes, materialized=${materialized}${decision.reason ? ` reason=${decision.reason}` : ""})`);
@@ -191571,6 +191651,8 @@ function injectM0M1Pi(state, db, piMessages, entryIds, recomputeM1ThisPass = fal
     m0Reason: decision.reason,
     m0Bytes: m0.length,
     m1Bytes: m1.length,
+    contentionExhausted,
+    renderedBoundary,
     syntheticLeadingCount: 2
   };
 }
@@ -194778,8 +194860,122 @@ function buildReferenceBlocks(args) {
 init_logger();
 var HISTORIAN_AGENT_NAME = "magic-context-historian";
 var DEFAULT_HISTORIAN_TIMEOUT_MS2 = 120000;
+var MAX_HISTORIAN_RETRIES = 2;
 var HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
 var lastHistorianAlertBySession = new Map;
+function getHistorianRetryBackoffMs(retryIndex) {
+  if (retryIndex === 0) {
+    return 2000 + Math.floor(Math.random() * 1001);
+  }
+  return 6000 + Math.floor(Math.random() * 2001);
+}
+function isTransientHistorianPromptError(message) {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("invalid request") || normalized.includes("bad request") || normalized.includes("unauthorized") || normalized.includes("forbidden") || normalized.includes("authentication") || normalized.includes("auth") || normalized.includes(" 400") || normalized.startsWith("400")) {
+    return false;
+  }
+  return [
+    "429",
+    "rate limit",
+    "timeout",
+    "econnreset",
+    "etimedout",
+    "503",
+    "502",
+    "500",
+    "overloaded"
+  ].some((token) => normalized.includes(token));
+}
+function isTransientHistorianRunFailure(result) {
+  if (result.reason === "abort")
+    return false;
+  if (result.reason === "timeout")
+    return true;
+  return isTransientHistorianPromptError(result.error);
+}
+function historianAbortResult(startedAt) {
+  return {
+    ok: false,
+    reason: "abort",
+    error: "pi subagent aborted by caller",
+    durationMs: Date.now() - startedAt
+  };
+}
+async function sleepWithAbort(ms, signal) {
+  if (signal?.aborted)
+    return true;
+  if (ms <= 0)
+    return signal?.aborted === true;
+  return new Promise((resolve3) => {
+    let settled = false;
+    let timeout;
+    const finish = (aborted2) => {
+      if (settled)
+        return;
+      settled = true;
+      if (timeout)
+        clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+      resolve3(aborted2);
+    };
+    const onAbort = () => finish(true);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    timeout = setTimeout(() => finish(false), ms);
+  });
+}
+async function runHistorianSubagentWithTransientRetries(args) {
+  const startedAt = Date.now();
+  if (args.options.signal?.aborted)
+    return historianAbortResult(startedAt);
+  for (let retryIndex = 0;retryIndex <= MAX_HISTORIAN_RETRIES; retryIndex += 1) {
+    const attemptStart = Date.now();
+    let result;
+    try {
+      result = await args.runner.run({
+        ...args.options,
+        fallbackModels: undefined
+      });
+    } catch (error51) {
+      const desc = describeError(error51);
+      result = {
+        ok: false,
+        reason: "model_failed",
+        error: desc.brief,
+        durationMs: Date.now() - attemptStart
+      };
+    }
+    if (result.ok)
+      return result;
+    if (result.reason === "abort" || args.options.signal?.aborted) {
+      return result.reason === "abort" ? result : historianAbortResult(startedAt);
+    }
+    const shouldRetry = retryIndex < MAX_HISTORIAN_RETRIES && isTransientHistorianRunFailure(result);
+    if (!shouldRetry)
+      return result;
+    const backoffMs2 = args.retryBackoffMs?.(retryIndex) ?? getHistorianRetryBackoffMs(retryIndex);
+    sessionLog(args.sessionId, `historian[${args.passLabel}] transient failure; retry ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES} on same model after ${backoffMs2}ms: ${result.error}`);
+    const aborted2 = await sleepWithAbort(backoffMs2, args.options.signal);
+    if (aborted2)
+      return historianAbortResult(startedAt);
+  }
+  return historianAbortResult(startedAt);
+}
+function buildHistorianFallbackChain(primaryModel, fallbackModels, fallbackModelId) {
+  const seen = new Set;
+  if (primaryModel)
+    seen.add(primaryModel);
+  const chain = [];
+  for (const candidate of fallbackModels ?? []) {
+    if (!candidate || seen.has(candidate))
+      continue;
+    seen.add(candidate);
+    chain.push({ modelId: candidate, kind: "configured" });
+  }
+  if (fallbackModelId && !seen.has(fallbackModelId)) {
+    chain.push({ modelId: fallbackModelId, kind: "session" });
+  }
+  return chain;
+}
 function parseSourceMessageTime(value) {
   if (typeof value === "number" && Number.isFinite(value))
     return value;
@@ -194828,11 +195024,14 @@ async function runPiHistorian(deps) {
     runner,
     historianModel,
     fallbackModels,
+    fallbackModelId,
     historianChunkTokens,
     boundarySnapshot: providedBoundarySnapshot,
     refreshBoundarySnapshot,
     currentContextLimit,
     historianTimeoutMs = DEFAULT_HISTORIAN_TIMEOUT_MS2,
+    signal,
+    retryBackoffMs,
     twoPass,
     thinkingLevel,
     memoryEnabled,
@@ -194846,7 +195045,9 @@ async function runPiHistorian(deps) {
     forceDrainQuota,
     forceKeepLastCompartment
   } = deps;
+  let issueNotified = false;
   const notify = async (message) => {
+    issueNotified = true;
     if (shouldSuppressHistorianAlert(sessionId)) {
       sessionLog(sessionId, "historian alert suppressed (cooldown)");
       return;
@@ -194947,6 +195148,7 @@ async function runPiHistorian(deps) {
       }
       drainReservation = reserve.reservation;
       const chunk = readSessionChunk(sessionId, historianChunkTokens, offset, eligibleEndOrdinal);
+      const forceKeepLastCompartmentForChunk = forceKeepLastCompartment === true && !chunk.hasMore;
       if (!chunk.text || chunk.messageCount === 0) {
         sessionLog(sessionId, `historian no-op: chunk empty after filtering (messageCount=${chunk.messageCount}, textLen=${chunk.text?.length ?? 0}) range=${offset}-${protectedTailStart - 1}`);
         if (boundarySnapshot.usagePercentage < 80) {
@@ -195036,67 +195238,87 @@ ${chunkText}`,
       retainDrainReservationForRetryThrottle = true;
       const historianSystemPrompt = withContentLanguageDirective(COMPARTMENT_AGENT_SYSTEM_PROMPT, deps.language, { preserveUserQuotes: true });
       const historianEditorSystemPrompt = withContentLanguageDirective(HISTORIAN_EDITOR_SYSTEM_PROMPT, deps.language, { preserveUserQuotes: true });
-      const firstResult = await runner.run({
-        agent: HISTORIAN_AGENT_NAME,
-        systemPrompt: historianSystemPrompt,
-        userMessage: prompt,
-        model: historianModel,
-        fallbackModels,
-        timeoutMs: historianTimeoutMs,
-        cwd: directory,
-        thinkingLevel,
-        onProgress: buildProgressLogger("first"),
-        accountingSessionId: sessionId,
-        accountingSubagent: "historian"
+      const firstResult = await runHistorianSubagentWithTransientRetries({
+        runner,
+        sessionId,
+        passLabel: "first",
+        retryBackoffMs,
+        options: {
+          agent: HISTORIAN_AGENT_NAME,
+          systemPrompt: historianSystemPrompt,
+          userMessage: prompt,
+          model: historianModel,
+          timeoutMs: historianTimeoutMs,
+          cwd: directory,
+          signal,
+          thinkingLevel,
+          onProgress: buildProgressLogger("first"),
+          accountingSessionId: sessionId,
+          accountingSubagent: "historian"
+        }
       });
       let validatedPass = await validateHistorianResult(firstResult, sessionId, chunk, priorCompartments, sequenceOffset);
       let validatedDraftText = firstResult.ok ? firstResult.assistantText : null;
       if (validatedPass.kind === "validation-failed") {
         sessionLog(sessionId, `historian: first pass validation failed, retrying with repair prompt: ${validatedPass.error}`);
         const repairPrompt = buildHistorianRepairPrompt(prompt, validatedPass.rawText, validatedPass.error, deps.language);
-        const repairResult = await runner.run({
-          agent: HISTORIAN_AGENT_NAME,
-          systemPrompt: historianSystemPrompt,
-          userMessage: repairPrompt,
-          model: historianModel,
-          fallbackModels,
-          timeoutMs: historianTimeoutMs,
-          cwd: directory,
-          thinkingLevel,
-          onProgress: buildProgressLogger("repair"),
-          accountingSessionId: sessionId,
-          accountingSubagent: "historian"
+        const repairResult = await runHistorianSubagentWithTransientRetries({
+          runner,
+          sessionId,
+          passLabel: "repair",
+          retryBackoffMs,
+          options: {
+            agent: HISTORIAN_AGENT_NAME,
+            systemPrompt: historianSystemPrompt,
+            userMessage: repairPrompt,
+            model: historianModel,
+            timeoutMs: historianTimeoutMs,
+            cwd: directory,
+            signal,
+            thinkingLevel,
+            onProgress: buildProgressLogger("repair"),
+            accountingSessionId: sessionId,
+            accountingSubagent: "historian"
+          }
         });
         validatedPass = await validateHistorianResult(repairResult, sessionId, chunk, priorCompartments, sequenceOffset);
         if (validatedPass.kind === "ok" && repairResult.ok) {
           validatedDraftText = repairResult.assistantText;
         }
       }
-      if (validatedPass.kind !== "ok" && (fallbackModels?.length ?? 0) > 0) {
-        const seen = new Set([historianModel].filter(Boolean));
-        for (const candidate of fallbackModels ?? []) {
-          if (!candidate || seen.has(candidate))
-            continue;
-          seen.add(candidate);
-          sessionLog(sessionId, `historian: escalating to configured fallback model ${candidate}`);
-          const fbResult = await runner.run({
-            agent: HISTORIAN_AGENT_NAME,
-            systemPrompt: historianSystemPrompt,
-            userMessage: prompt,
-            model: candidate,
-            fallbackModels: undefined,
-            timeoutMs: historianTimeoutMs,
-            cwd: directory,
-            thinkingLevel,
-            onProgress: buildProgressLogger("fallback"),
-            accountingSessionId: sessionId,
-            accountingSubagent: "historian"
+      const fallbackChain = buildHistorianFallbackChain(historianModel, fallbackModels, fallbackModelId);
+      if (validatedPass.kind !== "ok" && !(validatedPass.kind === "spawn-failed" && validatedPass.reason === "abort") && fallbackChain.length > 0) {
+        for (let i = 0;i < fallbackChain.length; i += 1) {
+          const candidate = fallbackChain[i];
+          sessionLog(sessionId, `historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.modelId}`);
+          const fbResult = await runHistorianSubagentWithTransientRetries({
+            runner,
+            sessionId,
+            passLabel: candidate.kind === "session" ? "fallback-session" : "fallback",
+            retryBackoffMs,
+            options: {
+              agent: HISTORIAN_AGENT_NAME,
+              systemPrompt: historianSystemPrompt,
+              userMessage: prompt,
+              model: candidate.modelId,
+              timeoutMs: historianTimeoutMs,
+              cwd: directory,
+              signal,
+              thinkingLevel,
+              onProgress: buildProgressLogger("fallback"),
+              accountingSessionId: sessionId,
+              accountingSubagent: "historian"
+            }
           });
           const fbPass = await validateHistorianResult(fbResult, sessionId, chunk, priorCompartments, sequenceOffset);
           if (fbPass.kind === "ok") {
             validatedPass = fbPass;
             if (fbResult.ok)
               validatedDraftText = fbResult.assistantText;
+            break;
+          }
+          if (fbPass.kind === "spawn-failed" && fbPass.reason === "abort") {
+            validatedPass = fbPass;
             break;
           }
         }
@@ -195115,17 +195337,24 @@ ${chunkText}`,
         const draftAssistantText = validatedDraftText ?? "";
         if (draftAssistantText.trim().length > 0) {
           sessionLog(sessionId, "historian two-pass: running editor on draft");
-          const editorResult = await runner.run({
-            agent: HISTORIAN_AGENT_NAME,
-            systemPrompt: historianEditorSystemPrompt,
-            userMessage: buildHistorianEditorPrompt(draftAssistantText),
-            model: historianModel,
-            timeoutMs: historianTimeoutMs,
-            cwd: directory,
-            thinkingLevel,
-            onProgress: buildProgressLogger("editor"),
-            accountingSessionId: sessionId,
-            accountingSubagent: "historian_editor"
+          const editorResult = await runHistorianSubagentWithTransientRetries({
+            runner,
+            sessionId,
+            passLabel: "editor",
+            retryBackoffMs,
+            options: {
+              agent: HISTORIAN_AGENT_NAME,
+              systemPrompt: historianEditorSystemPrompt,
+              userMessage: buildHistorianEditorPrompt(draftAssistantText),
+              model: historianModel,
+              timeoutMs: historianTimeoutMs,
+              cwd: directory,
+              signal,
+              thinkingLevel,
+              onProgress: buildProgressLogger("editor"),
+              accountingSessionId: sessionId,
+              accountingSubagent: "historian_editor"
+            }
           });
           const editorPass = await validateHistorianResult(editorResult, sessionId, chunk, priorCompartments, sequenceOffset);
           if (editorPass.kind === "ok") {
@@ -195137,7 +195366,6 @@ ${chunkText}`,
           }
         }
       }
-      const forceKeepLastCompartmentForChunk = forceKeepLastCompartment === true && !chunk.hasMore;
       const BOUNDARY_HEALING_SLACK = 2;
       const inEmergency = getOverflowState(db, sessionId).needsEmergencyRecovery;
       const emittedCompartments = validatedPass.compartments;
@@ -195339,7 +195567,7 @@ ${chunkText}`,
     const desc = describeError(error51);
     telemetry.failureReason = `exception: ${desc.brief}`;
     sessionLog(sessionId, `historian failure: source=exception ${desc.brief}${desc.stackHead ? ` stackHead="${desc.stackHead}"` : ""}`);
-    {
+    if (!issueNotified) {
       const failCount = incrementHistorianFailure(db, sessionId, desc.brief);
       await notify(buildHistorianFailureNotice(failCount, desc.brief));
     }
@@ -196898,6 +197126,7 @@ function applyForwardPressureFloor(trailingPercentage, trailingInputTokens, piUs
     inputTokens: Math.max(trailingInputTokens, forwardTokens)
   } : { percentage: trailingPercentage, inputTokens: trailingInputTokens };
 }
+var injectM0M1PiForRun = injectM0M1Pi;
 var DEFAULT_CLEAR_REASONING_AGE = 50;
 var PI_STABLE_ID_SCHEME = 1;
 var lastEmergencyNotificationAtMs = new Map;
@@ -197492,6 +197721,8 @@ function registerPiContextHandler(pi, baseOptions) {
       }
       const sessionMeta = sessionMetaForUsage;
       const modelKey = liveModelBySession.get(sessionId);
+      const providerId = typeof ctx.model?.provider === "string" ? ctx.model.provider : undefined;
+      const canUseEmptySentinels = modelAcceptsEmptyContent(providerId);
       if (usageContextLimit === undefined) {
         const modelWindow = ctx.model?.contextWindow ?? undefined;
         if (isSaneLimit(modelWindow)) {
@@ -197502,6 +197733,7 @@ function registerPiContextHandler(pi, baseOptions) {
         usagePercentage = usageInputTokens / usageContextLimit * 100;
       }
       ({ percentage: usagePercentage, inputTokens: usageInputTokens } = applyForwardPressureFloor(usagePercentage, usageInputTokens, piUsage?.tokens, usageContextLimit));
+      const realUsagePercentageBeforeEmergencyBump = usagePercentage;
       if (needsEmergencyBump) {
         sessionLog(sessionId, `transform: overflow recovery flag set \u2014 bumping percentage to 95% (detectedLimit=${usageContextLimit ?? "unknown"})`);
         usagePercentage = Math.max(usagePercentage, 95);
@@ -197572,7 +197804,7 @@ function registerPiContextHandler(pi, baseOptions) {
             sessionLog(sessionId, "EMERGENCY: historian wait completed (or timed out)");
           } catch {}
         }
-        if (emergencyRecoveryArmed && !inFlightHistorian.has(sessionId) && !hasEligiblePiCompartmentHistory(options.db, sessionId)) {
+        if (emergencyRecoveryArmed && realUsagePercentageBeforeEmergencyBump < FORCE_MATERIALIZATION_PERCENTAGE && !inFlightHistorian.has(sessionId) && !hasEligiblePiCompartmentHistory(options.db, sessionId)) {
           try {
             clearEmergencyRecovery(options.db, sessionId);
             sessionLog(sessionId, "EMERGENCY: disarming recovery \u2014 no eligible pre-tail history to compact (would otherwise loop at 95%)");
@@ -197597,7 +197829,6 @@ function registerPiContextHandler(pi, baseOptions) {
         projectIdentity,
         projectDirectory,
         messages: event.messages,
-        isSubagent: sessionMeta.isSubagent,
         smartDrops: options.smartDrops === true,
         protectedTags: options.protectedTags ?? 20,
         heuristics: options.heuristics,
@@ -197628,9 +197859,11 @@ function registerPiContextHandler(pi, baseOptions) {
         reasoningClearing: {
           clearReasoningAge: options.heuristics?.clearReasoningAge ?? DEFAULT_CLEAR_REASONING_AGE
         },
+        canUseEmptySentinels,
         temporalAwareness: options.injection?.temporalAwareness === true,
         appendCompaction: resolvePiAppendCompaction(ctx),
-        readBranchEntries: resolvePiReadBranchEntries(ctx)
+        readBranchEntries: resolvePiReadBranchEntries(ctx),
+        isSubagent: sessionMeta.isSubagent
       });
       const piDecisionSnapshotNewestAssistant = branchEntries === null ? undefined : findNewestPiAssistantEntryId(branchEntries);
       if (result.bustedThisPass && piDecisionSnapshotNewestAssistant !== undefined) {
@@ -197648,6 +197881,7 @@ function registerPiContextHandler(pi, baseOptions) {
       }
       if (options.historian) {
         maybeFireHistorian({
+          pi,
           ctx,
           sessionId,
           db: options.db,
@@ -197840,8 +198074,12 @@ function resolveHistoryBudgetTokensForPi(args) {
 }
 function startPiCompartmentLeaseRenewal(db, sessionId, holderId) {
   return setInterval(() => {
-    if (!renewCompartmentLease(db, sessionId, holderId)) {
-      sessionLog(sessionId, "compartment lease renewal failed; publish will be skipped if holder is stale");
+    try {
+      if (!renewCompartmentLease(db, sessionId, holderId)) {
+        sessionLog(sessionId, "compartment lease renewal failed; publish will be skipped if holder is stale");
+      }
+    } catch (err) {
+      sessionLog(sessionId, `compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`);
     }
   }, COMPARTMENT_LEASE_RENEWAL_MS);
 }
@@ -197884,6 +198122,7 @@ function sendPiIgnoredNotification(ctx, message) {
 }
 function spawnPiHistorianRun(args) {
   const {
+    pi,
     ctx,
     sessionId,
     db,
@@ -197892,7 +198131,8 @@ function spawnPiHistorianRun(args) {
     unregister,
     boundarySnapshot,
     refreshBoundarySnapshot,
-    currentContextLimit
+    currentContextLimit,
+    fallbackModelId
   } = args;
   const holderId = crypto3.randomUUID();
   const runPromise = (async () => {
@@ -197901,12 +198141,13 @@ function spawnPiHistorianRun(args) {
       sessionLog(sessionId, "historian skipped: compartment lease held by another process");
       return;
     }
+    if (isWrapupInProgress(db, sessionId)) {
+      sessionLog(sessionId, "historian skipped: /ctx-wrapup became active");
+      releaseCompartmentLease(db, sessionId, holderId);
+      return;
+    }
     const renewal = startPiCompartmentLeaseRenewal(db, sessionId, holderId);
     try {
-      if (isWrapupInProgress(db, sessionId)) {
-        sessionLog(sessionId, "historian skipped: /ctx-wrapup became active");
-        return;
-      }
       await runPiHistorian({
         db,
         sessionId,
@@ -197917,6 +198158,7 @@ function spawnPiHistorianRun(args) {
         runner: historian.runner,
         historianModel: historian.model,
         fallbackModels: historian.fallbackModels,
+        fallbackModelId,
         historianChunkTokens: historian.historianChunkTokens,
         boundarySnapshot,
         refreshBoundarySnapshot,
@@ -197929,6 +198171,17 @@ function spawnPiHistorianRun(args) {
         userMemoriesEnabled: historian.userMemoriesEnabled,
         language: historian.language,
         compartmentLeaseHolderId: holderId,
+        notifyIssue: (text) => {
+          if (!isContextHandlerSessionActive(sessionId)) {
+            sessionLog(sessionId, "historian failure notice skipped after session context cleared");
+            return;
+          }
+          sendCtxStatusMessage(pi, {
+            title: "Magic Context",
+            text,
+            level: "warning"
+          });
+        },
         onPublished: () => {
           const sessionStillActive = isContextHandlerSessionActive(sessionId);
           try {
@@ -197994,7 +198247,7 @@ function maybeFireHistorian(args) {
     let usageSource;
     usageContextLimit = isSaneLimit(piUsage?.contextWindow) ? piUsage.contextWindow : undefined;
     if (usageContextLimit === undefined && isSaneLimit(ctx.model?.contextWindow ?? undefined)) {
-      usageContextLimit = ctx.model.contextWindow;
+      usageContextLimit = ctx.model.contextWindow ?? undefined;
     }
     try {
       const overflowState = getOverflowState(db, sessionId);
@@ -198078,6 +198331,7 @@ function maybeFireHistorian(args) {
 
 Historian previously failed ${failureState.failureCount} time(s), so Magic Context is retrying history comparting immediately after restart.`);
         spawnPiHistorianRun({
+          pi: args.pi,
           ctx,
           sessionId,
           db,
@@ -198086,7 +198340,8 @@ Historian previously failed ${failureState.failureCount} time(s), so Magic Conte
           unregister,
           boundarySnapshot,
           refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
-          currentContextLimit: boundaryContextLimit
+          currentContextLimit: boundaryContextLimit,
+          fallbackModelId: modelKey
         });
         return;
       }
@@ -198108,6 +198363,7 @@ Historian previously failed ${failureState.failureCount} time(s), so Magic Conte
     triggered = true;
     sessionLog(sessionId, `historian trigger fired (reason=${trigger.reason ?? "unknown"}) usage=${usage.percentage.toFixed(1)}% \u2014 spawning subagent`);
     spawnPiHistorianRun({
+      pi: args.pi,
       ctx,
       sessionId,
       db,
@@ -198119,7 +198375,8 @@ Historian previously failed ${failureState.failureCount} time(s), so Magic Conte
         triggerBoundarySnapshot: trigger.boundarySnapshot
       }),
       refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
-      currentContextLimit: boundaryContextLimit
+      currentContextLimit: boundaryContextLimit,
+      fallbackModelId: modelKey
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -198128,6 +198385,14 @@ Historian previously failed ${failureState.failureCount} time(s), so Magic Conte
     if (!triggered)
       unregister();
   }
+}
+function pendingPiMarkerCoveredByRenderedBoundary(pending, injection) {
+  if (!injection || injection.contentionExhausted)
+    return false;
+  const boundary = injection.renderedBoundary;
+  if (pending.endMessageId === boundary.endMessageId)
+    return true;
+  return boundary.ordinal !== null && pending.ordinal <= boundary.ordinal;
 }
 async function runPipeline(args) {
   let executedWorkThisPass = false;
@@ -198142,6 +198407,7 @@ async function runPipeline(args) {
   let emergency = false;
   let autoReclaimDidMutateThisPass = false;
   let suppressDeferredHistoryDrain = false;
+  let deferredMaterializationConsumedThisPass = false;
   let casLost = false;
   const deferredHistoryWasPendingAtPassStart = deferredHistoryRefreshSessions.has(args.sessionId);
   if (args.temporalAwareness) {
@@ -198164,6 +198430,8 @@ async function runPipeline(args) {
     return findLatestUserMessageIdPi(args.messages, ids)?.messageId ?? null;
   })();
   const alreadyRanHeuristicsThisTurn = currentTurnId !== null && lastHeuristicsTurnIdBySession.get(args.sessionId) === currentTurnId;
+  const sessionMetaForAvailability = getOrCreateSessionMeta(args.db, args.sessionId);
+  const ctxReduceCallable = !sessionMetaForAvailability.isSubagent;
   const canConsumeDeferredLate = args.schedulerDecision === "execute" || args.forceMaterialization === true || args.contextUsage.percentage >= FORCE_MATERIALIZATION_PERCENTAGE;
   const deferredMaterializeEligible = canConsumeDeferredLate && deferredMaterializationSessions.has(args.sessionId);
   const piHardSignals = args.injection ? (() => {
@@ -198188,7 +198456,10 @@ async function runPipeline(args) {
     historyBudgetTokens: args.injection.historyBudgetTokens,
     hardSignals: piHardSignals
   }, args.db, getCompartments(args.db, args.sessionId)).value : false;
-  const shouldRunHeuristics = args.heuristics !== undefined && (args.forceMaterialization === true || hasPendingMaterialization(args.sessionId) || deferredMaterializeEligible || m0HardFoldThisPass || args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn);
+  const historianRunning = inFlightHistorian.has(args.sessionId);
+  const bypassHistorianGate = args.forceMaterialization === true || m0HardFoldThisPass;
+  const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
+  const shouldRunHeuristics = args.heuristics !== undefined && (!historianRunning || bypassHistorianGate) && (args.forceMaterialization === true || hasPendingMaterializeSignal || deferredMaterializeEligible || m0HardFoldThisPass || args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn);
   const entryFingerprintByMessageId = buildEntryFingerprintMap(args.messages, stableIdResolver);
   adoptPiFallbackTags(args.db, args.sessionId, args.tagger, entryFingerprintByMessageId, {
     messages: args.messages,
@@ -198203,7 +198474,6 @@ async function runPipeline(args) {
     sessionLog(args.sessionId, `stable-id scheme cutover complete \u2014 stamped scheme=${PI_STABLE_ID_SCHEME}`);
   }
   const tTag = performance.now();
-  const ctxReduceCallable = !args.isSubagent;
   const { targets } = tagTranscript(args.sessionId, transcript, args.tagger, args.db, {
     skipPrefixInjection: !ctxReduceCallable,
     entryFingerprintByMessageId
@@ -198223,14 +198493,13 @@ async function runPipeline(args) {
   } catch (err) {
     sessionLog(args.sessionId, `commit-detect failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
   }
-  const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
   const deferredMaterializationWasPending = deferredMaterializationSessions.has(args.sessionId);
   const deferredHistoryRefreshWasPending = deferredHistoryWasPendingAtPassStart;
   const pendingOps = getPendingOps(args.db, args.sessionId);
   const baseShouldApplyPendingOps = args.schedulerDecision === "execute" || args.forceMaterialization || hasPendingMaterializeSignal || m0HardFoldThisPass;
   const deferredMaterialize = canConsumeDeferredLate && deferredMaterializationWasPending;
   const deferredHistoryRefresh = canConsumeDeferredLate && deferredHistoryRefreshWasPending;
-  const shouldApplyPendingOps = baseShouldApplyPendingOps || deferredMaterialize;
+  const shouldApplyPendingOps = (baseShouldApplyPendingOps || deferredMaterialize) && (!historianRunning || bypassHistorianGate);
   if (shouldApplyPendingOps) {
     const applyReason = hasPendingMaterializeSignal ? "explicit_flush" : deferredMaterialize ? "deferred_publication" : args.forceMaterialization ? "force_materialization" : m0HardFoldThisPass && args.schedulerDecision !== "execute" ? `m0_hard_fold (drain folded into known m[0] bust, scheduler=${args.schedulerDecision})` : `scheduler_execute (scheduler=${args.schedulerDecision})`;
     sessionLog(args.sessionId, `pending ops WILL APPLY \u2014 reason=${applyReason}, pendingOps=${pendingOps.length}, context=${args.contextUsage.percentage.toFixed(1)}%`);
@@ -198291,14 +198560,16 @@ async function runPipeline(args) {
       sessionLog(args.sessionId, `reasoning replay failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  try {
-    const tags = getTagsByNumbers(args.db, args.sessionId, targetTagNumbers);
-    const replayed = replayCavemanCompression(args.sessionId, args.db, targets, tags);
-    if (replayed > 0) {
-      sessionLog(args.sessionId, `caveman replay: ${replayed} tags re-compressed from source`);
+  if (args.heuristics?.caveman?.enabled && !args.isSubagent) {
+    try {
+      const tags = getTagsByNumbers(args.db, args.sessionId, targetTagNumbers);
+      const replayed = replayCavemanCompression(args.sessionId, args.db, targets, tags);
+      if (replayed > 0) {
+        sessionLog(args.sessionId, `caveman replay: ${replayed} tags re-compressed from source`);
+      }
+    } catch (err) {
+      sessionLog(args.sessionId, `caveman replay failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
     }
-  } catch (err) {
-    sessionLog(args.sessionId, `caveman replay failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
   }
   let heuristicsExecuted = false;
   let heuristicsResult = null;
@@ -198317,11 +198588,12 @@ async function runPipeline(args) {
       const tHeuristic = performance.now();
       heuristicsResult = applyPiHeuristicCleanup(args.sessionId, args.db, targets, args.messages, {
         protectedTags: args.protectedTags,
+        staleReduceStripEnabled: args.canUseEmptySentinels,
         emergency: args.forceMaterialization === true && args.emergencyCeilingTokens !== undefined && args.emergencyCeilingTokens > 0 ? {
           currentTotalInputTokens: args.contextUsage.inputTokens,
           ceilingTokens: args.emergencyCeilingTokens
         } : undefined,
-        caveman: args.heuristics.caveman
+        caveman: args.isSubagent ? undefined : args.heuristics.caveman
       }, activeTags, stableIdResolver);
       const heuristicMutationCount = heuristicsResult.droppedTools + heuristicsResult.deduplicatedTools + heuristicsResult.droppedInjections + heuristicsResult.droppedStaleReduceCalls + heuristicsResult.mutatedTextTags;
       droppedCount += heuristicsResult.droppedTools + heuristicsResult.deduplicatedTools + heuristicsResult.droppedInjections + heuristicsResult.droppedStaleReduceCalls + heuristicsResult.mutatedTextTags;
@@ -198344,7 +198616,7 @@ async function runPipeline(args) {
   if (deferredMaterialize && pendingOpsAppliedThisPass) {
     const fullPassSucceeded = shouldRunHeuristics ? heuristicsExecuted : true;
     if (fullPassSucceeded) {
-      consumeDeferredMaterialization(args.sessionId);
+      deferredMaterializationConsumedThisPass = consumeDeferredMaterialization(args.sessionId);
     }
   }
   if (args.reasoningClearing && shouldRunHeuristics) {
@@ -198461,7 +198733,7 @@ async function runPipeline(args) {
   if (args.injection) {
     try {
       const tInjection = performance.now();
-      injectionResult = injectM0M1Pi({
+      injectionResult = injectM0M1PiForRun({
         sessionId: args.sessionId,
         projectIdentity: args.projectIdentity,
         projectDirectory: args.projectDirectory,
@@ -198493,11 +198765,23 @@ async function runPipeline(args) {
     forceDiscovery: args.stableIdSchemeCutover === true
   });
   const deferredHistoryDrainEligible = historyWasConsumedThisPass && materializationSatisfiedThisPass && (deferredHistoryWasPendingAtPassStart || hasPendingMaterializeSignal) && !suppressDeferredHistoryDrain && !casLost;
+  let preserveDeferredMaterializationForMarkerDrain = false;
   if (deferredHistoryDrainEligible) {
     try {
       const pending = getPendingPiCompactionMarkerState(args.db, args.sessionId);
       if (!pending) {
-        consumeDeferredHistoryRefresh(args.sessionId);
+        if (injectionResult?.contentionExhausted === true) {
+          suppressDeferredHistoryDrain = true;
+          preserveDeferredMaterializationForMarkerDrain = true;
+          sessionLog(args.sessionId, "Pi deferred-history drain skipped: m[0]/m[1] used a contention fallback; preserving deferred signals");
+        } else {
+          consumeDeferredHistoryRefresh(args.sessionId);
+        }
+      } else if (!pendingPiMarkerCoveredByRenderedBoundary(pending, injectionResult)) {
+        suppressDeferredHistoryDrain = true;
+        preserveDeferredMaterializationForMarkerDrain = true;
+        const boundary = injectionResult?.renderedBoundary;
+        sessionLog(args.sessionId, `Pi compaction-marker drain skipped: pending ordinal ${pending.ordinal} is newer than rendered boundary ${boundary?.ordinal ?? "<none>"} endMessageId=${boundary?.endMessageId ?? "<none>"}; preserving deferred signals`);
       } else if (!args.appendCompaction || !args.readBranchEntries) {
         suppressDeferredHistoryDrain = true;
         sessionLog(args.sessionId, "Pi compaction-marker drain skipped: sessionManager appendCompaction/getBranch unavailable; preserving deferred-history signal");
@@ -198519,6 +198803,9 @@ async function runPipeline(args) {
     } catch (err) {
       sessionLog(args.sessionId, `Pi compaction-marker drain failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+  if (preserveDeferredMaterializationForMarkerDrain && deferredMaterializationConsumedThisPass) {
+    signalPiDeferredMaterialization(args.sessionId);
   }
   if (executedWorkThisPass) {
     try {
@@ -198887,7 +199174,7 @@ init_data_path();
 function historianResponseDumpDir(directory) {
   return getProjectMagicContextHistorianDir(directory);
 }
-var MAX_HISTORIAN_RETRIES = 2;
+var MAX_HISTORIAN_RETRIES2 = 2;
 async function runValidatedHistorianPass(args) {
   const firstRun = await runHistorianPrompt({
     ...args,
@@ -199028,7 +199315,7 @@ async function runHistorianPrompt(args) {
       });
       return { ok: false, error: "Historian could not create its child session." };
     }
-    for (let retryIndex = 0;retryIndex <= MAX_HISTORIAN_RETRIES; retryIndex += 1) {
+    for (let retryIndex = 0;retryIndex <= MAX_HISTORIAN_RETRIES2; retryIndex += 1) {
       try {
         await promptSyncWithModelSuggestionRetry(client, {
           path: { id: agentSessionId },
@@ -199043,17 +199330,17 @@ async function runHistorianPrompt(args) {
           fallbackModels: modelOverride ? undefined : fallbackModels,
           callContext: agentId === HISTORIAN_EDITOR_AGENT ? "historian:editor" : "historian"
         });
-        sessionLog(parentSessionId, `historian: prompt completed (attempt ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES + 1})`);
+        sessionLog(parentSessionId, `historian: prompt completed (attempt ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES2 + 1})`);
         break;
       } catch (error51) {
         const errorMsg = getErrorMessage(error51);
         sessionLog(parentSessionId, `historian: prompt attempt ${retryIndex + 1} failed: ${errorMsg}`);
-        const shouldRetry = retryIndex < MAX_HISTORIAN_RETRIES && isTransientHistorianPromptError(errorMsg);
+        const shouldRetry = retryIndex < MAX_HISTORIAN_RETRIES2 && isTransientHistorianPromptError2(errorMsg);
         if (!shouldRetry) {
           throw error51;
         }
-        const backoffMs2 = getHistorianRetryBackoffMs(retryIndex);
-        sessionLog(parentSessionId, `historian retry ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES} after ${backoffMs2}ms: ${errorMsg}`);
+        const backoffMs2 = getHistorianRetryBackoffMs2(retryIndex);
+        sessionLog(parentSessionId, `historian retry ${retryIndex + 1}/${MAX_HISTORIAN_RETRIES2} after ${backoffMs2}ms: ${errorMsg}`);
         await sleep(backoffMs2);
       }
     }
@@ -199146,13 +199433,13 @@ function parseModelOverride(modelId) {
   }
   return { providerID, modelID };
 }
-function getHistorianRetryBackoffMs(retryIndex) {
+function getHistorianRetryBackoffMs2(retryIndex) {
   if (retryIndex === 0) {
     return 2000 + Math.floor(Math.random() * 1001);
   }
   return 6000 + Math.floor(Math.random() * 2001);
 }
-function isTransientHistorianPromptError(message) {
+function isTransientHistorianPromptError2(message) {
   const normalized = message.toLowerCase();
   if (normalized.includes("invalid request") || normalized.includes("bad request") || normalized.includes("unauthorized") || normalized.includes("forbidden") || normalized.includes("authentication") || normalized.includes("auth") || normalized.includes(" 400") || normalized.startsWith("400")) {
     return false;
@@ -200297,7 +200584,7 @@ function registerStatusLine(pi, deps) {
     const sessionId = resolveSessionId3(ctx);
     if (sessionId)
       lastRenderedBySession.delete(sessionId);
-    ctx.ui.setWidget(STATUS_KEY, undefined);
+    ctx.ui.setStatus(STATUS_KEY, undefined);
   });
 }
 function updateStatusLine(ctx, deps, force = false) {
@@ -200308,7 +200595,7 @@ function updateStatusLine(ctx, deps, force = false) {
   if (!force && lastRenderedBySession.get(sessionId) === text)
     return;
   lastRenderedBySession.set(sessionId, text);
-  ctx.ui.setWidget(STATUS_KEY, [text], { placement: "belowEditor" });
+  ctx.ui.setStatus(STATUS_KEY, text);
 }
 function renderStatusText(ctx, db, sessionId) {
   const usage = ctx.getContextUsage?.();
@@ -200396,6 +200683,13 @@ function spawnPiRecompRun(args) {
 // src/commands/ctx-recomp.ts
 var confirmationBySession = new Map;
 var RECOMP_CONFIRMATION_WINDOW_MS = 60000;
+var RECOMP_USAGE = [
+  "Usage:",
+  "- `/ctx-recomp` \u2014 full rebuild from message 1 to the protected tail",
+  "- `/ctx-recomp <start>-<end>` \u2014 partial rebuild of a message range (e.g. `/ctx-recomp 1-11322`)",
+  "- `/ctx-recomp --upgrade` \u2014 upgrade legacy v1 compartments to v2 layout (Wave 3 runner)"
+].join(`
+`);
 function registerCtxRecompCommand(pi, deps) {
   pi.registerCommand("ctx-recomp", {
     description: "Rebuild Magic Context compartments from raw Pi session history",
@@ -200411,14 +200705,7 @@ No active Pi session is available.`,
         });
         return;
       }
-      if (!deps.historianModel) {
-        sendCtxStatusMessage(pi, {
-          title: "/ctx-recomp",
-          text: "## Magic Recomp\n\n/ctx-recomp is unavailable because `historian.model` is not configured.",
-          level: "error"
-        });
-        return;
-      }
+      const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
       const parsed = parseRecompArgs(args);
       if (parsed.kind === "error") {
         sendCtxStatusMessage(pi, {
@@ -200430,12 +200717,28 @@ ${parsed.message}`,
         });
         return;
       }
+      if (parsed.kind === "upgrade") {
+        sendCtxStatusMessage(pi, {
+          title: "/ctx-recomp",
+          text: executeRecompUpgradeStub(currentDeps.db, sessionId),
+          level: "info"
+        });
+        return;
+      }
+      if (!currentDeps.historianModel) {
+        sendCtxStatusMessage(pi, {
+          title: "/ctx-recomp",
+          text: "## Magic Recomp\n\n/ctx-recomp is unavailable because `historian.model` is not configured.",
+          level: "error"
+        });
+        return;
+      }
       const argsKey = parsed.kind === "partial" ? `${parsed.range.start}-${parsed.range.end}` : "";
       const now = Date.now();
       const confirmation = confirmationBySession.get(sessionId);
       const confirmed = confirmation !== undefined && now - confirmation.timestamp < RECOMP_CONFIRMATION_WINDOW_MS && confirmation.argsKey === argsKey;
       if (!confirmed) {
-        const warning = buildConfirmationWarning(deps.db, sessionId, parsed);
+        const warning = buildConfirmationWarning(currentDeps.db, sessionId, parsed);
         if (!warning.confirmable)
           confirmationBySession.delete(sessionId);
         else
@@ -200447,20 +200750,20 @@ ${parsed.message}`,
         });
         return;
       }
+      if (isWrapupInProgress(currentDeps.db, sessionId)) {
+        sendCtxStatusMessage(pi, {
+          title: "/ctx-recomp",
+          text: "## Magic Recomp\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try `/ctx-recomp` again.",
+          level: "warning"
+        });
+        return;
+      }
       if (isPiRecompInFlight(sessionId)) {
         sendCtxStatusMessage(pi, {
           title: "/ctx-recomp",
           text: `## Magic Recomp
 
 A recomp or upgrade is already running for this session in the background. Wait for it to finish, then try again.`,
-          level: "warning"
-        });
-        return;
-      }
-      if (isWrapupInProgress(deps.db, sessionId)) {
-        sendCtxStatusMessage(pi, {
-          title: "/ctx-recomp",
-          text: "## Magic Recomp\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try `/ctx-recomp` again.",
           level: "warning"
         });
         return;
@@ -200481,16 +200784,19 @@ Historian recomp started. Rebuilding compartments and facts from raw Pi session 
       spawnPiRecompRun({
         sessionId,
         provider: provider2,
-        onStatusChange: () => updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd }),
+        onStatusChange: () => updateStatusLine(ctx, {
+          db: currentDeps.db,
+          projectIdentity: ctx.cwd
+        }),
         work: async () => {
           const result = await executeContextRecompWithResult({
             client: createPiHistorianClient({
-              runner: deps.runner,
-              model: deps.historianModel,
-              systemPrompt: withContentLanguageDirective(COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT, deps.language, { preserveUserQuotes: true }),
-              fallbackModels: deps.historianFallbacks,
-              timeoutMs: deps.historianTimeoutMs,
-              thinkingLevel: deps.historianThinkingLevel,
+              runner: currentDeps.runner,
+              model: currentDeps.historianModel,
+              systemPrompt: withContentLanguageDirective(COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT, currentDeps.language, { preserveUserQuotes: true }),
+              fallbackModels: currentDeps.historianFallbacks,
+              timeoutMs: currentDeps.historianTimeoutMs,
+              thinkingLevel: currentDeps.historianThinkingLevel,
               directory: ctx.cwd,
               accountingSessionId: sessionId,
               notify: (text) => {
@@ -200501,26 +200807,26 @@ Historian recomp started. Rebuilding compartments and facts from raw Pi session 
                 });
               }
             }),
-            db: deps.db,
+            db: currentDeps.db,
             sessionId,
-            historianChunkTokens: deps.historianChunkTokens,
+            historianChunkTokens: currentDeps.historianChunkTokens,
             directory: ctx.cwd,
-            historianTimeoutMs: deps.historianTimeoutMs,
-            memoryEnabled: deps.memoryEnabled,
-            autoPromote: deps.autoPromote,
+            historianTimeoutMs: currentDeps.historianTimeoutMs,
+            memoryEnabled: currentDeps.memoryEnabled,
+            autoPromote: currentDeps.autoPromote,
             ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
-            fallbackModels: deps.historianFallbacks,
-            language: deps.language,
+            fallbackModels: currentDeps.historianFallbacks,
+            language: currentDeps.language,
             fallbackModelId: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined
           }, parsed.kind === "partial" ? { range: parsed.range } : {});
           if (result.published) {
             try {
-              clearEmergencyRecovery(deps.db, sessionId);
+              clearEmergencyRecovery(currentDeps.db, sessionId);
             } catch (recoveryError) {
               sessionLog(sessionId, `/ctx-recomp: clearEmergencyRecovery failed (continuing): ${describeError(recoveryError).brief}`);
             }
             try {
-              stagePiRecompMarker({ db: deps.db, sessionId, ctx });
+              stagePiRecompMarker({ db: currentDeps.db, sessionId, ctx });
             } catch (markerError) {
               sessionLog(sessionId, `/ctx-recomp: marker staging failed (recomp already published; continuing): ${describeError(markerError).brief}`);
             }
@@ -200541,11 +200847,15 @@ function parseRecompArgs(raw) {
   const trimmed = raw.trim();
   if (trimmed.length === 0)
     return { kind: "full" };
+  if (trimmed === "--upgrade")
+    return { kind: "upgrade" };
   const match = trimmed.match(/^(\d+)\s*-\s*(\d+)$/);
   if (!match) {
     return {
       kind: "error",
-      message: "Usage:\n- `/ctx-recomp` \u2014 full rebuild from message 1 to the protected tail\n- `/ctx-recomp <start>-<end>` \u2014 partial rebuild of a message range"
+      message: `Invalid /ctx-recomp arguments: \`${trimmed}\`.
+
+${RECOMP_USAGE}`
     };
   }
   const start = Number.parseInt(match[1], 10);
@@ -200558,6 +200868,21 @@ function parseRecompArgs(raw) {
       message: `End must be >= start (got ${start}-${end}).`
     };
   return { kind: "partial", range: { start, end } };
+}
+function executeRecompUpgradeStub(db, sessionId) {
+  const legacyCount = getCompartments(db, sessionId).filter((compartment) => compartment.legacy === 1).length;
+  if (legacyCount === 0) {
+    return `## Magic Recomp Upgrade
+
+Nothing to upgrade: this session has no legacy compartments.`;
+  }
+  return [
+    "## Magic Recomp Upgrade",
+    "",
+    `Found ${legacyCount} legacy compartment${legacyCount === 1 ? "" : "s"} for this session.`,
+    "The `--upgrade` flag is deprecated. Run `/ctx-session-upgrade` to upgrade this session."
+  ].join(`
+`);
 }
 function buildConfirmationWarning(db, sessionId, parsed) {
   const compartments = getCompartments(db, sessionId);
@@ -200838,11 +201163,22 @@ No active Pi session is available.`,
         });
         return;
       }
-      if (!deps.historianModel) {
+      const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
+      if (!currentDeps.historianModel) {
         sendCtxStatusMessage(pi, {
           title: "/ctx-session-upgrade",
           text: "## Session Upgrade\n\nUnavailable because `historian.model` is not configured.",
           level: "error"
+        });
+        return;
+      }
+      if (isWrapupInProgress(currentDeps.db, sessionId)) {
+        sendCtxStatusMessage(pi, {
+          title: "/ctx-session-upgrade",
+          text: `## Session Upgrade
+
+/ctx-wrapup is already compacting this session. Wait for it to finish, then try again.`,
+          level: "warning"
         });
         return;
       }
@@ -200856,37 +201192,27 @@ An upgrade or recomp is already running for this session in the background. Wait
         });
         return;
       }
-      if (isWrapupInProgress(deps.db, sessionId)) {
-        sendCtxStatusMessage(pi, {
-          title: "/ctx-session-upgrade",
-          text: `## Session Upgrade
-
-/ctx-wrapup is already compacting this session. Wait for it to finish, then try again.`,
-          level: "warning"
-        });
-        return;
-      }
-      const compartments = getCompartments(deps.db, sessionId);
+      const compartments = getCompartments(currentDeps.db, sessionId);
       const upgradableCount = compartments.filter((c) => c.legacy === 1 || !c.p1 || c.p1.trim() === "").length;
       const sessionMainModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-      const migrationEnabled = deps.memoryEnabled;
+      const migrationEnabled = currentDeps.memoryEnabled;
       const runMigration = async () => {
         if (!migrationEnabled) {
           return "Memory migration skipped (memory disabled).";
         }
         try {
           const outcome = await runPiMemoryMigration({
-            db: deps.db,
-            runner: deps.runner,
+            db: currentDeps.db,
+            runner: currentDeps.runner,
             primaryModel: sessionMainModel,
-            model: deps.historianModel,
-            fallbackModels: deps.historianFallbacks,
-            timeoutMs: deps.historianTimeoutMs,
-            thinkingLevel: deps.historianThinkingLevel,
+            model: currentDeps.historianModel,
+            fallbackModels: currentDeps.historianFallbacks,
+            timeoutMs: currentDeps.historianTimeoutMs,
+            thinkingLevel: currentDeps.historianThinkingLevel,
             directory: ctx.cwd,
             sessionId,
-            userMemoriesEnabled: deps.userMemoriesEnabled,
-            language: deps.language
+            userMemoriesEnabled: currentDeps.userMemoriesEnabled,
+            language: currentDeps.language
           });
           return outcome.summary;
         } catch (error51) {
@@ -200895,7 +201221,7 @@ An upgrade or recomp is already running for this session in the background. Wait
       };
       if (upgradableCount === 0) {
         const projectPath = resolveProjectIdentity(ctx.cwd);
-        const migrationPending = migrationEnabled && !isMemoryMigrationDone(deps.db, projectPath);
+        const migrationPending = migrationEnabled && !isMemoryMigrationDone(currentDeps.db, projectPath);
         if (!migrationPending) {
           sendCtxStatusMessage(pi, {
             title: "/ctx-session-upgrade",
@@ -200921,7 +201247,10 @@ Compartments are already current. Re-organizing project memories. This may take 
           provider: {
             readMessages: () => readPiSessionMessages(ctx)
           },
-          onStatusChange: () => updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd }),
+          onStatusChange: () => updateStatusLine(ctx, {
+            db: currentDeps.db,
+            projectIdentity: ctx.cwd
+          }),
           work: async () => {
             const summary = await runMigration();
             sendCtxStatusMessage(pi, {
@@ -200947,35 +201276,38 @@ Rebuilding compartments into the v2 format and re-organizing project memories. T
       spawnPiRecompRun({
         sessionId,
         provider: provider2,
-        onStatusChange: () => updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd }),
+        onStatusChange: () => updateStatusLine(ctx, {
+          db: currentDeps.db,
+          projectIdentity: ctx.cwd
+        }),
         work: async () => {
           const recompResult = await executeContextRecompWithResult({
             client: createPiHistorianClient({
-              runner: deps.runner,
-              model: deps.historianModel,
-              fallbackModels: deps.historianFallbacks,
-              timeoutMs: deps.historianTimeoutMs,
-              thinkingLevel: deps.historianThinkingLevel,
+              runner: currentDeps.runner,
+              model: currentDeps.historianModel,
+              fallbackModels: currentDeps.historianFallbacks,
+              timeoutMs: currentDeps.historianTimeoutMs,
+              thinkingLevel: currentDeps.historianThinkingLevel,
               directory: ctx.cwd,
               accountingSessionId: sessionId,
-              systemPrompt: withContentLanguageDirective(COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT, deps.language, { preserveUserQuotes: true }),
+              systemPrompt: withContentLanguageDirective(COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT, currentDeps.language, { preserveUserQuotes: true }),
               notify: (text) => sendCtxStatusMessage(pi, {
                 title: "/ctx-session-upgrade",
                 text,
                 level: "info"
               })
             }),
-            db: deps.db,
+            db: currentDeps.db,
             sessionId,
-            historianChunkTokens: deps.historianChunkTokens,
+            historianChunkTokens: currentDeps.historianChunkTokens,
             directory: ctx.cwd,
-            historianTimeoutMs: deps.historianTimeoutMs,
-            memoryEnabled: deps.memoryEnabled,
-            autoPromote: deps.autoPromote,
+            historianTimeoutMs: currentDeps.historianTimeoutMs,
+            memoryEnabled: currentDeps.memoryEnabled,
+            autoPromote: currentDeps.autoPromote,
             ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
-            fallbackModels: deps.historianFallbacks,
+            fallbackModels: currentDeps.historianFallbacks,
             fallbackModelId: sessionMainModel,
-            language: deps.language
+            language: currentDeps.language
           }, {});
           if (!recompResult.published || !isRecompComplete(recompResult.message)) {
             const reason = contextualizeUpgradeReason(isRecompFailure(recompResult.message) ? extractRecompReason(recompResult.message) : `Compartments were not fully rebuilt: ${extractRecompReason(recompResult.message)}`);
@@ -200989,7 +201321,7 @@ ${reason}`,
             return;
           }
           try {
-            stagePiRecompMarker({ db: deps.db, sessionId, ctx });
+            stagePiRecompMarker({ db: currentDeps.db, sessionId, ctx });
           } catch (markerError) {
             sessionLog(sessionId, `pi /ctx-session-upgrade marker staging failed (non-fatal, recomp already published): ${describeError(markerError).brief}`);
           }
@@ -201014,375 +201346,6 @@ ${migrationSummary}` : "",
       });
     }
   });
-}
-
-// src/commands/ctx-wrapup.ts
-import * as crypto4 from "crypto";
-var DEFAULT_MESSAGES_TO_KEEP = 20;
-var LEASE_WAIT_MS = 1000;
-function parseWrapupArgs(raw) {
-  const trimmed = raw.trim();
-  if (trimmed === "")
-    return { ok: true, messagesToKeep: DEFAULT_MESSAGES_TO_KEEP };
-  if (!/^\d+$/.test(trimmed)) {
-    return {
-      ok: false,
-      message: "Usage: `/ctx-wrapup [messages_to_keep]` where messages_to_keep is a positive integer."
-    };
-  }
-  const messagesToKeep = Number.parseInt(trimmed, 10);
-  if (!Number.isSafeInteger(messagesToKeep) || messagesToKeep <= 0) {
-    return {
-      ok: false,
-      message: "messages_to_keep must be a positive integer."
-    };
-  }
-  return { ok: true, messagesToKeep };
-}
-function registerCtxWrapupCommand(pi, deps) {
-  pi.registerCommand("ctx-wrapup", {
-    description: "Compact older Magic Context history while keeping the newest messages raw",
-    handler: async (args, ctx) => {
-      const sessionId = resolveSessionId(ctx);
-      if (!sessionId) {
-        sendCtxStatusMessage(pi, {
-          title: "/ctx-wrapup",
-          text: `## Magic Wrapup
-
-No active Pi session is available.`,
-          level: "error"
-        });
-        return;
-      }
-      const sessionMeta = getOrCreateSessionMeta(deps.db, sessionId);
-      if (sessionMeta.isSubagent) {
-        sendCtxStatusMessage(pi, {
-          title: "/ctx-wrapup",
-          text: `## Magic Wrapup \u2014 Skipped
-
-/ctx-wrapup is only available in primary sessions.`,
-          level: "warning"
-        });
-        return;
-      }
-      if (!deps.historianModel) {
-        sendCtxStatusMessage(pi, {
-          title: "/ctx-wrapup",
-          text: "## Magic Wrapup\n\n/ctx-wrapup is unavailable because `historian.model` is not configured.",
-          level: "error"
-        });
-        return;
-      }
-      const parsed = parseWrapupArgs(args);
-      if (!parsed.ok) {
-        sendCtxStatusMessage(pi, {
-          title: "/ctx-wrapup",
-          text: `## Magic Wrapup \u2014 Invalid Arguments
-
-${parsed.message}`,
-          level: "error"
-        });
-        return;
-      }
-      let result;
-      try {
-        result = await runPiWrapup(pi, deps, ctx, sessionId, parsed.messagesToKeep);
-      } catch (err) {
-        result = `## Magic Wrapup \u2014 Failed
-
-${err instanceof Error ? err.message : String(err)}`;
-      }
-      sendCtxStatusMessage(pi, {
-        title: "/ctx-wrapup",
-        text: result,
-        level: result.includes("Failed") || result.includes("Partial") ? "error" : "success"
-      });
-    }
-  });
-}
-async function runPiWrapup(pi, deps, ctx, sessionId, messagesToKeep) {
-  if (getOrCreateSessionMeta(deps.db, sessionId).isSubagent) {
-    return `## Magic Wrapup \u2014 Skipped
-
-/ctx-wrapup is only available in primary sessions.`;
-  }
-  if (isPiRecompInFlight(sessionId)) {
-    return "## Magic Wrapup \u2014 Skipped\n\nA recomp or upgrade is already running for this session. Wait for it to finish, then try `/ctx-wrapup` again.";
-  }
-  if (!deps.historianModel) {
-    return "## Magic Wrapup \u2014 Failed\n\n`historian.model` is not configured.";
-  }
-  const provider2 = { readMessages: () => readPiSessionMessages(ctx) };
-  const unregister = setRawMessageProvider(sessionId, provider2);
-  let holderId = "";
-  try {
-    const contextLimit = resolvePiContextLimit(ctx);
-    const modelKey = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-    const executeThresholdPercentage = resolveExecuteThreshold(deps.executeThresholdPercentage ?? 65, modelKey, 65, {
-      tokensConfig: deps.executeThresholdTokens,
-      contextLimit,
-      sessionId
-    });
-    const initialPlan = resolveWrapupProtectedTailBoundary({
-      db: deps.db,
-      sessionId,
-      mode: "manual-wrapup",
-      contextLimit,
-      executeThresholdPercentage,
-      usage: { percentage: 0, inputTokens: 0 },
-      usageSource: "manual-none",
-      providerShapeVersion: "pi-folded-v1",
-      cacheNamespace: `pi:${sessionId}`,
-      messagesToKeep
-    });
-    if (initialPlan.rawMessagesAboveLastCompartment <= messagesToKeep) {
-      return `## Magic Wrapup
-
-Nothing to wrap up \u2014 only ${initialPlan.rawMessagesAboveLastCompartment} messages above the last compartment.`;
-    }
-    if (!hasRunnableCompartmentWindow(initialPlan.snapshot)) {
-      return `## Magic Wrapup \u2014 Partial
-
-No runnable wrapup boundary is available yet; wrapped up 0 messages into 0 compartments. Run /ctx-wrapup again to continue.`;
-    }
-    holderId = crypto4.randomUUID();
-    const acquired = acquireWrapupInProgress(deps.db, sessionId, {
-      holderId,
-      messagesToKeep,
-      anchorRawMessageCount: initialPlan.anchorRawMessageCount,
-      targetEligibleEndOrdinal: initialPlan.targetEligibleEndOrdinal,
-      lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
-      chunkIndex: 0,
-      expectedChunks: estimateChunks(initialPlan.snapshot.trueRawEligibleTokens, deps.historianChunkTokens)
-    });
-    if (!acquired.ok) {
-      return formatExistingWrapup(acquired.state ?? getWrapupInProgressState(deps.db, sessionId));
-    }
-    let ownershipLost = false;
-    const ownershipLostReason = "another process took over this session's wrapup";
-    const markOwnershipLost = () => {
-      if (ownershipLost)
-        return;
-      ownershipLost = true;
-    };
-    const renewWrapupMarker = (updates) => {
-      const updated = updateWrapupInProgress(deps.db, sessionId, holderId, updates);
-      if (!updated) {
-        markOwnershipLost();
-        return false;
-      }
-      return true;
-    };
-    const renewal = setInterval(() => {
-      try {
-        renewWrapupMarker({
-          lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId)
-        });
-      } catch (err) {
-        console.warn(`[magic-context][pi] /ctx-wrapup marker renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }, 60000);
-    try {
-      sendCtxStatusMessage(pi, {
-        title: "/ctx-wrapup",
-        text: `## Magic Wrapup
-
-Eligible history is about ${initialPlan.snapshot.trueRawEligibleTokens.toLocaleString()} tokens across approximately ${estimateChunks(initialPlan.snapshot.trueRawEligibleTokens, deps.historianChunkTokens)} historian chunk(s).`,
-        level: "info"
-      });
-      const startEnd = getLastCompartmentEndMessage(deps.db, sessionId);
-      const startCompartmentCount = getCompartments(deps.db, sessionId).length;
-      let chunkIndex = 0;
-      let lastEnd = startEnd;
-      let targetEligibleEndOrdinal = initialPlan.targetEligibleEndOrdinal;
-      let failure = null;
-      for (;; ) {
-        if (ownershipLost) {
-          failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
-          break;
-        }
-        if (!renewWrapupMarker({
-          chunkIndex,
-          lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId)
-        })) {
-          failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
-          break;
-        }
-        const plan = resolveWrapupProtectedTailBoundary({
-          db: deps.db,
-          sessionId,
-          mode: "manual-wrapup",
-          contextLimit,
-          executeThresholdPercentage,
-          usage: { percentage: 0, inputTokens: 0 },
-          usageSource: "manual-none",
-          providerShapeVersion: "pi-folded-v1",
-          cacheNamespace: `pi:${sessionId}`,
-          messagesToKeep,
-          anchorRawMessageCount: initialPlan.anchorRawMessageCount
-        });
-        targetEligibleEndOrdinal = plan.targetEligibleEndOrdinal;
-        lastEnd = getLastCompartmentEndMessage(deps.db, sessionId);
-        if (lastEnd + 1 >= targetEligibleEndOrdinal)
-          break;
-        if (!hasRunnableCompartmentWindow(plan.snapshot)) {
-          failure = `No runnable wrapup boundary is available yet; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
-          break;
-        }
-        chunkIndex += 1;
-        if (!renewWrapupMarker({
-          chunkIndex,
-          lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
-          targetEligibleEndOrdinal: plan.targetEligibleEndOrdinal,
-          expectedChunks: Math.max(chunkIndex, estimateChunks(plan.snapshot.trueRawEligibleTokens, deps.historianChunkTokens))
-        })) {
-          failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
-          break;
-        }
-        sendCtxStatusMessage(pi, {
-          title: "/ctx-wrapup",
-          text: `## Magic Wrapup
-
-Chunk ${chunkIndex}: wrapping messages ${plan.snapshot.offset}-${plan.snapshot.eligibleEndOrdinal - 1} (~${plan.snapshot.trueRawEligibleTokens.toLocaleString()} eligible tokens remain).`,
-          level: "info"
-        });
-        const leaseHolder = await acquireCompartmentLeaseEventually(deps.db, sessionId, renewWrapupMarker);
-        if (!leaseHolder) {
-          failure = ownershipLost ? `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.` : "Another Magic Context rebuild started while wrapup was waiting. Run /ctx-wrapup again to continue.";
-          break;
-        }
-        const leaseRenewal = setInterval(() => {
-          try {
-            renewCompartmentLease(deps.db, sessionId, leaseHolder);
-          } catch (err) {
-            console.warn(`[magic-context][pi] /ctx-wrapup compartment lease renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }, COMPARTMENT_LEASE_RENEWAL_MS);
-        try {
-          const runHistorian = deps.runPiHistorianForWrapup ?? runPiHistorian;
-          await runHistorian({
-            db: deps.db,
-            sessionId,
-            directory: ctx.cwd,
-            provider: provider2,
-            runner: deps.runner,
-            historianModel: deps.historianModel,
-            fallbackModels: deps.historianFallbacks,
-            historianChunkTokens: deps.historianChunkTokens,
-            boundarySnapshot: plan.snapshot,
-            refreshBoundarySnapshot: () => resolveWrapupProtectedTailBoundary({
-              db: deps.db,
-              sessionId,
-              mode: "manual-wrapup",
-              contextLimit,
-              executeThresholdPercentage,
-              usage: { percentage: 0, inputTokens: 0 },
-              usageSource: "manual-none",
-              providerShapeVersion: "pi-folded-v1",
-              cacheNamespace: `pi:${sessionId}`,
-              messagesToKeep,
-              anchorRawMessageCount: initialPlan.anchorRawMessageCount
-            }).snapshot,
-            currentContextLimit: contextLimit,
-            historianTimeoutMs: deps.historianTimeoutMs,
-            thinkingLevel: deps.historianThinkingLevel,
-            memoryEnabled: deps.memoryEnabled,
-            autoPromote: deps.autoPromote,
-            userMemoriesEnabled: deps.userMemoriesEnabled,
-            language: deps.language,
-            compartmentLeaseHolderId: leaseHolder,
-            readBranchEntries: () => readBranchEntries(ctx),
-            notifyIssue: (text) => sendCtxStatusMessage(pi, {
-              title: "/ctx-wrapup",
-              text,
-              level: "warning"
-            }),
-            ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
-            forceDrainQuota: true,
-            forceKeepLastCompartment: true,
-            onPublished: () => {
-              updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd });
-              signalPiDeferredHistoryRefresh(sessionId);
-              signalPiDeferredMaterialization(sessionId);
-            }
-          });
-        } finally {
-          clearInterval(leaseRenewal);
-          releaseCompartmentLease(deps.db, sessionId, leaseHolder);
-        }
-        const afterEnd = getLastCompartmentEndMessage(deps.db, sessionId);
-        if (afterEnd <= lastEnd) {
-          failure = `No forward progress after chunk ${chunkIndex}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
-          break;
-        }
-        lastEnd = afterEnd;
-      }
-      const finalEnd = getLastCompartmentEndMessage(deps.db, sessionId);
-      if (!failure && finalEnd + 1 < targetEligibleEndOrdinal) {
-        failure = `Wrapped up through message ${finalEnd}, but no runnable wrapup boundary remained before target message ${targetEligibleEndOrdinal}. Run /ctx-wrapup again to continue.`;
-      }
-      const finalCompartmentCount = getCompartments(deps.db, sessionId).length;
-      const messagesWrapped = Math.max(0, finalEnd - startEnd);
-      const compartmentsCreated = Math.max(0, finalCompartmentCount - startCompartmentCount);
-      if (failure) {
-        return `## Magic Wrapup \u2014 Partial
-
-Wrapped up ${messagesWrapped} messages into ${compartmentsCreated} compartments; ${failure}`;
-      }
-      try {
-        clearEmergencyRecovery(deps.db, sessionId);
-      } catch {}
-      return `## Magic Wrapup
-
-Wrapped up ${messagesWrapped} messages into ${compartmentsCreated} compartments. The compacted history is queued and materializes on your next message.`;
-    } finally {
-      clearInterval(renewal);
-      releaseWrapupInProgress(deps.db, sessionId, holderId);
-    }
-  } finally {
-    unregister();
-  }
-}
-function resolvePiContextLimit(ctx) {
-  const usage = ctx.getContextUsage?.();
-  if (typeof usage?.contextWindow === "number" && usage.contextWindow > 0) {
-    return usage.contextWindow;
-  }
-  if (typeof ctx.model?.contextWindow === "number" && ctx.model.contextWindow > 0) {
-    return ctx.model.contextWindow;
-  }
-  return 128000;
-}
-async function acquireCompartmentLeaseEventually(db, sessionId, renewWrapupMarker) {
-  for (;; ) {
-    const holderId = crypto4.randomUUID();
-    const lease = acquireCompartmentLease(db, sessionId, holderId);
-    if (lease)
-      return holderId;
-    if (!renewWrapupMarker({}))
-      return null;
-    await new Promise((resolve3) => setTimeout(resolve3, LEASE_WAIT_MS));
-  }
-}
-function estimateChunks(tokens, chunkTokens) {
-  return Math.max(1, Math.ceil(Math.max(0, tokens) / Math.max(1, chunkTokens)));
-}
-function formatExistingWrapup(state) {
-  if (!state) {
-    return `## Magic Wrapup \u2014 Skipped
-
-Another /ctx-wrapup is already compacting this session. Wait for it to finish, then try again.`;
-  }
-  return `## Magic Wrapup \u2014 Skipped
-
-Another /ctx-wrapup is already compacting this session (chunk ${state.chunkIndex}/${Math.max(state.chunkIndex, state.expectedChunks)}, wrapped through message ${state.lastCompartmentEnd}). Wait for it to finish, then try again.`;
-}
-function readBranchEntries(ctx) {
-  const getBranch = ctx.sessionManager.getBranch;
-  if (typeof getBranch !== "function")
-    return [];
-  const branch = getBranch.call(ctx.sessionManager);
-  return Array.isArray(branch?.entries) ? branch.entries : [];
 }
 
 // ../plugin/src/hooks/magic-context/execute-status.ts
@@ -201709,6 +201672,7 @@ function renderInner(s, theme, innerWidth) {
   lines.push(`${theme.fg("accent", theme.bold("\u26A1 Magic Context Status"))}   ${theme.fg("muted", `v${package_default.version}`)}`);
   lines.push("");
   lines.push(`Context  ${theme.fg(pctColor, theme.bold(`${s.usagePercentage.toFixed(1)}%`))} \xB7 ${fmt2(s.inputTokens)} / ${s.contextLimit > 0 ? fmt2(s.contextLimit) : "?"} tokens`);
+  lines.push(`Work tokens ${fmt2(s.newWorkTokens)} new \xB7 ${fmt2(s.totalInputTokens)} total input`);
   lines.push(renderBar(s, innerWidth));
   for (const seg of breakdownSegments(s)) {
     const pct = (seg.tokens / (s.inputTokens || 1) * 100).toFixed(1);
@@ -201801,6 +201765,7 @@ function buildPiStatusDetail(pi, ctx, deps, sessionId) {
     toolDefinitionTokens = tools.length * 50;
   } catch {}
   const conversationTokens = Math.max(0, inputTokens - systemPromptTokens - compartmentTokens - factTokens - memoryTokens - docsTokens - profileTokens - toolCallTokens - toolDefinitionTokens);
+  const workMetrics = getSessionWorkMetrics(deps.db, sessionId);
   const modelKey = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
   const threshold = resolveExecuteThresholdDetail(deps.executeThresholdPercentage ?? 65, modelKey, 65, {
     tokensConfig: deps.executeThresholdTokens,
@@ -201864,6 +201829,8 @@ function buildPiStatusDetail(pi, ctx, deps, sessionId) {
     conversationTokens,
     toolCallTokens,
     toolDefinitionTokens,
+    newWorkTokens: workMetrics.newWorkTokens,
+    totalInputTokens: workMetrics.totalInputTokens,
     upgradeNeededCount: safeRead(() => countCompartmentsNeedingUpgrade(deps.db, sessionId), 0),
     recompInFlight: isPiRecompInFlight(sessionId)
   };
@@ -202009,8 +201976,9 @@ function registerCtxStatusCommand(pi, deps) {
   pi.registerCommand("ctx-status", {
     description: "Show Magic Context status for the current Pi session",
     handler: async (_args, ctx) => {
-      const projectIdentity = deps.resolveProject?.(ctx).projectIdentity ?? deps.projectIdentity;
-      const currentDeps = { ...deps, projectIdentity };
+      const runtimeDeps = deps.resolveStatusDeps?.(ctx) ?? deps;
+      const projectIdentity = runtimeDeps.resolveProject?.(ctx).projectIdentity ?? runtimeDeps.projectIdentity;
+      const currentDeps = { ...runtimeDeps, projectIdentity };
       const sessionId = resolveSessionId(ctx);
       if (!sessionId) {
         sendCtxStatusMessage(pi, {
@@ -202085,6 +202053,367 @@ function readHistorianState(db, sessionId, meta3) {
     lastError: row?.historian_last_error ?? null,
     failureCount: row?.historian_failure_count ?? 0
   };
+}
+
+// src/commands/ctx-wrapup.ts
+import * as crypto4 from "crypto";
+var DEFAULT_MESSAGES_TO_KEEP = 20;
+var LEASE_WAIT_MS = 1000;
+function parseWrapupArgs(raw) {
+  const trimmed = raw.trim();
+  if (trimmed === "")
+    return { ok: true, messagesToKeep: DEFAULT_MESSAGES_TO_KEEP };
+  if (!/^\d+$/.test(trimmed)) {
+    return {
+      ok: false,
+      message: "Usage: `/ctx-wrapup [messages_to_keep]` where messages_to_keep is a positive integer."
+    };
+  }
+  const messagesToKeep = Number.parseInt(trimmed, 10);
+  if (!Number.isSafeInteger(messagesToKeep) || messagesToKeep <= 0) {
+    return {
+      ok: false,
+      message: "messages_to_keep must be a positive integer."
+    };
+  }
+  return { ok: true, messagesToKeep };
+}
+function registerCtxWrapupCommand(pi, deps) {
+  pi.registerCommand("ctx-wrapup", {
+    description: "Compact older Magic Context history while keeping the newest messages raw",
+    handler: async (args, ctx) => {
+      const sessionId = resolveSessionId(ctx);
+      if (!sessionId) {
+        sendCtxStatusMessage(pi, {
+          title: "/ctx-wrapup",
+          text: `## Magic Wrapup
+
+No active Pi session is available.`,
+          level: "error"
+        });
+        return;
+      }
+      const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
+      const sessionMeta = getOrCreateSessionMeta(currentDeps.db, sessionId);
+      if (sessionMeta.isSubagent) {
+        sendCtxStatusMessage(pi, {
+          title: "/ctx-wrapup",
+          text: `## Magic Wrapup \u2014 Skipped
+
+/ctx-wrapup is only available in primary sessions.`,
+          level: "warning"
+        });
+        return;
+      }
+      if (!currentDeps.historianModel) {
+        sendCtxStatusMessage(pi, {
+          title: "/ctx-wrapup",
+          text: "## Magic Wrapup\n\n/ctx-wrapup is unavailable because `historian.model` is not configured.",
+          level: "error"
+        });
+        return;
+      }
+      const parsed = parseWrapupArgs(args);
+      if (!parsed.ok) {
+        sendCtxStatusMessage(pi, {
+          title: "/ctx-wrapup",
+          text: `## Magic Wrapup \u2014 Invalid Arguments
+
+${parsed.message}`,
+          level: "error"
+        });
+        return;
+      }
+      const result = await runPiWrapup(pi, currentDeps, ctx, sessionId, parsed.messagesToKeep);
+      sendCtxStatusMessage(pi, {
+        title: "/ctx-wrapup",
+        text: result,
+        level: result.includes("Failed") || result.includes("Partial") ? "error" : "success"
+      });
+    }
+  });
+}
+async function runPiWrapup(pi, deps, ctx, sessionId, messagesToKeep) {
+  if (getOrCreateSessionMeta(deps.db, sessionId).isSubagent) {
+    return `## Magic Wrapup \u2014 Skipped
+
+/ctx-wrapup is only available in primary sessions.`;
+  }
+  if (isPiRecompInFlight(sessionId)) {
+    return "## Magic Wrapup \u2014 Skipped\n\nA recomp or upgrade is already running for this session. Wait for it to finish, then try `/ctx-wrapup` again.";
+  }
+  const provider2 = { readMessages: () => readPiSessionMessages(ctx) };
+  const unregister = setRawMessageProvider(sessionId, provider2);
+  let holderId = "";
+  try {
+    const contextLimit = resolvePiContextLimit(ctx);
+    const modelKey = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+    const executeThresholdPercentage = resolveExecuteThreshold(deps.executeThresholdPercentage ?? 65, modelKey, 65, {
+      tokensConfig: deps.executeThresholdTokens,
+      contextLimit,
+      sessionId
+    });
+    const initialPlan = resolveWrapupProtectedTailBoundary({
+      db: deps.db,
+      sessionId,
+      mode: "manual-wrapup",
+      contextLimit,
+      executeThresholdPercentage,
+      usage: { percentage: 0, inputTokens: 0 },
+      usageSource: "manual-none",
+      providerShapeVersion: "pi-folded-v1",
+      cacheNamespace: `pi:${sessionId}`,
+      messagesToKeep
+    });
+    if (initialPlan.rawMessagesAboveLastCompartment <= messagesToKeep) {
+      return `## Magic Wrapup
+
+Nothing to wrap up \u2014 only ${initialPlan.rawMessagesAboveLastCompartment} messages above the last compartment.`;
+    }
+    if (!hasRunnableCompartmentWindow(initialPlan.snapshot)) {
+      return `## Magic Wrapup \u2014 Partial
+
+No runnable wrapup boundary is available yet; wrapped up 0 messages into 0 compartments. Run /ctx-wrapup again to continue.`;
+    }
+    holderId = crypto4.randomUUID();
+    const acquired = acquireWrapupInProgress(deps.db, sessionId, {
+      holderId,
+      messagesToKeep,
+      anchorRawMessageCount: initialPlan.anchorRawMessageCount,
+      targetEligibleEndOrdinal: initialPlan.targetEligibleEndOrdinal,
+      lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
+      chunkIndex: 0,
+      expectedChunks: estimateChunks(initialPlan.snapshot.trueRawEligibleTokens, deps.historianChunkTokens)
+    });
+    if (!acquired.ok) {
+      return formatExistingWrapup(acquired.state ?? getWrapupInProgressState(deps.db, sessionId));
+    }
+    let ownershipLost = false;
+    const ownershipLostReason = "another process took over this session's wrapup";
+    const markOwnershipLost = () => {
+      if (ownershipLost)
+        return;
+      ownershipLost = true;
+    };
+    const renewWrapupMarker = (updates) => {
+      const updated = updateWrapupInProgress(deps.db, sessionId, holderId, updates);
+      if (!updated) {
+        markOwnershipLost();
+        return false;
+      }
+      return true;
+    };
+    const renewal = setInterval(() => {
+      try {
+        renewWrapupMarker({
+          lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId)
+        });
+      } catch (err) {
+        console.warn(`[magic-context][omp] /ctx-wrapup marker renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }, 60000);
+    try {
+      sendCtxStatusMessage(pi, {
+        title: "/ctx-wrapup",
+        text: `## Magic Wrapup
+
+Eligible history is about ${initialPlan.snapshot.trueRawEligibleTokens.toLocaleString()} tokens across approximately ${estimateChunks(initialPlan.snapshot.trueRawEligibleTokens, deps.historianChunkTokens)} historian chunk(s).`,
+        level: "info"
+      });
+      const startEnd = getLastCompartmentEndMessage(deps.db, sessionId);
+      const startCompartmentCount = getCompartments(deps.db, sessionId).length;
+      let chunkIndex = 0;
+      let lastEnd = startEnd;
+      let targetEligibleEndOrdinal = initialPlan.targetEligibleEndOrdinal;
+      let failure = null;
+      for (;; ) {
+        if (ownershipLost) {
+          failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
+          break;
+        }
+        if (!renewWrapupMarker({
+          chunkIndex,
+          lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId)
+        })) {
+          failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
+          break;
+        }
+        const plan = resolveWrapupProtectedTailBoundary({
+          db: deps.db,
+          sessionId,
+          mode: "manual-wrapup",
+          contextLimit,
+          executeThresholdPercentage,
+          usage: { percentage: 0, inputTokens: 0 },
+          usageSource: "manual-none",
+          providerShapeVersion: "pi-folded-v1",
+          cacheNamespace: `pi:${sessionId}`,
+          messagesToKeep,
+          anchorRawMessageCount: initialPlan.anchorRawMessageCount
+        });
+        targetEligibleEndOrdinal = plan.targetEligibleEndOrdinal;
+        lastEnd = getLastCompartmentEndMessage(deps.db, sessionId);
+        if (lastEnd + 1 >= targetEligibleEndOrdinal)
+          break;
+        if (!hasRunnableCompartmentWindow(plan.snapshot)) {
+          failure = `No runnable wrapup boundary is available yet; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
+          break;
+        }
+        chunkIndex += 1;
+        if (!renewWrapupMarker({
+          chunkIndex,
+          lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
+          targetEligibleEndOrdinal: plan.targetEligibleEndOrdinal,
+          expectedChunks: Math.max(chunkIndex, estimateChunks(plan.snapshot.trueRawEligibleTokens, deps.historianChunkTokens))
+        })) {
+          failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
+          break;
+        }
+        sendCtxStatusMessage(pi, {
+          title: "/ctx-wrapup",
+          text: `## Magic Wrapup
+
+Chunk ${chunkIndex}: wrapping messages ${plan.snapshot.offset}-${plan.snapshot.eligibleEndOrdinal - 1} (~${plan.snapshot.trueRawEligibleTokens.toLocaleString()} eligible tokens remain).`,
+          level: "info"
+        });
+        const leaseHolder = await acquireCompartmentLeaseEventually(deps.db, sessionId, renewWrapupMarker);
+        if (!leaseHolder) {
+          failure = ownershipLost ? `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.` : "Another Magic Context rebuild started while wrapup was waiting. Run /ctx-wrapup again to continue.";
+          break;
+        }
+        const leaseRenewal = setInterval(() => {
+          try {
+            renewCompartmentLease(deps.db, sessionId, leaseHolder);
+          } catch (err) {
+            console.warn(`[magic-context][omp] /ctx-wrapup compartment lease renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }, COMPARTMENT_LEASE_RENEWAL_MS);
+        try {
+          const runHistorian = deps.runPiHistorianForWrapup ?? runPiHistorian;
+          await runHistorian({
+            db: deps.db,
+            sessionId,
+            directory: ctx.cwd,
+            provider: provider2,
+            runner: deps.runner,
+            historianModel: deps.historianModel,
+            fallbackModels: deps.historianFallbacks,
+            fallbackModelId: modelKey,
+            historianChunkTokens: deps.historianChunkTokens,
+            boundarySnapshot: plan.snapshot,
+            refreshBoundarySnapshot: () => resolveWrapupProtectedTailBoundary({
+              db: deps.db,
+              sessionId,
+              mode: "manual-wrapup",
+              contextLimit,
+              executeThresholdPercentage,
+              usage: { percentage: 0, inputTokens: 0 },
+              usageSource: "manual-none",
+              providerShapeVersion: "pi-folded-v1",
+              cacheNamespace: `pi:${sessionId}`,
+              messagesToKeep,
+              anchorRawMessageCount: initialPlan.anchorRawMessageCount
+            }).snapshot,
+            currentContextLimit: contextLimit,
+            historianTimeoutMs: deps.historianTimeoutMs,
+            thinkingLevel: deps.historianThinkingLevel,
+            memoryEnabled: deps.memoryEnabled,
+            autoPromote: deps.autoPromote,
+            userMemoriesEnabled: deps.userMemoriesEnabled,
+            language: deps.language,
+            compartmentLeaseHolderId: leaseHolder,
+            readBranchEntries: () => readBranchEntries(ctx),
+            notifyIssue: (text) => sendCtxStatusMessage(pi, {
+              title: "/ctx-wrapup",
+              text,
+              level: "warning"
+            }),
+            ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
+            forceDrainQuota: true,
+            forceKeepLastCompartment: true,
+            onPublished: () => {
+              updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd });
+              signalPiDeferredHistoryRefresh(sessionId);
+              signalPiDeferredMaterialization(sessionId);
+            }
+          });
+        } finally {
+          clearInterval(leaseRenewal);
+          releaseCompartmentLease(deps.db, sessionId, leaseHolder);
+        }
+        const afterEnd = getLastCompartmentEndMessage(deps.db, sessionId);
+        if (afterEnd <= lastEnd) {
+          failure = `No forward progress after chunk ${chunkIndex}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
+          break;
+        }
+        lastEnd = afterEnd;
+      }
+      const finalEnd = getLastCompartmentEndMessage(deps.db, sessionId);
+      if (!failure && finalEnd + 1 < targetEligibleEndOrdinal) {
+        failure = `Wrapped up through message ${finalEnd}, but no runnable wrapup boundary remained before target message ${targetEligibleEndOrdinal}. Run /ctx-wrapup again to continue.`;
+      }
+      const finalCompartmentCount = getCompartments(deps.db, sessionId).length;
+      const messagesWrapped = Math.max(0, finalEnd - startEnd);
+      const compartmentsCreated = Math.max(0, finalCompartmentCount - startCompartmentCount);
+      if (failure) {
+        return `## Magic Wrapup \u2014 Partial
+
+Wrapped up ${messagesWrapped} messages into ${compartmentsCreated} compartments; ${failure}`;
+      }
+      try {
+        clearEmergencyRecovery(deps.db, sessionId);
+      } catch {}
+      return `## Magic Wrapup
+
+Wrapped up ${messagesWrapped} messages into ${compartmentsCreated} compartments. The compacted history is queued and materializes on your next message.`;
+    } finally {
+      clearInterval(renewal);
+      releaseWrapupInProgress(deps.db, sessionId, holderId);
+    }
+  } finally {
+    unregister();
+  }
+}
+function resolvePiContextLimit(ctx) {
+  const usage = ctx.getContextUsage?.();
+  if (typeof usage?.contextWindow === "number" && usage.contextWindow > 0) {
+    return usage.contextWindow;
+  }
+  if (typeof ctx.model?.contextWindow === "number" && ctx.model.contextWindow > 0) {
+    return ctx.model.contextWindow;
+  }
+  return 128000;
+}
+async function acquireCompartmentLeaseEventually(db, sessionId, renewWrapupMarker) {
+  for (;; ) {
+    const holderId = crypto4.randomUUID();
+    const lease = acquireCompartmentLease(db, sessionId, holderId);
+    if (lease)
+      return holderId;
+    if (!renewWrapupMarker({}))
+      return null;
+    await new Promise((resolve3) => setTimeout(resolve3, LEASE_WAIT_MS));
+  }
+}
+function estimateChunks(tokens, chunkTokens) {
+  return Math.max(1, Math.ceil(Math.max(0, tokens) / Math.max(1, chunkTokens)));
+}
+function formatExistingWrapup(state) {
+  if (!state) {
+    return `## Magic Wrapup \u2014 Skipped
+
+Another /ctx-wrapup is already compacting this session. Wait for it to finish, then try again.`;
+  }
+  return `## Magic Wrapup \u2014 Skipped
+
+Another /ctx-wrapup is already compacting this session (chunk ${state.chunkIndex}/${Math.max(state.chunkIndex, state.expectedChunks)}, wrapped through message ${state.lastCompartmentEnd}). Wait for it to finish, then try again.`;
+}
+function readBranchEntries(ctx) {
+  const getBranch = ctx.sessionManager.getBranch;
+  if (typeof getBranch !== "function")
+    return [];
+  const branch = getBranch.call(ctx.sessionManager);
+  return Array.isArray(branch?.entries) ? branch.entries : [];
 }
 
 // src/pi-pressure.ts
@@ -206555,16 +206884,16 @@ __export(exports_typebox, {
 // src/tools/ctx-expand.ts
 var ParamsSchema = exports_typebox.Object({
   start: exports_typebox.Optional(exports_typebox.Number({
-    description: "Start message ordinal (from compartment start attribute)"
+    description: `First message ordinal to expand \u2014 a compartment's start="N" attribute, or an ordinal from a ctx_search message hit`
   })),
   end: exports_typebox.Optional(exports_typebox.Number({
-    description: "End message ordinal (from compartment end attribute)"
+    description: `Last message ordinal to expand (inclusive) \u2014 a compartment's end="M" attribute`
   })),
   verbose: exports_typebox.Optional(exports_typebox.Boolean({
     description: "With start/end: list each message separately with its ordinal [N] and per-part preview, so you can recover one in full by ordinal."
   })),
   message: exports_typebox.Optional(exports_typebox.Number({
-    description: "Full untruncated recovery of ONE message by its ordinal (text + every tool call's full input/output). Recovers a tool output you dropped with ctx_reduce."
+    description: "Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce."
   }))
 });
 function ok(text) {
@@ -206715,25 +207044,45 @@ function formatMemoryList(memories) {
     id: String(m.id),
     category: m.category,
     status: m.status,
+    verification: m.verificationStatus,
     updated: new Date(m.updatedAt).toISOString(),
     content: m.content.replace(/\s+/g, " ").trim()
   }));
+  const headers = {
+    id: "ID",
+    category: "CATEGORY",
+    status: "STATUS",
+    verification: "VERIFY",
+    updated: "UPDATED",
+    content: "CONTENT"
+  };
   const widths = {
-    id: Math.max(2, ...rows.map((r) => r.id.length)),
-    category: Math.max(8, ...rows.map((r) => r.category.length)),
-    status: Math.max(6, ...rows.map((r) => r.status.length)),
-    updated: Math.max(7, ...rows.map((r) => r.updated.length))
+    id: Math.max(headers.id.length, ...rows.map((r) => r.id.length)),
+    category: Math.max(headers.category.length, ...rows.map((r) => r.category.length)),
+    status: Math.max(headers.status.length, ...rows.map((r) => r.status.length)),
+    verification: Math.max(headers.verification.length, ...rows.map((r) => r.verification.length)),
+    updated: Math.max(headers.updated.length, ...rows.map((r) => r.updated.length))
   };
   const fmt3 = (r) => [
     r.id.padEnd(widths.id),
     r.category.padEnd(widths.category),
     r.status.padEnd(widths.status),
+    r.verification.padEnd(widths.verification),
     r.updated.padEnd(widths.updated),
     r.content
   ].join(" | ");
   return [
     `Found ${rows.length} active ${rows.length === 1 ? "memory" : "memories"}:`,
     "",
+    fmt3(headers),
+    [
+      "-".repeat(widths.id),
+      "-".repeat(widths.category),
+      "-".repeat(widths.status),
+      "-".repeat(widths.verification),
+      "-".repeat(widths.updated),
+      "-------"
+    ].join("-+-"),
     ...rows.map(fmt3)
   ].join(`
 `);
@@ -207139,6 +207488,7 @@ function createCtxNoteTool(deps) {
     parameters: ParamsSchema3,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const sessionId = ctx.sessionManager.getSessionId();
+      const dreamerEnabled = deps.resolveDreamerEnabled?.(ctx) ?? deps.dreamerEnabled;
       const action2 = params.action ?? (params.content?.trim() ? "write" : "read");
       if (action2 === "write") {
         const content = params.content?.trim();
@@ -207147,7 +207497,7 @@ function createCtxNoteTool(deps) {
         const anchorOrdinal = captureAnchorOrdinal(deps.db, sessionId);
         const surfaceCondition = params.surface_condition?.trim();
         if (surfaceCondition) {
-          if (deps.dreamerEnabled !== true) {
+          if (dreamerEnabled !== true) {
             return err3("Error: Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.");
           }
           const projectIdentity = resolveProjectIdentity(ctx.cwd);
@@ -207156,6 +207506,7 @@ function createCtxNoteTool(deps) {
           }
           const note2 = addNote(deps.db, "smart", {
             content,
+            sessionId,
             projectPath: projectIdentity,
             surfaceCondition,
             anchorOrdinal
@@ -207407,6 +207758,7 @@ function createCtxReduceTool(deps) {
     parameters: ParamsSchema4,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const sessionId = ctx.sessionManager.getSessionId();
+      const protectedTags = Math.max(0, Math.floor(deps.resolveProtectedTags?.(ctx) ?? deps.protectedTags));
       if (!params.drop) {
         return err4("Error: 'drop' must be provided.");
       }
@@ -207424,7 +207776,7 @@ function createCtxReduceTool(deps) {
         return err4(`Error: Unknown tag(s) ${formatIds(unknownIds)}. Check available tags in conversation.`);
       }
       const activeTags = allTags.filter((tag) => tag.status === "active");
-      const protectedTagIds = activeTags.map((tag) => tag.tagNumber).sort((left, right) => right - left).slice(0, deps.protectedTags);
+      const protectedTagIds = activeTags.map((tag) => tag.tagNumber).sort((left, right) => right - left).slice(0, protectedTags);
       const protectedSet = new Set(protectedTagIds);
       const tagStatusMap = new Map(allTags.map((tag) => [tag.tagNumber, tag.status]));
       const pendingOps = getPendingOps(deps.db, sessionId);
@@ -207651,6 +208003,417 @@ function createCtxSearchTool(deps) {
   };
 }
 
+// src/tools/todo-view-pi.ts
+import {
+  truncateToWidth as truncateToWidth2
+} from "@oh-my-pi/pi-tui";
+var TODO_TOOL_NAME = "todowrite";
+var TODOS_COMMAND_NAME = "todos";
+var WIDGET_KEY = "magic-context-todos";
+var MAX_OVERLAY_CONTENT_ROWS = 12;
+var TODO_STATUSES = [
+  "pending",
+  "in_progress",
+  "completed",
+  "cancelled"
+];
+var TODO_PRIORITIES = ["high", "medium", "low"];
+var STATUS_GLYPH = {
+  pending: "\u25CB",
+  in_progress: "\u25D0",
+  completed: "\u2713",
+  cancelled: "\u2717"
+};
+var STATUS_COLOR = {
+  pending: "dim",
+  in_progress: "warning",
+  completed: "success",
+  cancelled: "error"
+};
+var snapshotsBySession = new Map;
+function isTodoStatus(value) {
+  return TODO_STATUSES.includes(value);
+}
+function isTodoPriority(value) {
+  return TODO_PRIORITIES.includes(value);
+}
+function cloneTodos(todos) {
+  return todos.map((todo) => ({ ...todo }));
+}
+function parseTodos(input) {
+  if (!Array.isArray(input))
+    return null;
+  const todos = [];
+  for (const item of input) {
+    if (item === null || typeof item !== "object")
+      return null;
+    const raw = item;
+    if (typeof raw.content !== "string" || !isTodoStatus(raw.status)) {
+      return null;
+    }
+    const todo = {
+      content: raw.content,
+      status: raw.status
+    };
+    if (isTodoPriority(raw.priority))
+      todo.priority = raw.priority;
+    if (typeof raw.id === "string" && raw.id.length > 0)
+      todo.id = raw.id;
+    todos.push(todo);
+  }
+  return todos;
+}
+function parseTodoStateJson(stateJson) {
+  if (!stateJson)
+    return null;
+  try {
+    return parseTodos(JSON.parse(stateJson));
+  } catch {
+    return null;
+  }
+}
+function setTodoSnapshot(sessionId, todos) {
+  const parsed = parseTodos(todos);
+  if (parsed === null)
+    return false;
+  snapshotsBySession.set(sessionId, { todos: parsed });
+  return true;
+}
+function seedTodoSnapshotFromStateJson(sessionId, stateJson) {
+  const parsed = parseTodoStateJson(stateJson);
+  if (parsed === null) {
+    snapshotsBySession.delete(sessionId);
+    return false;
+  }
+  snapshotsBySession.set(sessionId, { todos: parsed });
+  return true;
+}
+function getTodoSnapshot(sessionId) {
+  if (!sessionId)
+    return { todos: [] };
+  const snapshot = snapshotsBySession.get(sessionId);
+  return { todos: snapshot ? cloneTodos(snapshot.todos) : [] };
+}
+function clearTodoSnapshot(sessionId) {
+  snapshotsBySession.delete(sessionId);
+}
+function getSessionId(ctx) {
+  try {
+    const id = ctx.sessionManager?.getSessionId?.();
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  } catch {
+    return;
+  }
+}
+function countTodos(todos) {
+  const counts = {
+    total: todos.length,
+    pending: 0,
+    inProgress: 0,
+    completed: 0,
+    cancelled: 0
+  };
+  for (const todo of todos) {
+    switch (todo.status) {
+      case "pending":
+        counts.pending++;
+        break;
+      case "in_progress":
+        counts.inProgress++;
+        break;
+      case "completed":
+        counts.completed++;
+        break;
+      case "cancelled":
+        counts.cancelled++;
+        break;
+    }
+  }
+  return counts;
+}
+function activeTitleCount(todos) {
+  return todos.filter((todo) => todo.status !== "completed").length;
+}
+function formatCounts(counts) {
+  if (counts.total === 0)
+    return "No todos";
+  const parts = [`${counts.completed}/${counts.total} completed`];
+  if (counts.inProgress > 0)
+    parts.push(`${counts.inProgress} in progress`);
+  if (counts.pending > 0)
+    parts.push(`${counts.pending} pending`);
+  if (counts.cancelled > 0)
+    parts.push(`${counts.cancelled} cancelled`);
+  return parts.join(" \xB7 ");
+}
+function formatTodoLine(todo, theme, options = {}) {
+  const glyph = theme.fg(STATUS_COLOR[todo.status], STATUS_GLYPH[todo.status]);
+  const id = options.showId && todo.id ? `${theme.fg("accent", `#${todo.id}`)} ` : "";
+  const color = todo.status === "pending" || todo.status === "in_progress" ? "text" : "dim";
+  let content = theme.fg(color, todo.content);
+  if (todo.status === "completed" || todo.status === "cancelled") {
+    content = theme.strikethrough(content);
+  }
+  return `${glyph} ${id}${content}`;
+}
+function formatCommandLine(todo) {
+  const id = todo.id ? `#${todo.id} ` : "";
+  return `  ${STATUS_GLYPH[todo.status]} ${id}${todo.content}`;
+}
+function lineComponent(renderLines) {
+  return {
+    render: renderLines,
+    invalidate() {}
+  };
+}
+function renderTodowriteCall(args, theme) {
+  const todos = parseTodos(args.todos) ?? [];
+  const active = activeTitleCount(todos);
+  const activeColor = active > 0 ? "warning" : "success";
+  const line = `${theme.fg("toolTitle", theme.bold("Todos"))} ${theme.fg("muted", "\u2014")} ${theme.fg(activeColor, `${active} active`)}`;
+  return lineComponent((width) => [truncateToWidth2(line, width, "\u2026")]);
+}
+function renderTodowriteResult(result, theme) {
+  const detailsTodos = result.details?.todos;
+  let todos = parseTodos(detailsTodos);
+  if (todos === null && Array.isArray(result.content)) {
+    const text = result.content.find((part) => part !== null && typeof part === "object" && part.type === "text" && typeof part.text === "string")?.text;
+    if (text) {
+      try {
+        todos = parseTodos(JSON.parse(text));
+      } catch {}
+    }
+  }
+  const renderedTodos = todos ?? [];
+  return lineComponent((width) => {
+    if (renderedTodos.length === 0)
+      return [theme.fg("dim", "No todos")];
+    return renderedTodos.map((todo) => truncateToWidth2(formatTodoLine(todo, theme, { showId: true }), width, "\u2026"));
+  });
+}
+function registerTodosCommand(pi) {
+  pi.registerCommand(TODOS_COMMAND_NAME, {
+    description: "Show the current Magic Context todo list",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("The /todos command requires interactive UI.", "error");
+        return;
+      }
+      const sessionId = getSessionId(ctx);
+      const todos = getTodoSnapshot(sessionId).todos;
+      if (todos.length === 0) {
+        ctx.ui.notify("No todos yet.", "info");
+        return;
+      }
+      const counts = countTodos(todos);
+      const lines = [formatCounts(counts)];
+      const groups = [
+        ["pending", "\u2500\u2500 Pending \u2500\u2500"],
+        ["in_progress", "\u2500\u2500 In Progress \u2500\u2500"],
+        ["completed", "\u2500\u2500 Completed \u2500\u2500"],
+        ["cancelled", "\u2500\u2500 Cancelled \u2500\u2500"]
+      ];
+      for (const [status, heading] of groups) {
+        const group = todos.filter((todo) => todo.status === status);
+        if (group.length === 0)
+          continue;
+        lines.push(heading);
+        for (const todo of group)
+          lines.push(formatCommandLine(todo));
+      }
+      ctx.ui.notify(lines.join(`
+`), "info");
+    }
+  });
+}
+function todoKey(todo, index) {
+  return todo.id ? `id:${todo.id}` : `pos:${index}:${todo.content}`;
+}
+function isOverlayLive(todo) {
+  return todo.status === "pending" || todo.status === "in_progress";
+}
+
+class TodoOverlay {
+  uiCtx;
+  sessionId;
+  widgetRegistered = false;
+  tui;
+  completedTaskIdsPendingHide = new Set;
+  hiddenCompletedTaskIds = new Set;
+  lastTodoKeys = new Set;
+  setUICtx(sessionId, ctx) {
+    if (ctx !== this.uiCtx || sessionId !== this.sessionId) {
+      this.uiCtx = ctx;
+      this.sessionId = sessionId;
+      this.widgetRegistered = false;
+      this.tui = undefined;
+      this.resetCompletedDisplayState();
+    }
+  }
+  update(sessionId = this.sessionId) {
+    if (!this.uiCtx || !this.sessionId || sessionId !== this.sessionId)
+      return;
+    const todos = getTodoSnapshot(this.sessionId).todos;
+    this.pruneCompletedDisplayState(todos);
+    const visible = this.selectOverlayTodos(todos);
+    if (visible.length === 0) {
+      if (this.widgetRegistered) {
+        this.uiCtx.setWidget(WIDGET_KEY, undefined);
+        this.widgetRegistered = false;
+        this.tui = undefined;
+      }
+      return;
+    }
+    if (!this.widgetRegistered) {
+      this.uiCtx.setWidget(WIDGET_KEY, (tui, theme) => {
+        this.tui = tui;
+        return {
+          render: (width) => this.renderWidget(theme, width),
+          invalidate: () => {
+            this.widgetRegistered = false;
+            this.tui = undefined;
+          }
+        };
+      }, { placement: "aboveEditor" });
+      this.widgetRegistered = true;
+    } else {
+      this.tui?.requestRender();
+    }
+  }
+  resetCompletedDisplayState() {
+    this.completedTaskIdsPendingHide.clear();
+    this.hiddenCompletedTaskIds.clear();
+    this.lastTodoKeys.clear();
+  }
+  hideCompletedTasksFromPreviousTurn() {
+    if (this.completedTaskIdsPendingHide.size === 0)
+      return;
+    for (const taskId of this.completedTaskIdsPendingHide) {
+      this.hiddenCompletedTaskIds.add(taskId);
+    }
+    this.completedTaskIdsPendingHide.clear();
+    this.update();
+  }
+  disposeSession(sessionId) {
+    if (this.sessionId !== sessionId)
+      return;
+    this.dispose();
+  }
+  dispose() {
+    if (this.uiCtx)
+      this.uiCtx.setWidget(WIDGET_KEY, undefined);
+    this.widgetRegistered = false;
+    this.tui = undefined;
+    this.uiCtx = undefined;
+    this.sessionId = undefined;
+    this.resetCompletedDisplayState();
+  }
+  pruneCompletedDisplayState(todos) {
+    const currentKeys = new Set(todos.map((todo, index) => todoKey(todo, index)));
+    const hasSharedKeys = [...currentKeys].some((key) => this.lastTodoKeys.has(key));
+    if (this.lastTodoKeys.size > 0 && currentKeys.size > 0 && !hasSharedKeys) {
+      this.resetCompletedDisplayState();
+    }
+    this.lastTodoKeys = currentKeys;
+    const completedKeys = new Set(todos.map((todo, index) => ({ todo, key: todoKey(todo, index) })).filter(({ todo }) => todo.status === "completed").map(({ key }) => key));
+    for (const taskId of this.completedTaskIdsPendingHide) {
+      if (!completedKeys.has(taskId))
+        this.completedTaskIdsPendingHide.delete(taskId);
+    }
+    for (const taskId of this.hiddenCompletedTaskIds) {
+      if (!completedKeys.has(taskId))
+        this.hiddenCompletedTaskIds.delete(taskId);
+    }
+  }
+  selectOverlayTodos(todos) {
+    return todos.map((todo, index) => ({ todo, key: todoKey(todo, index) })).filter(({ todo, key }) => {
+      if (isOverlayLive(todo))
+        return true;
+      return todo.status === "completed" && !this.hiddenCompletedTaskIds.has(key);
+    });
+  }
+  renderWidget(theme, width) {
+    if (!this.sessionId)
+      return [];
+    const todos = getTodoSnapshot(this.sessionId).todos;
+    this.pruneCompletedDisplayState(todos);
+    const overlayTodos = this.selectOverlayTodos(todos);
+    if (overlayTodos.length === 0)
+      return [];
+    const counts = countTodos(todos);
+    const hasInProgress = counts.inProgress > 0;
+    const headingColor = hasInProgress ? "accent" : "dim";
+    const headingIcon = hasInProgress ? "\u25CF" : "\u25CB";
+    const heading = `${theme.fg(headingColor, headingIcon)} ${theme.fg(headingColor, "Todos")} ${theme.fg("muted", "\u2014")} ${theme.fg("dim", formatCounts(counts))}`;
+    const truncate3 = (line) => truncateToWidth2(line, width, "\u2026");
+    const lines = [truncate3(heading)];
+    const hasTruncatedTail = overlayTodos.length > MAX_OVERLAY_CONTENT_ROWS;
+    const visibleRows = hasTruncatedTail ? MAX_OVERLAY_CONTENT_ROWS - 1 : MAX_OVERLAY_CONTENT_ROWS;
+    const truncatedTail = Math.max(0, overlayTodos.length - visibleRows);
+    const visible = overlayTodos.slice(0, visibleRows);
+    for (const [index, { todo, key }] of visible.entries()) {
+      const isLast = index === visible.length - 1 && truncatedTail === 0;
+      const branch = theme.fg("dim", isLast ? "\u2514\u2500" : "\u251C\u2500");
+      lines.push(truncate3(`${branch} ${formatTodoLine(todo, theme, { showId: true })}`));
+      if (todo.status === "completed")
+        this.completedTaskIdsPendingHide.add(key);
+    }
+    if (truncatedTail > 0) {
+      lines.push(truncate3(`${theme.fg("dim", "\u2514\u2500")} ${theme.fg("dim", `+${truncatedTail} more`)}`));
+    }
+    return lines;
+  }
+}
+function registerTodoOverlay(pi, deps) {
+  const overlay = new TodoOverlay;
+  pi.on("session_start", async (_event, ctx) => {
+    const sessionId = getSessionId(ctx);
+    if (!sessionId)
+      return;
+    seedTodoSnapshotFromStateJson(sessionId, deps.readLastTodoState(sessionId));
+    if (!ctx.hasUI)
+      return;
+    overlay.setUICtx(sessionId, ctx.ui);
+    overlay.update(sessionId);
+  });
+  pi.on("agent_start", async () => {
+    overlay.hideCompletedTasksFromPreviousTurn();
+  });
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const sessionId = getSessionId(ctx);
+    if (!sessionId)
+      return;
+    clearTodoSnapshot(sessionId);
+    overlay.disposeSession(sessionId);
+  });
+  pi.on("session_before_switch", async (_event, ctx) => {
+    const sessionId = getSessionId(ctx);
+    if (!sessionId)
+      return;
+    clearTodoSnapshot(sessionId);
+    overlay.disposeSession(sessionId);
+  });
+  return overlay;
+}
+function registerTodoStateLifecycle(pi, deps) {
+  pi.on("session_start", async (_event, ctx) => {
+    const sessionId = getSessionId(ctx);
+    if (!sessionId)
+      return;
+    seedTodoSnapshotFromStateJson(sessionId, deps.readLastTodoState(sessionId));
+  });
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const sessionId = getSessionId(ctx);
+    if (sessionId)
+      clearTodoSnapshot(sessionId);
+  });
+  pi.on("session_before_switch", async (_event, ctx) => {
+    const sessionId = getSessionId(ctx);
+    if (sessionId)
+      clearTodoSnapshot(sessionId);
+  });
+}
+
 // src/tools/todowrite.ts
 var STATUS_VALUES = [
   "pending",
@@ -207670,29 +208433,20 @@ var TodowriteParams = exports_typebox.Object({
     description: "Replace the current task list with this complete set of todos. Include every task you intend to track this turn \u2014 pending, in_progress, completed, or cancelled \u2014 because the list overwrites previous state."
   })
 });
-var TOOL_DESCRIPTION = [
-  "Manage your task list for this session.",
-  "",
-  "Use this tool to plan multi-step work, track in-flight tasks, and",
-  "mark progress as you complete steps. Pass the COMPLETE updated list",
-  "of todos every time \u2014 this tool replaces the prior list rather than",
-  "appending to it.",
-  "",
-  "Task states:",
-  "  - pending: not started yet",
-  "  - in_progress: currently working on (limit to ONE task at a time)",
-  "  - completed: finished successfully",
-  "  - cancelled: no longer needed",
-  "",
-  "Use this tool proactively for non-trivial work spanning 3+ steps.",
-  "Skip it for single-shot answers or trivial 1-2 step tasks."
-].join(`
-`);
+var PROMPT_SNIPPET = "Manage a task list to track multi-step progress";
+var PROMPT_GUIDELINES = [
+  "Use `todowrite` for non-trivial work spanning 3+ steps, when the user gives you multiple tasks, or when you need to track progress across a verify/fix loop. Skip it for single-shot answers or trivial one-step work.",
+  "Pass the COMPLETE updated todo list every time. This tool replaces the prior list rather than appending to it, so include pending, in_progress, completed, and cancelled tasks that should remain visible.",
+  "When starting a task, mark exactly one todo `in_progress` before doing the work. Mark items `completed` immediately when done; use `cancelled` only for work that is no longer needed.",
+  "Never mark a todo completed if verification is failing, implementation is partial, or an unresolved blocker remains. Keep it `in_progress` and add or update a todo for the blocker instead."
+];
 function createTodowriteTool() {
   return {
-    name: "todowrite",
+    name: TODO_TOOL_NAME,
     label: "Todos",
-    description: TOOL_DESCRIPTION,
+    description: "Manage the session task list.",
+    promptSnippet: PROMPT_SNIPPET,
+    promptGuidelines: PROMPT_GUIDELINES,
     parameters: TodowriteParams,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const todos = params.todos ?? [];
@@ -207711,6 +208465,12 @@ function createTodowriteTool() {
           truncated: false
         }
       };
+    },
+    renderCall(args, theme) {
+      return renderTodowriteCall(args, theme);
+    },
+    renderResult(result, _opts, theme) {
+      return renderTodowriteResult(result, theme);
     }
   };
 }
@@ -207737,15 +208497,22 @@ function registerMagicContextTools(pi, opts) {
   if (!opts.sessionScopedToolsDisabled) {
     register(createCtxNoteTool({
       db: opts.db,
-      dreamerEnabled: opts.dreamerEnabled ?? false
+      dreamerEnabled: opts.dreamerEnabled ?? false,
+      resolveDreamerEnabled: opts.resolveDreamerEnabled
     }));
     register(createCtxExpandTool({ db: opts.db }));
   }
-  register(createTodowriteTool());
+  if (opts.todowriteEnabled !== false) {
+    register(createTodowriteTool());
+    if (opts.todowriteCommandEnabled !== false) {
+      registerTodosCommand(pi);
+    }
+  }
   if (!opts.sessionScopedToolsDisabled) {
     register(createCtxReduceTool({
       db: opts.db,
-      protectedTags: opts.protectedTags ?? 20
+      protectedTags: opts.protectedTags ?? 20,
+      resolveProtectedTags: opts.resolveProtectedTags
     }));
   }
 }
@@ -208508,7 +209275,7 @@ function fixOrphanedToolUse(messages) {
   }
   return result;
 }
-function registerACMExtension(pi) {
+function tools_default(pi) {
   const zod = pi.zod;
   const contextRefresh = new ContextRefreshRegistry;
   const cachedUsageMap = new WeakMap;
@@ -209174,6 +209941,10 @@ function resolveCurrentProject(ctx) {
   const projectIdentity = resolveProjectIdentityOrFallback(projectDir);
   return { projectDir, projectIdentity };
 }
+function signalPiDeferredCompactionMarkerDrain(sessionId) {
+  signalPiDeferredHistoryRefresh(sessionId);
+  signalPiDeferredMaterialization(sessionId);
+}
 function persistPiMessageEndModelMeta(args) {
   if (!args.message || typeof args.message !== "object")
     return;
@@ -209378,8 +210149,7 @@ async function src_default2(pi) {
   try {
     const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
     for (const sid of pendingPiMarkerSessions) {
-      signalPiDeferredHistoryRefresh(sid);
-      signalPiDeferredMaterialization(sid);
+      signalPiDeferredCompactionMarkerDrain(sid);
     }
     if (pendingPiMarkerSessions.length > 0) {
       log(`${PREFIX} rehydrated ${pendingPiMarkerSessions.length} Pi deferred compaction marker session(s)`);
@@ -209412,27 +210182,7 @@ async function src_default2(pi) {
   }
   await ensureProjectRegisteredFromPiDirectory(projectDir, db);
   info(`registered embedding config for project ${projectIdentity}`);
-  registerMagicContextTools(pi, {
-    db,
-    ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
-    allowDreamerActions: false,
-    memoryToolEnabled: true,
-    protectedTags: config2.protected_tags ?? 20,
-    dreamerEnabled: isDreamerRunnable(config2)
-  });
-  registerACMExtension(pi);
-  info("registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce");
-  const historianConfig = resolveHistorianFromConfig(config2);
-  if (historianConfig) {
-    historianConfig.onStatusChange = (ctx) => {
-      updateStatusLine(ctx, {
-        db,
-        projectIdentity: resolveCurrentProject(ctx).projectIdentity
-      });
-    };
-  }
-  const autoSearchConfig = resolveAutoSearchFromConfig(config2);
-  const contextOptionsByDir = new Map;
+  const projectDepsByDir = new Map;
   const buildContextOptions = (cfg, hist, auto) => ({
     db: database,
     smartDrops: cfg.smart_drops === true,
@@ -209473,46 +210223,111 @@ async function src_default2(pi) {
       });
     }
   });
-  function resolveContextOptionsForProject(dir) {
-    const cached2 = contextOptionsByDir.get(dir);
-    if (cached2)
-      return cached2;
-    ensureConfigLocationsMigrated(dir);
-    const switchedConfig = loadPiConfig({ cwd: dir }).config;
-    const switchedHistorian = resolveHistorianFromConfig(switchedConfig);
-    if (switchedHistorian) {
-      switchedHistorian.onStatusChange = (ctx) => {
+  function buildProjectDeps(dir, identity, cfg) {
+    const hist = resolveHistorianFromConfig(cfg);
+    if (hist) {
+      hist.onStatusChange = (ctx) => {
         updateStatusLine(ctx, {
           db: database,
           projectIdentity: resolveCurrentProject(ctx).projectIdentity
         });
       };
     }
-    const built = buildContextOptions(switchedConfig, switchedHistorian, resolveAutoSearchFromConfig(switchedConfig));
-    contextOptionsByDir.set(dir, built);
+    const auto = resolveAutoSearchFromConfig(cfg);
+    return {
+      projectDir: dir,
+      projectIdentity: identity,
+      config: cfg,
+      historianConfig: hist,
+      autoSearchConfig: auto,
+      contextOptions: buildContextOptions(cfg, hist, auto),
+      sidekickConfig: resolveSidekickFromConfig(cfg),
+      dreamerConfig: resolveDreamerFromConfig(cfg),
+      dreamerEnabled: isDreamerRunnable(cfg)
+    };
+  }
+  function resolveProjectDepsForDir(dir, identityOverride) {
+    const cached2 = projectDepsByDir.get(dir);
+    if (cached2)
+      return cached2;
+    ensureConfigLocationsMigrated(dir);
+    const switchedConfig = loadPiConfig({ cwd: dir }).config;
+    const switchedIdentity = identityOverride ?? resolveProjectIdentityOrFallback(dir);
+    const built = buildProjectDeps(dir, switchedIdentity, switchedConfig);
+    projectDepsByDir.set(dir, built);
     return built;
   }
-  const bootContextOptions = buildContextOptions(config2, historianConfig, autoSearchConfig);
-  contextOptionsByDir.set(projectDir, bootContextOptions);
-  registerPiContextHandler(pi, bootContextOptions);
-  info(historianConfig ? `registered historian trigger (model=${historianConfig.model}, executeThreshold=${formatExecuteThresholdForLog(historianConfig.executeThresholdPercentage)})` : "registered historian trigger: DISABLED (set historian.model in magic-context.jsonc)");
-  info(autoSearchConfig.enabled ? `registered auto-search hint (threshold=${autoSearchConfig.scoreThreshold}, minChars=${autoSearchConfig.minPromptChars})` : "registered auto-search hint: DISABLED (memory.auto_search.enabled=false)");
-  const sidekickConfig = resolveSidekickFromConfig(config2);
-  registerCtxAugCommand(pi, sidekickConfig);
-  info(sidekickConfig ? `registered /ctx-aug (sidekick model=${sidekickConfig.model})` : "registered /ctx-aug (sidekick disabled \u2014 set sidekick.disable=false and sidekick.model in config)");
+  function resolveCurrentProjectDeps(ctx) {
+    const currentProject = resolveCurrentProject(ctx);
+    return resolveProjectDepsForDir(currentProject.projectDir, currentProject.projectIdentity);
+  }
+  function resolveContextOptionsForProject(dir) {
+    return resolveProjectDepsForDir(dir).contextOptions;
+  }
+  const bootProjectDeps = buildProjectDeps(projectDir, projectIdentity, config2);
+  projectDepsByDir.set(projectDir, bootProjectDeps);
+  const todowriteEnabled = bootProjectDeps.config.todowrite.enabled !== false;
+  const todowriteOverlayEnabled = todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
+  registerMagicContextTools(pi, {
+    db,
+    ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
+    allowDreamerActions: false,
+    memoryToolEnabled: true,
+    protectedTags: config2.protected_tags ?? 20,
+    resolveProtectedTags: (ctx) => resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
+    dreamerEnabled: isDreamerRunnable(config2),
+    resolveDreamerEnabled: (ctx) => resolveCurrentProjectDeps(ctx).dreamerEnabled,
+    todowriteEnabled
+  });
+  tools_default(pi);
+  info(todowriteEnabled ? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos" : "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)");
+  const readLastTodoState = (sessionId) => getOrCreateSessionMeta(db, sessionId).lastTodoState;
+  if (todowriteEnabled) {
+    registerTodoStateLifecycle(pi, { readLastTodoState });
+  }
+  const todoOverlay = todowriteOverlayEnabled ? registerTodoOverlay(pi, {
+    readLastTodoState
+  }) : undefined;
+  info(todowriteOverlayEnabled ? "registered todowrite overlay" : "registered todowrite overlay: DISABLED (todowrite.enabled=false or todowrite.overlay=false)");
+  registerPiContextHandler(pi, bootProjectDeps.contextOptions);
+  info(bootProjectDeps.historianConfig ? `registered historian trigger (model=${bootProjectDeps.historianConfig.model}, executeThreshold=${formatExecuteThresholdForLog(bootProjectDeps.historianConfig.executeThresholdPercentage)})` : "registered historian trigger: DISABLED (set historian.model in magic-context.jsonc)");
+  info(bootProjectDeps.autoSearchConfig.enabled ? `registered auto-search hint (threshold=${bootProjectDeps.autoSearchConfig.scoreThreshold}, minChars=${bootProjectDeps.autoSearchConfig.minPromptChars})` : "registered auto-search hint: DISABLED (memory.auto_search.enabled=false)");
+  registerCtxAugCommand(pi, (ctx) => resolveCurrentProjectDeps(ctx).sidekickConfig);
+  info(bootProjectDeps.sidekickConfig ? `registered /ctx-aug (sidekick model=${bootProjectDeps.sidekickConfig.model})` : "registered /ctx-aug (sidekick disabled \u2014 set sidekick.disable=false and sidekick.model in config)");
+  const recompRunner = new PiSubagentRunner;
+  const wrapupRunner = new PiSubagentRunner;
+  const upgradeRunner = new PiSubagentRunner;
   registerCtxStatusCommand(pi, {
     db,
     projectIdentity,
     resolveProject: resolveCurrentProject,
-    protectedTags: config2.protected_tags,
-    executeThresholdPercentage: config2.execute_threshold_percentage,
-    historyBudgetPercentage: config2.history_budget_percentage,
-    injectionBudgetTokens: config2.memory?.injection_budget_tokens,
-    commitClusterTrigger: config2.commit_cluster_trigger,
-    executeThresholdTokens: config2.execute_threshold_tokens,
+    protectedTags: bootProjectDeps.config.protected_tags,
+    executeThresholdPercentage: bootProjectDeps.config.execute_threshold_percentage,
+    historyBudgetPercentage: bootProjectDeps.config.history_budget_percentage,
+    injectionBudgetTokens: bootProjectDeps.config.memory?.injection_budget_tokens,
+    commitClusterTrigger: bootProjectDeps.config.commit_cluster_trigger,
+    executeThresholdTokens: bootProjectDeps.config.execute_threshold_tokens,
     dreamer: {
-      runnable: isDreamerRunnable(config2),
-      scheduleSummary: summarizeDreamSchedule(config2.dreamer)
+      runnable: bootProjectDeps.dreamerEnabled,
+      scheduleSummary: summarizeDreamSchedule(bootProjectDeps.config.dreamer)
+    },
+    resolveStatusDeps: (ctx) => {
+      const current = resolveCurrentProjectDeps(ctx);
+      return {
+        db,
+        projectIdentity: current.projectIdentity,
+        resolveProject: resolveCurrentProject,
+        protectedTags: current.config.protected_tags,
+        executeThresholdPercentage: current.config.execute_threshold_percentage,
+        historyBudgetPercentage: current.config.history_budget_percentage,
+        injectionBudgetTokens: current.config.memory?.injection_budget_tokens,
+        commitClusterTrigger: current.config.commit_cluster_trigger,
+        executeThresholdTokens: current.config.execute_threshold_tokens,
+        dreamer: {
+          runnable: current.dreamerEnabled,
+          scheduleSummary: summarizeDreamSchedule(current.config.dreamer)
+        }
+      };
     }
   });
   info("registered /ctx-status");
@@ -209522,45 +210337,94 @@ async function src_default2(pi) {
   info("registered /ctx-flush");
   registerCtxRecompCommand(pi, {
     db,
-    runner: new PiSubagentRunner,
-    historianModel: historianConfig?.model,
-    historianChunkTokens: deriveHistorianChunkTokens(resolveHistorianContextLimit(historianConfig?.model)),
-    historianFallbacks: historianConfig?.fallbackModels,
-    historianTimeoutMs: config2.historian_timeout_ms,
-    historianThinkingLevel: historianConfig?.thinkingLevel,
-    language: config2.language,
-    memoryEnabled: config2.memory.enabled,
-    autoPromote: config2.memory.auto_promote
+    runner: recompRunner,
+    historianModel: bootProjectDeps.historianConfig?.model,
+    historianChunkTokens: deriveHistorianChunkTokens(resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model)),
+    historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
+    historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
+    historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
+    language: bootProjectDeps.config.language,
+    memoryEnabled: bootProjectDeps.config.memory.enabled,
+    autoPromote: bootProjectDeps.config.memory.auto_promote,
+    resolveRuntimeDeps: (ctx) => {
+      const current = resolveCurrentProjectDeps(ctx);
+      return {
+        db,
+        runner: recompRunner,
+        historianModel: current.historianConfig?.model,
+        historianChunkTokens: deriveHistorianChunkTokens(resolveHistorianContextLimit(current.historianConfig?.model)),
+        historianFallbacks: current.historianConfig?.fallbackModels,
+        historianTimeoutMs: current.config.historian_timeout_ms,
+        historianThinkingLevel: current.historianConfig?.thinkingLevel,
+        language: current.config.language,
+        memoryEnabled: current.config.memory.enabled,
+        autoPromote: current.config.memory.auto_promote
+      };
+    }
   });
   info("registered /ctx-recomp");
   registerCtxWrapupCommand(pi, {
     db,
-    runner: new PiSubagentRunner,
-    historianModel: historianConfig?.model,
-    historianChunkTokens: deriveHistorianChunkTokens(resolveHistorianContextLimit(historianConfig?.model)),
-    historianFallbacks: historianConfig?.fallbackModels,
-    historianTimeoutMs: config2.historian_timeout_ms,
-    historianThinkingLevel: historianConfig?.thinkingLevel,
-    language: config2.language,
-    memoryEnabled: config2.memory.enabled,
-    autoPromote: config2.memory.auto_promote,
-    userMemoriesEnabled: userMemoryCollectionEnabled(config2.dreamer),
-    executeThresholdPercentage: config2.execute_threshold_percentage,
-    executeThresholdTokens: config2.execute_threshold_tokens
+    runner: wrapupRunner,
+    historianModel: bootProjectDeps.historianConfig?.model,
+    historianChunkTokens: deriveHistorianChunkTokens(resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model)),
+    historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
+    historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
+    historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
+    language: bootProjectDeps.config.language,
+    memoryEnabled: bootProjectDeps.config.memory.enabled,
+    autoPromote: bootProjectDeps.config.memory.auto_promote,
+    userMemoriesEnabled: userMemoryCollectionEnabled(bootProjectDeps.config.dreamer),
+    executeThresholdPercentage: bootProjectDeps.config.execute_threshold_percentage,
+    executeThresholdTokens: bootProjectDeps.config.execute_threshold_tokens,
+    resolveRuntimeDeps: (ctx) => {
+      const current = resolveCurrentProjectDeps(ctx);
+      return {
+        db,
+        runner: wrapupRunner,
+        historianModel: current.historianConfig?.model,
+        historianChunkTokens: deriveHistorianChunkTokens(resolveHistorianContextLimit(current.historianConfig?.model)),
+        historianFallbacks: current.historianConfig?.fallbackModels,
+        historianTimeoutMs: current.config.historian_timeout_ms,
+        historianThinkingLevel: current.historianConfig?.thinkingLevel,
+        language: current.config.language,
+        memoryEnabled: current.config.memory.enabled,
+        autoPromote: current.config.memory.auto_promote,
+        userMemoriesEnabled: userMemoryCollectionEnabled(current.config.dreamer),
+        executeThresholdPercentage: current.config.execute_threshold_percentage,
+        executeThresholdTokens: current.config.execute_threshold_tokens
+      };
+    }
   });
   info("registered /ctx-wrapup");
   registerCtxSessionUpgradeCommand(pi, {
     db,
-    runner: new PiSubagentRunner,
-    historianModel: historianConfig?.model,
-    historianChunkTokens: deriveHistorianChunkTokens(resolveHistorianContextLimit(historianConfig?.model)),
-    historianFallbacks: historianConfig?.fallbackModels,
-    historianTimeoutMs: config2.historian_timeout_ms,
-    historianThinkingLevel: historianConfig?.thinkingLevel,
-    language: config2.language,
-    memoryEnabled: config2.memory.enabled,
-    autoPromote: config2.memory.auto_promote,
-    userMemoriesEnabled: userMemoryCollectionEnabled(config2.dreamer)
+    runner: upgradeRunner,
+    historianModel: bootProjectDeps.historianConfig?.model,
+    historianChunkTokens: deriveHistorianChunkTokens(resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model)),
+    historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
+    historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
+    historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
+    language: bootProjectDeps.config.language,
+    memoryEnabled: bootProjectDeps.config.memory.enabled,
+    autoPromote: bootProjectDeps.config.memory.auto_promote,
+    userMemoriesEnabled: userMemoryCollectionEnabled(bootProjectDeps.config.dreamer),
+    resolveRuntimeDeps: (ctx) => {
+      const current = resolveCurrentProjectDeps(ctx);
+      return {
+        db,
+        runner: upgradeRunner,
+        historianModel: current.historianConfig?.model,
+        historianChunkTokens: deriveHistorianChunkTokens(resolveHistorianContextLimit(current.historianConfig?.model)),
+        historianFallbacks: current.historianConfig?.fallbackModels,
+        historianTimeoutMs: current.config.historian_timeout_ms,
+        historianThinkingLevel: current.historianConfig?.thinkingLevel,
+        language: current.config.language,
+        memoryEnabled: current.config.memory.enabled,
+        autoPromote: current.config.memory.auto_promote,
+        userMemoriesEnabled: userMemoryCollectionEnabled(current.config.dreamer)
+      };
+    }
   });
   info("registered /ctx-session-upgrade");
   registerCtxDreamCommand(pi, {
@@ -209568,7 +210432,8 @@ async function src_default2(pi) {
     projectDir,
     projectIdentity,
     resolveProject: resolveCurrentProject,
-    dreamerEnabled: isDreamerRunnable(config2),
+    dreamerEnabled: bootProjectDeps.dreamerEnabled,
+    resolveDreamerEnabled: (ctx) => resolveCurrentProjectDeps(ctx).dreamerEnabled,
     onProjectSeen: (identity) => seenDreamerProjectIdentities.add(identity)
   });
   info("registered /ctx-dream");
@@ -209576,26 +210441,27 @@ async function src_default2(pi) {
     db,
     projectDir,
     projectIdentity,
-    memoryEnabled: config2.memory.enabled,
+    memoryEnabled: bootProjectDeps.config.memory.enabled,
+    resolveMemoryEnabled: (ctx) => resolveCurrentProjectDeps(ctx).config.memory.enabled,
     resolveProject: resolveCurrentProject
   });
   info("registered /ctx-embed");
-  const dreamerConfig = resolveDreamerFromConfig(config2);
+  const dreamerConfig = bootProjectDeps.dreamerConfig;
   if (dreamerConfig) {
     registerPiDreamerProject({
       db,
       projectDir,
       projectIdentity,
       config: dreamerConfig,
-      embeddingConfig: config2.embedding,
-      memoryEnabled: config2.memory.enabled,
-      language: config2.language,
-      gitCommitIndexing: config2.memory.git_commit_indexing,
+      embeddingConfig: bootProjectDeps.config.embedding,
+      memoryEnabled: bootProjectDeps.config.memory.enabled,
+      language: bootProjectDeps.config.language,
+      gitCommitIndexing: bootProjectDeps.config.memory.git_commit_indexing,
       onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject
     });
     info(`registered dreamer (${summarizeDreamSchedule(dreamerConfig)})`);
   } else {
-    info(isDreamerRunnable(config2) ? "registered dreamer: DISABLED (no dreamer config)" : "registered dreamer: DISABLED (dreamer.disable=true or no dreamer config)");
+    info(bootProjectDeps.dreamerEnabled ? "registered dreamer: DISABLED (no dreamer config)" : "registered dreamer: DISABLED (dreamer.disable=true or no dreamer config)");
   }
   pi.on("before_agent_start", async (event, ctx) => {
     try {
@@ -209616,13 +210482,14 @@ async function src_default2(pi) {
       }
     } catch {}
     try {
-      const currentProject = resolveCurrentProject(ctx);
+      const effectiveProjectDeps = resolveCurrentProjectDeps(ctx);
+      const currentProject = {
+        projectDir: effectiveProjectDeps.projectDir,
+        projectIdentity: effectiveProjectDeps.projectIdentity
+      };
+      const effectiveConfig = effectiveProjectDeps.config;
       seenDreamerProjectIdentities.add(currentProject.projectIdentity);
-      const switchedProject = currentProject.projectDir !== projectDir;
-      if (switchedProject)
-        ensureConfigLocationsMigrated(currentProject.projectDir);
-      const effectiveConfig = switchedProject ? loadPiConfig({ cwd: currentProject.projectDir }).config : config2;
-      const effectiveDreamerConfig = switchedProject ? resolveDreamerFromConfig(effectiveConfig) : dreamerConfig;
+      const effectiveDreamerConfig = effectiveProjectDeps.dreamerConfig;
       if (effectiveDreamerConfig) {
         try {
           registerPiDreamerProject({
@@ -209632,13 +210499,14 @@ async function src_default2(pi) {
             config: effectiveDreamerConfig,
             embeddingConfig: effectiveConfig.embedding,
             memoryEnabled: effectiveConfig.memory.enabled,
+            language: effectiveConfig.language,
             gitCommitIndexing: effectiveConfig.memory.git_commit_indexing,
             onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject
           });
         } catch (err5) {
           warn("before_agent_start: registerPiDreamerProject threw:", err5);
         }
-      } else if (switchedProject) {
+      } else {
         try {
           unregisterPiDreamerProject({
             projectIdentity: currentProject.projectIdentity
@@ -209665,11 +210533,10 @@ async function src_default2(pi) {
           const smForDrain = sm;
           const canDrain = typeof smForDrain.appendCompaction === "function" && typeof smForDrain.getBranch === "function";
           if (canDrain && getPendingPiCompactionMarkerState(db, sessionId)) {
-            signalPiDeferredHistoryRefresh(sessionId);
-            signalPiPendingMaterialization(sessionId);
+            signalPiDeferredCompactionMarkerDrain(sessionId);
           }
         } catch {}
-        if (ctx.hasUI && historianConfig?.model) {
+        if (ctx.hasUI && effectiveProjectDeps.historianConfig?.model) {
           maybeSendUpgradeReminder({
             client: null,
             db,
@@ -209692,7 +210559,6 @@ async function src_default2(pi) {
         return;
       }
       const isCacheBusting = sessionId ? hasSystemPromptRefresh(sessionId) : true;
-      const effectiveDreamerRunnable = switchedProject ? isDreamerRunnable(effectiveConfig) : isDreamerRunnable(config2);
       const block = buildMagicContextBlock({
         db,
         cwd: currentProject.projectDir,
@@ -209701,7 +210567,7 @@ async function src_default2(pi) {
         includeGuidance: true,
         protectedTags: effectiveConfig.protected_tags,
         ctxReduceCallable: true,
-        dreamerEnabled: effectiveDreamerRunnable,
+        dreamerEnabled: effectiveProjectDeps.dreamerEnabled,
         temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
         cavemanTextCompressionEnabled: effectiveConfig.caveman_text_compression?.enabled === true,
         language: effectiveConfig.language,
@@ -209759,6 +210625,10 @@ ${block}` : systemPromptText;
         const todoArgs = event.args;
         const todos = todoArgs?.todos;
         const sessionMeta = Array.isArray(todos) ? getOrCreateSessionMeta(db, sessionId) : null;
+        if (todowriteEnabled && Array.isArray(todos)) {
+          setTodoSnapshot(sessionId, todos);
+          todoOverlay?.update(sessionId);
+        }
         if (sessionMeta && !sessionMeta.isSubagent) {
           const normalizedTodos = normalizeTodoStateJson(todos);
           if (normalizedTodos !== null) {
@@ -209847,7 +210717,7 @@ ${block}` : systemPromptText;
         db,
         sessionId,
         message: event.message,
-        cacheTtlConfig: config2.cache_ttl
+        cacheTtlConfig: resolveCurrentProjectDeps(ctx).config.cache_ttl
       });
       const piUsage = ctx.getContextUsage?.();
       const piContextWindow = piUsage && typeof piUsage.contextWindow === "number" && piUsage.contextWindow > 0 ? piUsage.contextWindow : ctx.model?.contextWindow ?? 0;
@@ -209889,6 +210759,10 @@ ${block}` : systemPromptText;
               const normalized = normalizeTodoStateJson(todos);
               if (normalized === null)
                 continue;
+              if (todowriteEnabled) {
+                setTodoSnapshot(sessionId, todos);
+                todoOverlay?.update(sessionId);
+              }
               updateSessionMeta(db, sessionId, {
                 lastTodoState: normalized
               });
@@ -209980,6 +210854,7 @@ function formatExecuteThresholdForLog(value) {
   return overrides.length > 0 ? `${base} (${overrides.join(", ")})` : base;
 }
 export {
+  signalPiDeferredCompactionMarkerDrain,
   resolveSidekickFromConfig,
   resolveHistorianFromConfig,
   resolveDreamerFromConfig,

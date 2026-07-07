@@ -373,10 +373,10 @@ export function getMeaningfulSkipReason(entry: SessionEntry): MeaningfulSkipReas
  if (msg.role === "assistant") {
   if (Array.isArray(msg.content)) {
    const toolCalls = msg.content.filter(
-    (c): c is ToolCall => c.type === "toolCall",
+    (c: AssistantContentPart): c is ToolCall => c.type === "toolCall",
    );
    const hasVisibleText = msg.content.some(
-    (c) => c.type === "text" && (c as TextContent).text.trim().length > 0,
+    (c: AssistantContentPart) => c.type === "text" && (c as TextContent).text.trim().length > 0,
    );
    const onlyInternalTools = toolCalls.length > 0 &&
     toolCalls.every((tc: ToolCall) => ACM_INTERNAL_TOOLS.has(tc.name));

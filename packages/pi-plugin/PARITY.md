@@ -557,6 +557,33 @@ channel) — it reflects `task_schedule_state` read-only.
 
 ---
 
+## 19b. Processed-image stripping is OpenCode-only
+
+OpenCode replaces large base64 image payloads in user `file` parts with
+sentinels once the assistant has processed them (`stripProcessedImages`,
+frozen-id replay). Pi's image part shape differs (`kind: "image"` with a URL)
+and large base64 images are rare in Pi sessions — the equivalent strip would
+only fire for the pasted-screenshot case, which Pi does not currently
+optimize. A Pi-specific image-content stripper can be added later if that
+case becomes common. Intentional divergence (see the cleanup-stage notes in
+`context-handler.ts`).
+
+---
+
+## 19a. `/ctx-aug` skips empty sidekick augmentation blocks
+
+When sidekick returns the empty-result sentinel (for example, "No relevant
+memories found"), **Pi sends the original prompt without a
+`<sidekick-augmentation>` block**. This is intentional: a no-op augmentation
+block consumes tokens and adds noise while giving the main agent no useful
+context.
+
+OpenCode currently injects a `<sidekick-augmentation>` block containing the
+empty sentinel text. Pi's behavior is the desired target; OpenCode should
+eventually adopt the same skip-empty behavior.
+
+---
+
 ## 20. Pi subagents discover extensions, then fail closed with per-agent tools
 
 Pi child agents are spawned as `pi --print --mode json --no-session` subprocesses.

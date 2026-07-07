@@ -352,7 +352,7 @@ function setEntryLabel(sm: SessionManager, entryId: string, label: string | unde
 
 // ── Extension factory ─────────────────────────────────────────
 
-export default function registerACMExtension(pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI) {
     const acmToolNames = new Set(["acm_checkpoint", "acm_timeline", "acm_travel"]);
     pi.on("before_provider_request", (event) => {
         const payload = event.payload;

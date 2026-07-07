@@ -43,14 +43,29 @@ if (!index.includes("registerACMExtension(pi)")) {
     : 'info(\n\t\t`registered tools:';
   const infoPos = index.indexOf(infoAnchor);
   if (infoPos === -1) {
-    // Fallback: find any `info("registered tools` or `info(`registered tools`
-    const re = /info\(\s*["`]registered tools:/;
-    const m = re.exec(index);
-    if (!m) {
+    // Fallback: find the info() call about registered tools that comes AFTER registerMagicContextTools
+    const regToolsPos = index.indexOf("registerMagicContextTools(");
+    if (regToolsPos === -1) {
+      console.error(`ERROR: could not find registerMagicContextTools in ${indexPath}`);
+      process.exit(1);
+    }
+    // Find the next info() call after registerMagicContextTools that mentions "registered tools"
+    const afterReg = index.slice(regToolsPos);
+    const re = /info\(/g;
+    let m;
+    let insertPos = -1;
+    while ((m = re.exec(afterReg)) !== null) {
+      const lineEnd = afterReg.indexOf("\n", m.index + 100) || afterReg.length;
+      const chunk = afterReg.slice(m.index, Math.min(m.index + 300, afterReg.length));
+      if (chunk.includes("registered tools")) {
+        insertPos = regToolsPos + m.index;
+        break;
+      }
+    }
+    if (insertPos === -1) {
       console.error(`ERROR: could not find registered tools info() in ${indexPath}`);
       process.exit(1);
     }
-    const insertPos = m.index;
     index = index.slice(0, insertPos) +
       "// Register ACM tools (acm_checkpoint, acm_timeline, acm_travel)\n\t" +
       "registerACMExtension(pi);\n\n\t" +

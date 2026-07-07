@@ -136,6 +136,7 @@ import {
 	setRawMessageProvider,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { invalidateTrueRawTokenCache } from "@magic-context/core/hooks/magic-context/read-session-true-raw-tokens";
+import { modelAcceptsEmptyContent } from "@magic-context/core/hooks/magic-context/sentinel";
 import {
 	buildEditSupersessionReclaim,
 	buildSupersessionReclaimOps,
@@ -153,6 +154,7 @@ import {
 	runAutoSearchHintForPi,
 } from "./auto-search-pi";
 import { clearPiEmbedSessionState } from "./commands/ctx-embed";
+import { sendCtxStatusMessage } from "./commands/pi-command-utils";
 import {
 	type ApplyDeferredPiCompactionMarkerDeps,
 	applyDeferredPiCompactionMarker,
@@ -253,6 +255,17 @@ export const __test = {
 	applyForwardPressureFloor,
 	buildEntryFingerprintMap,
 	buildPiToolOwnerMap,
+	setInFlightHistorianForTests(
+		sessionId: string,
+		promise: Promise<unknown>,
+	): () => void {
+		inFlightHistorian.set(sessionId, promise);
+		return () => {
+			if (inFlightHistorian.get(sessionId) === promise) {
+				inFlightHistorian.delete(sessionId);
+			}
+		};
+	},
 	setInjectM0M1PiForTests(fn: typeof injectM0M1Pi): () => void {
 		injectM0M1PiForRun = fn;
 		return () => {
@@ -1849,6 +1862,11 @@ export function registerPiContextHandler(
 
 			const sessionMeta = sessionMetaForUsage;
 			const modelKey = liveModelBySession.get(sessionId);
+			const providerId =
+				typeof ctx.model?.provider === "string"
+					? ctx.model.provider
+					: undefined;
+			const canUseEmptySentinels = modelAcceptsEmptyContent(providerId);
 			// Cold-start stable-limit fallback: if `getContextUsage()` hasn't
 			// reported a (sane) window yet (first pass after restart, before any
 			// response), read the model's window directly from `ctx.model`
@@ -1883,6 +1901,7 @@ export function registerPiContextHandler(
 					piUsage?.tokens,
 					usageContextLimit,
 				));
+			const realUsagePercentageBeforeEmergencyBump = usagePercentage;
 			// Emergency bump LAST so it floors recovery pressure without capping
 			// a higher live forward-pressure reading.
 			if (needsEmergencyBump) {
@@ -2091,19 +2110,16 @@ export function registerPiContextHandler(
 					}
 				}
 
-				// Disarm a stuck emergency-recovery flag. The flag is normally
-				// cleared by the historian publication path (onPublished →
-				// clearEmergencyRecovery). But if recovery was armed by an
-				// overflow on a session with NO eligible pre-tail history to
-				// compact, no historian will ever spawn (maybeFireHistorian's
-				// trigger needs eligible history), so onPublished never fires and
-				// the flag stays armed — bumping every later pass to 95% forever
-				// (abort loop), even after the user manually frees context. Clear
-				// it here when there's no in-flight historian AND no eligible
-				// history, mirroring OpenCode transform.ts:745. detectedContextLimit
-				// is left intact (authoritative model data).
+				// Disarm a stuck emergency-recovery flag only after real pressure has
+				// fallen below the force-materialization threshold. The flag must survive
+				// while the session is genuinely oversized; clearing it early would expose
+				// the next send to another overflow. Once the user has freed enough context,
+				// the emergency bump is stale and can stop forcing every pass to 95%. The
+				// detected context limit is left intact as authoritative model data.
 				if (
 					emergencyRecoveryArmed &&
+					realUsagePercentageBeforeEmergencyBump <
+						FORCE_MATERIALIZATION_PERCENTAGE &&
 					!inFlightHistorian.has(sessionId) &&
 					!hasEligiblePiCompartmentHistory(options.db, sessionId)
 				) {
@@ -2239,6 +2255,7 @@ export function registerPiContextHandler(
 						options.heuristics?.clearReasoningAge ??
 						DEFAULT_CLEAR_REASONING_AGE,
 				},
+				canUseEmptySentinels,
 				temporalAwareness: options.injection?.temporalAwareness === true,
 				appendCompaction: resolvePiAppendCompaction(ctx),
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
@@ -2279,6 +2296,7 @@ export function registerPiContextHandler(
 			// fire-and-forget so we never block the LLM call on it.
 			if (options.historian) {
 				maybeFireHistorian({
+					pi,
 					ctx,
 					sessionId,
 					db: options.db,
@@ -2835,6 +2853,7 @@ function sendPiIgnoredNotification(
 }
 
 function spawnPiHistorianRun(args: {
+	pi: ExtensionAPI;
 	ctx: ExtensionContext;
 	sessionId: string;
 	db: ContextDatabase;
@@ -2844,8 +2863,10 @@ function spawnPiHistorianRun(args: {
 	boundarySnapshot: ProtectedTailBoundarySnapshot;
 	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
 	currentContextLimit: number;
+	fallbackModelId?: string;
 }): void {
 	const {
+		pi,
 		ctx,
 		sessionId,
 		db,
@@ -2855,6 +2876,7 @@ function spawnPiHistorianRun(args: {
 		boundarySnapshot,
 		refreshBoundarySnapshot,
 		currentContextLimit,
+		fallbackModelId,
 	} = args;
 	const holderId = crypto.randomUUID();
 	const runPromise = (async () => {
@@ -2885,6 +2907,7 @@ function spawnPiHistorianRun(args: {
 				runner: historian.runner,
 				historianModel: historian.model,
 				fallbackModels: historian.fallbackModels,
+				fallbackModelId,
 				historianChunkTokens: historian.historianChunkTokens,
 				boundarySnapshot,
 				refreshBoundarySnapshot,
@@ -2897,6 +2920,20 @@ function spawnPiHistorianRun(args: {
 				userMemoriesEnabled: historian.userMemoriesEnabled,
 				language: historian.language,
 				compartmentLeaseHolderId: holderId,
+				notifyIssue: (text) => {
+					if (!isContextHandlerSessionActive(sessionId)) {
+						sessionLog(
+							sessionId,
+							"historian failure notice skipped after session context cleared",
+						);
+						return;
+					}
+					sendCtxStatusMessage(pi, {
+						title: "Magic Context",
+						text,
+						level: "warning",
+					});
+				},
 				onPublished: () => {
 					const sessionStillActive = isContextHandlerSessionActive(sessionId);
 					try {
@@ -2994,6 +3031,7 @@ function resolvePiReadBranchEntries(
  * agent turn continues regardless of historian outcome.
  */
 function maybeFireHistorian(args: {
+	pi: ExtensionAPI;
 	ctx: ExtensionContext;
 	sessionId: string;
 	db: ContextDatabase;
@@ -3199,6 +3237,7 @@ function maybeFireHistorian(args: {
 					`## Historian recovery\n\nHistorian previously failed ${failureState.failureCount} time(s), so Magic Context is retrying history comparting immediately after restart.`,
 				);
 				spawnPiHistorianRun({
+					pi: args.pi,
 					ctx,
 					sessionId,
 					db,
@@ -3208,6 +3247,7 @@ function maybeFireHistorian(args: {
 					boundarySnapshot,
 					refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
 					currentContextLimit: boundaryContextLimit,
+					fallbackModelId: modelKey,
 				});
 				return;
 			}
@@ -3284,6 +3324,7 @@ function maybeFireHistorian(args: {
 		// at session_shutdown — without that, `pi --print` mode would
 		// kill the historian subprocess mid-run when the parent exits.
 		spawnPiHistorianRun({
+			pi: args.pi,
 			ctx,
 			sessionId,
 			db,
@@ -3296,6 +3337,7 @@ function maybeFireHistorian(args: {
 			}),
 			refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
 			currentContextLimit: boundaryContextLimit,
+			fallbackModelId: modelKey,
 		});
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -3404,6 +3446,8 @@ interface RunPipelineArgs {
 	reasoningClearing?: {
 		clearReasoningAge: number;
 	};
+	/** True only when the active provider filters empty sentinel content safely. */
+	canUseEmptySentinels: boolean;
 	/**
 	 * Whether to inject temporal `<!-- +Xm -->` markers into user
 	 * messages with large gaps. Mirrors OpenCode's
@@ -3630,13 +3674,21 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					getCompartments(args.db, args.sessionId),
 				).value
 			: false;
+	const historianRunning = inFlightHistorian.has(args.sessionId);
+	// Match OpenCode's compartment-running veto: a normal execute/deferred drain
+	// must wait while the historian is reading its raw snapshot, but unavoidable
+	// busts still drain immediately so they do not create a second cache bust later.
+	const bypassHistorianGate =
+		args.forceMaterialization === true || m0HardFoldThisPass;
+	const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
 	// Pi sessions are primary-equivalent today. If Pi adds subagents on this
 	// transform path, subagents should bypass this once-per-turn guard like
 	// OpenCode does, because they do not share the primary agent's turn cache.
 	const shouldRunHeuristics =
 		args.heuristics !== undefined &&
+		(!historianRunning || bypassHistorianGate) &&
 		(args.forceMaterialization === true ||
-			hasPendingMaterialization(args.sessionId) ||
+			hasPendingMaterializeSignal ||
 			deferredMaterializeEligible ||
 			// A known m[0] hard fold busts the prefix regardless, so fold this
 			// pass's reductions into that unavoidable bust instead of waiting for a
@@ -3732,6 +3784,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// detection in `before_agent_start` also signals this set so a
 	// real prompt-content change forces materialization on the same
 	// turn the cache already busts.
+	// Normal drains wait while this session's historian is in flight; force
+	// materialization and m[0] hard folds are already cache-busting, so they bypass
+	// the historian gate and drain now.
 	//
 	// PEEK-then-drain-on-success pattern (Oracle audit Round 8 #6):
 	// the signal is only deleted AFTER applyPendingOperations succeeds.
@@ -3739,7 +3794,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	//
 	// Drops in the protected window are deferred (re-queued) so the
 	// agent's recent working context stays intact.
-	const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
 	const deferredMaterializationWasPending = deferredMaterializationSessions.has(
 		args.sessionId,
 	);
@@ -3771,7 +3825,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const deferredHistoryRefresh =
 		canConsumeDeferredLate && deferredHistoryRefreshWasPending;
 	const shouldApplyPendingOps =
-		baseShouldApplyPendingOps || deferredMaterialize;
+		(baseShouldApplyPendingOps || deferredMaterialize) &&
+		(!historianRunning || bypassHistorianGate);
 	if (shouldApplyPendingOps) {
 		const applyReason = hasPendingMaterializeSignal
 			? "explicit_flush"
@@ -4025,6 +4080,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.messages,
 				{
 					protectedTags: args.protectedTags,
+					staleReduceStripEnabled: args.canUseEmptySentinels,
 					// Tiered emergency drop fires only at ≥85% AND when the
 					// ceiling is known. forceMaterialization already incorporates
 					// the ≥85% / emergency condition for Pi (primary-equivalent).
