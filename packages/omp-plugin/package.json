@@ -63,12 +63,12 @@
 	},
 	"exports": {
 		".": {
-			"import": "./dist/index.js"
+			"import": "./src/index.ts"
 		}
 	},
 	"omp": {
 		"extensions": [
-			"./dist/index.js"
+			"./src/index.ts"
 		]
 	}
 }
