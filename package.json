@@ -8,7 +8,6 @@
     "packages/omp-plugin"
   ],
   "dependencies": {
-    "@huggingface/transformers": "^4.1.0",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
     "ai-tokenizer": "^1.0.6",
     "comment-json": "^5.0.0",
