@@ -12,5 +12,15 @@
     "build": "bun run --filter '*' build",
     "test": "bun run --filter '*' test",
     "typecheck": "bun run --filter '*' typecheck"
+  },
+  "pi": {
+    "extensions": [
+      "./packages/pi-plugin/src/index.ts"
+    ]
+  },
+  "omp": {
+    "extensions": [
+      "./packages/omp-plugin/src/index.ts"
+    ]
   }
 }
