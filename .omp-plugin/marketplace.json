@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "magic-acm-context",
-      "source": "./packages/omp-plugin",
+      "source": "./",
       "description": "MC (memory/reduce/search/note/expand) + ACM (checkpoint/timeline/travel) 统一上下文管理",
       "category": "productivity",
       "keywords": [
