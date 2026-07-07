@@ -1,7 +1,6 @@
 {
   "name": "magic-acm-context",
   "version": "0.1.0",
-  "private": true,
   "description": "Magic Context + ACM (Active Context Management) unified extension for pi and omp",
   "workspaces": [
     "packages/plugin",
