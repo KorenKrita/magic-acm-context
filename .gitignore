@@ -13,8 +13,7 @@ Thumbs.db
 !.env.example
 
 node_modules/
-packages/plugin/dist/
-packages/pi-plugin/dist/
+dist/
 build/
 
 *.log
