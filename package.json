@@ -20,7 +20,7 @@
   },
   "omp": {
     "extensions": [
-      "./packages/omp-plugin/src/index.ts"
+      "./packages/omp-plugin/dist/index.js"
     ]
   }
 }

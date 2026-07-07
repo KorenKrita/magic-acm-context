@@ -27,7 +27,7 @@
 		"README.md"
 	],
 	"scripts": {
-		"build": "bun build src/index.ts src/subagent-entry.ts --outdir dist --target node --format esm --external @oh-my-pi/pi-coding-agent --external @oh-my-pi/pi-tui --external @huggingface/transformers --external node:sqlite",
+		"build": "bun build src/index.ts src/subagent-entry.ts --outdir dist --target bun --format esm --external @oh-my-pi/pi-coding-agent --external @oh-my-pi/pi-tui --external @huggingface/transformers --external node:sqlite",
 		"typecheck": "tsc --noEmit",
 		"test": "bun test",
 		"lint": "biome check src",
@@ -63,12 +63,12 @@
 	},
 	"exports": {
 		".": {
-			"import": "./src/index.ts"
+			"import": "./dist/index.js"
 		}
 	},
 	"omp": {
 		"extensions": [
-			"./src/index.ts"
+			"./dist/index.js"
 		]
 	}
 }
