@@ -1,0 +1,37 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "magic-acm-context",
+  "owner": {
+    "name": "KorenKrita"
+  },
+  "metadata": {
+    "description": "Magic Context + ACM unified context management extension",
+    "version": "0.1.0",
+    "pluginRoot": "packages/omp-plugin"
+  },
+  "plugins": [
+    {
+      "name": "magic-acm-context",
+      "description": "MC (memory/reduce/search/note/expand) + ACM (checkpoint/timeline/travel) 统一上下文管理扩展",
+      "source": "packages/omp-plugin",
+      "version": "0.1.0",
+      "author": {
+        "name": "KorenKrita"
+      },
+      "homepage": "https://github.com/KorenKrita/magic-acm-context",
+      "repository": "https://github.com/KorenKrita/magic-acm-context",
+      "license": "MIT",
+      "keywords": [
+        "context",
+        "management",
+        "magic-context",
+        "acm",
+        "checkpoint",
+        "travel",
+        "memory",
+        "reduce"
+      ],
+      "category": "productivity"
+    }
+  ]
+}
