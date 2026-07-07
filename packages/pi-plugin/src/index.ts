@@ -35,7 +35,7 @@ import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityOrFallback } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
@@ -94,6 +94,7 @@ import { registerCtxFlushCommand } from "./commands/ctx-flush";
 import { registerCtxRecompCommand } from "./commands/ctx-recomp";
 import { registerCtxSessionUpgradeCommand } from "./commands/ctx-session-upgrade";
 import { registerCtxStatusCommand } from "./commands/ctx-status";
+import { registerCtxWrapupCommand } from "./commands/ctx-wrapup";
 import { loadPiConfig } from "./config";
 import {
 	awaitInFlightHistorians,
@@ -107,6 +108,7 @@ import {
 	recordPiLiveModel,
 	registerPiContextHandler,
 	signalPiDeferredHistoryRefresh,
+	signalPiDeferredMaterialization,
 	signalPiHistoryRefresh,
 	signalPiPendingMaterialization,
 	signalPiSystemPromptRefresh,
@@ -150,7 +152,7 @@ function resolveCurrentProject(ctx: { cwd: string }): {
 	projectIdentity: string;
 } {
 	const projectDir = ctx.cwd;
-	const projectIdentity = resolveProjectIdentity(projectDir);
+	const projectIdentity = resolveProjectIdentityOrFallback(projectDir);
 	return { projectDir, projectIdentity };
 }
 
@@ -526,14 +528,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// identity/path resolution uses ctx.cwd per hook/command so session cwd
 	// switches follow the active project without reloading config.
 	const projectDir = process.cwd();
-	const projectIdentity = resolveProjectIdentity(projectDir);
+	const projectIdentity = resolveProjectIdentityOrFallback(projectDir);
 	const seenDreamerProjectIdentities = new Set<string>([projectIdentity]);
 
 	try {
 		const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
 		for (const sid of pendingPiMarkerSessions) {
 			signalPiDeferredHistoryRefresh(sid);
-			signalPiPendingMaterialization(sid);
+			signalPiDeferredMaterialization(sid);
 		}
 		if (pendingPiMarkerSessions.length > 0) {
 			log(
@@ -621,11 +623,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
 		// the retrieval-only sidekick, a separate security concern.)
 		memoryToolEnabled: true,
-		// Match OpenCode's gating: when ctx_reduce_enabled is false,
-		// we don't surface the tool at all (along with disabling §N§
-		// prefix injection and stripping ctx_reduce mentions from the
-		// system prompt). When true, register ctx_reduce.
-		ctxReduceEnabled: config.ctx_reduce_enabled === true,
 		protectedTags: config.protected_tags ?? 20,
 		// Smart notes (surface_condition) only work when dreamer is
 		// running — otherwise the note sits `pending` forever with no
@@ -636,9 +633,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	registerACMExtension(pi);
 
 	info(
-		`registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand${
-			config.ctx_reduce_enabled === true ? ", ctx_reduce" : ""
-		}, acm_checkpoint, acm_timeline, acm_travel`,
+		"registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce",
 	);
 
 	// Register the per-LLM-call transform pipeline. Tags eligible message
@@ -670,17 +665,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		auto: PiAutoSearchHandlerOptions,
 	): PiContextHandlerOptions => ({
 		db: database,
-		ctxReduceEnabled: cfg.ctx_reduce_enabled,
 		smartDrops: cfg.smart_drops === true,
 		protectedTags: cfg.protected_tags ?? 20,
 		heuristics: {
-			caveman:
-				cfg.ctx_reduce_enabled === false && cfg.caveman_text_compression
-					? {
-							enabled: cfg.caveman_text_compression.enabled,
-							minChars: cfg.caveman_text_compression.min_chars,
-						}
-					: undefined,
+			caveman: cfg.caveman_text_compression
+				? {
+						enabled: cfg.caveman_text_compression.enabled,
+						minChars: cfg.caveman_text_compression.min_chars,
+					}
+				: undefined,
 			clearReasoningAge: cfg.clear_reasoning_age,
 		},
 		injection: {
@@ -825,6 +818,25 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		autoPromote: config.memory.auto_promote,
 	});
 	info("registered /ctx-recomp");
+
+	registerCtxWrapupCommand(pi, {
+		db,
+		runner: new PiSubagentRunner(),
+		historianModel: historianConfig?.model,
+		historianChunkTokens: deriveHistorianChunkTokens(
+			resolveHistorianContextLimit(historianConfig?.model),
+		),
+		historianFallbacks: historianConfig?.fallbackModels,
+		historianTimeoutMs: config.historian_timeout_ms,
+		historianThinkingLevel: historianConfig?.thinkingLevel,
+		language: config.language,
+		memoryEnabled: config.memory.enabled,
+		autoPromote: config.memory.auto_promote,
+		userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
+		executeThresholdPercentage: config.execute_threshold_percentage,
+		executeThresholdTokens: config.execute_threshold_tokens,
+	});
+	info("registered /ctx-wrapup");
 
 	// E6b/E6c: /ctx-session-upgrade — full recomp (legacy→v2 tiered) + once-per-
 	// project memory migration into the 5-category taxonomy. Own runner instance
@@ -1128,11 +1140,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				memoryEnabled: effectiveConfig.memory.enabled,
 				includeGuidance: true,
 				protectedTags: effectiveConfig.protected_tags,
-				ctxReduceEnabled: effectiveConfig.ctx_reduce_enabled,
+				ctxReduceCallable: true,
 				dreamerEnabled: effectiveDreamerRunnable,
 				temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
 				cavemanTextCompressionEnabled:
-					effectiveConfig.ctx_reduce_enabled === false &&
 					effectiveConfig.caveman_text_compression?.enabled === true,
 				language: effectiveConfig.language,
 				// Stable user memories rendered as <user-profile> — dreamer

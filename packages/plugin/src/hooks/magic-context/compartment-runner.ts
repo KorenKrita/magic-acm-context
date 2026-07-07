@@ -4,7 +4,7 @@ import {
     releaseCompartmentLease,
     renewCompartmentLease,
 } from "../../features/magic-context/compartment-lease";
-import { updateSessionMeta } from "../../features/magic-context/storage-meta";
+import { isWrapupInProgress, updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { sessionLog } from "../../shared/logger";
 import { runCompartmentAgent } from "./compartment-runner-incremental";
 import {
@@ -17,6 +17,7 @@ import type { CompartmentRunnerDeps } from "./compartment-runner-types";
 export interface ActiveCompartmentRun {
     promise: Promise<void>;
     published: boolean;
+    kind?: "incremental" | "recomp" | "wrapup" | "other";
     /**
      * Set to true once the 95%-emergency user-facing notification has been
      * dispatched for this run. Prevents the notification from re-firing on
@@ -56,10 +57,12 @@ export function markActiveCompartmentRunPublished(sessionId: string): void {
 export function registerActiveCompartmentRun(
     sessionId: string,
     promise: Promise<void>,
+    kind: ActiveCompartmentRun["kind"] = "other",
 ): ActiveCompartmentRun {
     const activeRun: ActiveCompartmentRun = {
         promise: Promise.resolve(),
         published: false,
+        kind,
     };
     const wrapped = promise.finally(() => {
         // Only clear if this is still the current entry (another run may have
@@ -88,10 +91,18 @@ function startLeaseRenewal(
     holderId: string,
 ): ReturnType<typeof setInterval> {
     return setInterval(() => {
-        if (!renewCompartmentLease(deps.db, deps.sessionId, holderId)) {
+        try {
+            if (!renewCompartmentLease(deps.db, deps.sessionId, holderId)) {
+                sessionLog(
+                    deps.sessionId,
+                    "compartment lease renewal failed; publish will be skipped if holder is stale",
+                );
+            }
+        } catch (err) {
+            // A missed renewal is safe because the compartment lease has a five-minute TTL.
             sessionLog(
                 deps.sessionId,
-                "compartment lease renewal failed; publish will be skipped if holder is stale",
+                `compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
             );
         }
     }, COMPARTMENT_LEASE_RENEWAL_MS);
@@ -103,6 +114,15 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
     // so another start for the same session cannot sneak in here.
     const existing = activeRuns.get(deps.sessionId);
     if (existing) {
+        return;
+    }
+
+    if (isWrapupInProgress(deps.db, deps.sessionId)) {
+        // /ctx-wrapup owns compartment-state publication while this marker is live.
+        // The marker has a five-minute TTL renewed by wrapup, so a crashed wrapup
+        // self-expires instead of suppressing trigger-fired historian runs forever.
+        sessionLog(deps.sessionId, "compartment agent skipped: /ctx-wrapup is active");
+        updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
         return;
     }
 
@@ -119,6 +139,15 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
         updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
         return;
     }
+    if (isWrapupInProgress(deps.db, deps.sessionId)) {
+        // Close the cross-process check/lease race: /ctx-wrapup may have published
+        // its marker after the first check but before this process won the lease.
+        sessionLog(deps.sessionId, "compartment agent skipped: /ctx-wrapup became active");
+        releaseCompartmentLease(deps.db, deps.sessionId, holderId);
+        updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
+        return;
+    }
+
     const renewal = startLeaseRenewal(deps, holderId);
 
     // Track the real underlying promise — NOT a raced wrapper.
@@ -149,7 +178,7 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
                 activeRuns.delete(deps.sessionId);
             }
         });
-    activeRuns.set(deps.sessionId, { promise, published: false });
+    activeRuns.set(deps.sessionId, { promise, published: false, kind: "incremental" });
     // If the runner no-op'd synchronously (stale/empty snapshot, nothing to
     // compact, drain-quota), it returned before signalling onHistorianRunStarted
     // and before any `await`, so `promise` is already settling. It cleared
@@ -189,6 +218,13 @@ export async function executeContextRecompWithResult(
     options: ExecuteContextRecompOptions = {},
 ): Promise<ExecuteContextRecompResult> {
     const { sessionId } = deps;
+    if (isWrapupInProgress(deps.db, sessionId)) {
+        return {
+            message:
+                "## Magic Recomp — Skipped\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try `/ctx-recomp` again.",
+            published: false,
+        };
+    }
     if (activeRuns.has(sessionId)) {
         return {
             // "— Skipped" suffix so isRecompFailure() (string-based callers) treats
@@ -221,7 +257,7 @@ export async function executeContextRecompWithResult(
         .catch((err) => {
             sessionLog(sessionId, "compartment agent: recomp unhandled rejection:", err);
         });
-    activeRuns.set(sessionId, { promise: wrappedPromise, published: false });
+    activeRuns.set(sessionId, { promise: wrappedPromise, published: false, kind: "recomp" });
     try {
         const message = await promise;
         // B1 (dogfood 2026-05-30): log EVERY recomp outcome here — this wraps all

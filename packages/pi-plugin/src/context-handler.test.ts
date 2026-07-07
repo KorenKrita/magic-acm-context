@@ -8,6 +8,7 @@ import {
 } from "@magic-context/core/features/magic-context/message-index-async";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
+	acquireWrapupInProgress,
 	addNote,
 	appendNoteNudgeAnchor,
 	getHistorianFailureState,
@@ -25,6 +26,7 @@ import {
 	setLastNudgeLevel,
 	setLastNudgeUndropped,
 	setPendingPiCompactionMarkerState,
+	updateCavemanDepth,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
 import { getEmergencyInputSample } from "@magic-context/core/features/magic-context/storage-meta-persisted";
@@ -51,6 +53,7 @@ import {
 	registerPiContextHandler,
 	resolvePiHistorianTriggerInputs,
 	signalPiDeferredHistoryRefresh,
+	signalPiDeferredMaterialization,
 	signalPiHistoryRefresh,
 	signalPiPendingMaterialization,
 	trackSessionForProject,
@@ -876,7 +879,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -898,8 +900,7 @@ describe("registerPiContextHandler", () => {
 		// Council #4 (project-config bleed on /cd): a Pi process can switch
 		// projects mid-session; the context handler must resolve options from the
 		// CURRENT pass cwd, not the launch-cwd base options. We assert the
-		// resolver is consulted with ctx.cwd and that its returned options win
-		// (here: a switched project disables ctx_reduce, so no §N§ prefix).
+		// resolver is consulted with ctx.cwd and that its returned options win.
 		const db = createTestDb();
 		try {
 			const fake = createFakePi();
@@ -907,12 +908,9 @@ describe("registerPiContextHandler", () => {
 			const switchedDir = "/tmp/switched-project-abc";
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				// Base (launch) options: ctx_reduce ON.
-				ctxReduceEnabled: true,
 				resolveForProject: (dir: string) => {
 					seenDirs.push(dir);
-					// Switched checkout turns ctx_reduce OFF.
-					return { db, ctxReduceEnabled: false };
+					return { db, smartDrops: true };
 				},
 			});
 			const handler = fake.handlers.get("context") as (
@@ -943,7 +941,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -975,7 +972,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: false,
 				historian: {
 					runner: {} as SubagentRunner,
 					model: "test/historian",
@@ -1015,7 +1011,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				scheduler: { executeThresholdPercentage: 65 },
 			});
@@ -1068,7 +1063,6 @@ describe("registerPiContextHandler", () => {
 			recordPiLiveModel(sessionId, "anthropic/old-model");
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				scheduler: { executeThresholdPercentage: 65 },
 			});
@@ -1124,7 +1118,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -1160,7 +1153,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				// Disable protection so the immediate drop on tag #2 actually
 				// materializes; otherwise the schema default (20) defers the
 				// drop because tag #2 is in the protected window.
@@ -1217,7 +1209,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -1266,7 +1257,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -1337,7 +1327,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				autoSearch: {
 					enabled: true,
 					scoreThreshold: 0.6,
@@ -1377,7 +1366,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				autoSearch: {
 					enabled: true,
 					scoreThreshold: 0.6,
@@ -1430,7 +1418,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -1555,7 +1542,6 @@ describe("registerPiContextHandler", () => {
 			recordPiLiveModel("ses-context", "anthropic/claude-sonnet-4-5");
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				scheduler: {
 					executeThresholdPercentage: {
@@ -1612,7 +1598,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				scheduler: { executeThresholdPercentage: 80 },
 			});
@@ -1670,7 +1655,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				heuristics: {},
 				scheduler: { executeThresholdPercentage: 65 },
@@ -1741,6 +1725,58 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("does not replay persisted caveman compression when caveman is disabled", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-caveman-replay-disabled";
+		const originalText =
+			"The assistant should preserve the detailed explanation about queue scheduling because caveman replay is disabled.";
+		try {
+			updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				heuristics: { caveman: { enabled: false, minChars: 1 } },
+				scheduler: { executeThresholdPercentage: 65 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const entryIds = ["entry-user", "entry-assistant"];
+			const buildMessages = () =>
+				[userMessage("start", 1), assistantMessage(originalText, 2)] as never[];
+			const contextFor = (messages: never[]) =>
+				({
+					...fakeContext(sessionId, process.cwd(), entryIds, messages),
+					getContextUsage: () => ({
+						tokens: 1_000,
+						percent: 1,
+						contextWindow: 100_000,
+					}),
+				}) as never;
+
+			let messages = buildMessages();
+			await handler({ messages }, contextFor(messages));
+			const assistantTag = getTagsBySession(db, sessionId)
+				.filter((tag) => tag.type === "message")
+				.sort((left, right) => right.tagNumber - left.tagNumber)[0];
+			if (!assistantTag) throw new Error("expected assistant message tag");
+			updateCavemanDepth(db, sessionId, assistantTag.tagNumber, 1);
+			db.prepare(
+				"INSERT OR REPLACE INTO source_contents (session_id, tag_id, content, created_at, harness) VALUES (?, ?, ?, ?, 'pi')",
+			).run(sessionId, assistantTag.tagNumber, originalText, Date.now());
+
+			messages = buildMessages();
+			const result = await handler({ messages }, contextFor(messages));
+
+			expect(textOf(result.messages[1] as never)).toContain(originalText);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("keeps wire bytes stable on a forced pass with no emergency candidates", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-forward-no-candidates";
@@ -1749,7 +1785,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				heuristics: {},
 				scheduler: { executeThresholdPercentage: 65 },
@@ -1814,7 +1849,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				historian: {
 					runner,
@@ -1858,6 +1892,149 @@ describe("registerPiContextHandler", () => {
 				getContextUsage: () => ({
 					tokens: 85_000,
 					percent: 10,
+					contextWindow: 100_000,
+				}),
+			} as never);
+			await awaitInFlightHistorians();
+
+			expect(runner.run).toHaveBeenCalledTimes(1);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("skips trigger-fired historian while /ctx-wrapup is active", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-wrapup-active-skip";
+		try {
+			acquireWrapupInProgress(db, sessionId, {
+				holderId: "wrapup-holder",
+				messagesToKeep: 20,
+				anchorRawMessageCount: 100,
+				targetEligibleEndOrdinal: 80,
+				lastCompartmentEnd: 0,
+				chunkIndex: 0,
+				expectedChunks: 1,
+			});
+			const runner = {
+				harness: "pi",
+				run: mock(async () => ({
+					ok: true as const,
+					assistantText:
+						'<compartment start="1" end="2" title="Skipped">Should not run.</compartment>',
+					durationMs: 1,
+				})),
+			} as unknown as SubagentRunner;
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				historian: {
+					runner,
+					model: "test/historian",
+					historianChunkTokens: 20_000,
+					executeThresholdPercentage: 80,
+					protectedTags: 0,
+				},
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const messages = Array.from({ length: 12 }, (_, index) =>
+				index % 2 === 0
+					? userMessage(`user ${index}`, index + 1)
+					: assistantMessage(`assistant ${index}`, index + 1),
+			) as never[];
+
+			await handler({ messages }, {
+				...fakeContext(
+					sessionId,
+					process.cwd(),
+					messages.map((_, index) => `entry-${index + 1}`),
+					messages,
+				),
+				getContextUsage: () => ({
+					tokens: 85_000,
+					percent: 85,
+					contextWindow: 100_000,
+				}),
+			} as never);
+			await awaitInFlightHistorians();
+
+			const leaseRow = db
+				.prepare(
+					"SELECT holder_id AS holderId FROM compartment_state_lease WHERE session_id = ?",
+				)
+				.get(sessionId) as { holderId: string } | null;
+			expect(leaseRow).toBeNull();
+			expect(runner.run).not.toHaveBeenCalled();
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("fires trigger historian after an expired /ctx-wrapup marker", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-wrapup-expired-fire";
+		try {
+			acquireWrapupInProgress(
+				db,
+				sessionId,
+				{
+					holderId: "expired-wrapup-holder",
+					messagesToKeep: 20,
+					anchorRawMessageCount: 100,
+					targetEligibleEndOrdinal: 80,
+					lastCompartmentEnd: 0,
+					chunkIndex: 0,
+					expectedChunks: 1,
+				},
+				Date.now() - 10 * 60_000,
+			);
+			const runner = {
+				harness: "pi",
+				run: mock(async () => ({
+					ok: true as const,
+					assistantText:
+						'<compartment start="1" end="2" title="Expired">Expired wrapup marker no longer blocks.</compartment>',
+					durationMs: 1,
+				})),
+			} as unknown as SubagentRunner;
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				historian: {
+					runner,
+					model: "test/historian",
+					historianChunkTokens: 20_000,
+					executeThresholdPercentage: 80,
+					protectedTags: 0,
+				},
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const messages = Array.from({ length: 12 }, (_, index) =>
+				index % 2 === 0
+					? userMessage(`user ${index}`, index + 1)
+					: assistantMessage(`assistant ${index}`, index + 1),
+			) as never[];
+
+			await handler({ messages }, {
+				...fakeContext(
+					sessionId,
+					process.cwd(),
+					messages.map((_, index) => `entry-${index + 1}`),
+					messages,
+				),
+				getContextUsage: () => ({
+					tokens: 85_000,
+					percent: 85,
 					contextWindow: 100_000,
 				}),
 			} as never);
@@ -2054,7 +2231,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -2092,7 +2268,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner: {} as SubagentRunner,
 					model: "test/historian",
@@ -2150,7 +2325,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner,
 					model: "test/model",
@@ -2214,7 +2388,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -2269,7 +2442,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner,
 					model: "test/model",
@@ -2332,7 +2504,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner,
 					model: "test/model",
@@ -2394,7 +2565,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				historian: {
 					runner,
 					model: "test/model",
@@ -2487,7 +2657,6 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				ctxReduceEnabled: true,
 				protectedTags: 0,
 				heuristics: {},
 				injection: { injectionBudgetTokens: 10_000 },
@@ -2591,11 +2760,11 @@ describe("registerPiContextHandler", () => {
 			db: ReturnType<typeof createTestDb>;
 			sessionId: string;
 			appendCompaction?: (...args: unknown[]) => string | undefined;
+			contextPercent?: number;
 		}): Promise<void> {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db: args.db,
-				ctxReduceEnabled: true,
 				injection: { injectionBudgetTokens: 10_000 },
 			});
 			const handler = fake.handlers.get("context") as (
@@ -2619,6 +2788,13 @@ describe("registerPiContextHandler", () => {
 			};
 			if (args.appendCompaction) {
 				ctx.sessionManager.appendCompaction = args.appendCompaction;
+			}
+			if (args.contextPercent !== undefined) {
+				(ctx as { getContextUsage: () => unknown }).getContextUsage = () => ({
+					tokens: args.contextPercent === 0 ? 0 : 90_000,
+					percent: args.contextPercent,
+					contextWindow: 100_000,
+				});
 			}
 			await handler({ messages }, ctx as never);
 		}
@@ -2645,6 +2821,120 @@ describe("registerPiContextHandler", () => {
 				expect(appendCompaction).toHaveBeenCalledTimes(1);
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("preserves deferred marker signals on contention fallback, then drains after a covered render", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-contention-retry";
+			const appendCompaction = mock(() => "compact-1");
+			let contention = true;
+			const restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
+				(_state, _db, _messages) => ({
+					injected: true,
+					compartmentCount: 1,
+					factCount: 0,
+					memoryCount: 0,
+					skippedVisibleMessages: 0,
+					m0Materialized: !contention,
+					m0Reason: contention ? "contention" : "test_success",
+					m0Bytes: 2,
+					m1Bytes: 2,
+					contentionExhausted: contention,
+					renderedBoundary: contention
+						? { endMessageId: "entry-1", ordinal: 1 }
+						: { endMessageId: "entry-2", ordinal: 2 },
+					syntheticLeadingCount: 0,
+				}),
+			);
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 90,
+				});
+
+				expect(appendCompaction).not.toHaveBeenCalled();
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(true);
+				expect(consumeDeferredMaterialization(sessionId)).toBe(true);
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+
+				contention = false;
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 90,
+				});
+
+				expect(appendCompaction).toHaveBeenCalledTimes(1);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+				expect(consumeDeferredMaterialization(sessionId)).toBe(false);
+			} finally {
+				restoreInjection();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("defers rehydrated Pi marker signals until the next natural bust", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-rehydrated-deferred";
+			try {
+				seedCompartment(db, sessionId);
+				const appendCompaction = mock(() => "compact-1");
+
+				await runDrainPass({ db, sessionId, appendCompaction });
+
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 0,
+				});
+
+				expect(appendCompaction).not.toHaveBeenCalled();
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 90,
+				});
+
+				expect(appendCompaction).toHaveBeenCalledTimes(1);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 			} finally {
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);

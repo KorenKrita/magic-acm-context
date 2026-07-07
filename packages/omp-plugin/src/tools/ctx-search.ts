@@ -31,6 +31,8 @@ import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/con
 import { type Static, Type } from "typebox";
 
 const DEFAULT_LIMIT = 10;
+const NOTE_EXPAND_HINT =
+	"Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
 
 const ParamsSchema = Type.Object({
 	query: Type.String({
@@ -49,10 +51,11 @@ const ParamsSchema = Type.Object({
 				Type.Literal("message"),
 				Type.Literal("git_commit"),
 				Type.Literal("primer"),
+				Type.Literal("note"),
 			]),
 			{
 				description:
-					'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
+					'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
 			},
 		),
 	),
@@ -80,7 +83,11 @@ function formatAge(committedAtMs: number): string {
 	return years === 1 ? "1y ago" : `${years}y ago`;
 }
 
-function formatResult(result: UnifiedSearchResult, index: number): string {
+function formatResult(
+	result: UnifiedSearchResult,
+	index: number,
+	currentSessionId: string,
+): string {
 	if (result.source === "memory") {
 		// `source=` attributes a foreign workspace member's memory to its origin
 		// project (parity with OpenCode ctx-search/tools.ts); empty for own-project.
@@ -104,6 +111,17 @@ function formatResult(result: UnifiedSearchResult, index: number): string {
 			result.content,
 		].join("\n");
 	}
+	if (result.source === "note") {
+		const anchor =
+			result.anchorOrdinal !== null &&
+			result.sourceSessionId === currentSessionId
+				? ` @msg ${result.anchorOrdinal}`
+				: "";
+		return [
+			`[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatAge(result.createdAt)}${anchor}`,
+			result.content,
+		].join("\n");
+	}
 
 	if (result.source === "compartment") {
 		return [
@@ -123,12 +141,13 @@ function formatResult(result: UnifiedSearchResult, index: number): string {
 function formatSearchResults(
 	query: string,
 	results: UnifiedSearchResult[],
+	currentSessionId: string,
 ): string {
 	if (results.length === 0) {
-		return `No results found for "${query}" across memories, primers, git commits, or message history.`;
+		return `No results found for "${query}" across notes, memories, primers, git commits, or message history.`;
 	}
 	const bodyParts = results.map((result, index) =>
-		formatResult(result, index + 1),
+		formatResult(result, index + 1, currentSessionId),
 	);
 	if (
 		results.some(
@@ -139,6 +158,16 @@ function formatSearchResults(
 		bodyParts.push(
 			"Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.",
 		);
+	}
+	if (
+		results.some(
+			(result) =>
+				result.source === "note" &&
+				result.anchorOrdinal !== null &&
+				result.sourceSessionId === currentSessionId,
+		)
+	) {
+		bodyParts.push(NOTE_EXPAND_HINT);
 	}
 	const body = bodyParts.join("\n\n");
 	return `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${query}":\n\n${body}`;
@@ -240,7 +269,12 @@ export function createCtxSearchTool(
 			);
 
 			return {
-				content: [{ type: "text", text: formatSearchResults(query, results) }],
+				content: [
+					{
+						type: "text",
+						text: formatSearchResults(query, results, sessionId),
+					},
+				],
 				details: undefined,
 			};
 		},

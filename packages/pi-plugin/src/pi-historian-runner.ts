@@ -59,6 +59,7 @@ import {
 	clearHistorianFailureState,
 	getOverflowState,
 	incrementHistorianFailure,
+	isWrapupInProgress,
 	recordHistorianDrainFailure,
 	recordProtectedTailPublicationFloor,
 	reserveProtectedTailDrainTokens,
@@ -236,6 +237,10 @@ export interface PiHistorianDeps {
 		directory: string,
 		db: Database,
 	) => void | Promise<void>;
+	/** Manual wrapup bypasses the pressure-window quota but keeps no-progress protection. */
+	forceDrainQuota?: boolean;
+	/** Persist the final weak-lookahead compartment for coverage while skipping promotion. */
+	forceKeepLastCompartment?: boolean;
 }
 
 export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
@@ -262,6 +267,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		readBranchEntries,
 		notifyIssue,
 		ensureProjectRegistered = ensureProjectRegisteredFromPiDirectory,
+		forceDrainQuota,
+		forceKeepLastCompartment,
 	} = deps;
 
 	const notify = async (message: string): Promise<void> => {
@@ -400,7 +407,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					`historian no-op: protectedTailStart=${protectedTailStart} eligibleEnd=${eligibleEndOrdinal} <= offset=${offset} — nothing to compact`,
 				);
 				if (boundarySnapshot.usagePercentage < 80) {
-					clearEmergencyRecovery(db, sessionId);
+					if (!isWrapupInProgress(db, sessionId))
+						clearEmergencyRecovery(db, sessionId);
 				} else {
 					recordHighPressureNoEligibleHead(db, boundarySnapshot);
 				}
@@ -418,16 +426,19 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						100,
 				),
 			);
-			const reserve = reserveProtectedTailDrainTokens({
-				db,
-				sessionId,
-				runId: crypto.randomUUID(),
-				trueRawTokens: boundarySnapshot.trueRawEligibleTokens,
-				usagePercentage: boundarySnapshot.usagePercentage,
-				usable,
-				perRunCap,
-				executeThresholdPercentage: boundarySnapshot.executeThresholdPercentage,
-			});
+			const reserve = forceDrainQuota
+				? { ok: true as const, reservation: null }
+				: reserveProtectedTailDrainTokens({
+						db,
+						sessionId,
+						runId: crypto.randomUUID(),
+						trueRawTokens: boundarySnapshot.trueRawEligibleTokens,
+						usagePercentage: boundarySnapshot.usagePercentage,
+						usable,
+						perRunCap,
+						executeThresholdPercentage:
+							boundarySnapshot.executeThresholdPercentage,
+					});
 			if (!reserve.ok) {
 				sessionLog(
 					sessionId,
@@ -445,13 +456,16 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				offset,
 				eligibleEndOrdinal,
 			);
+			const forceKeepLastCompartmentForChunk =
+				forceKeepLastCompartment === true && !chunk.hasMore;
 			if (!chunk.text || chunk.messageCount === 0) {
 				sessionLog(
 					sessionId,
 					`historian no-op: chunk empty after filtering (messageCount=${chunk.messageCount}, textLen=${chunk.text?.length ?? 0}) range=${offset}-${protectedTailStart - 1}`,
 				);
 				if (boundarySnapshot.usagePercentage < 80) {
-					clearEmergencyRecovery(db, sessionId);
+					if (!isWrapupInProgress(db, sessionId))
+						clearEmergencyRecovery(db, sessionId);
 				} else {
 					recordHighPressureNoEligibleHead(db, boundarySnapshot);
 				}
@@ -835,7 +849,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			).needsEmergencyRecovery;
 			const emittedCompartments = validatedPass.compartments;
 			let newCompartments = emittedCompartments;
-			if (!inEmergency && emittedCompartments.length >= 2) {
+			if (
+				!inEmergency &&
+				!forceKeepLastCompartmentForChunk &&
+				emittedCompartments.length >= 2
+			) {
 				const lastEmitted = emittedCompartments[emittedCompartments.length - 1];
 				const lookaheadMargin = chunk.endIndex - lastEmitted.endMessage;
 				if (lookaheadMargin <= BOUNDARY_HEALING_SLACK) {
@@ -886,11 +904,18 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				}
 			}
 
-			// discard-last: when the provisional last compartment was dropped, its
-			// facts AND observations are not durable yet — skip both this run
-			// (unanchored; re-derived next run). Computed before publication so
-			// durable promotion can share the publish transaction.
+			// A wrapup caller may request final weak-lookahead preservation, but the
+			// runner is authoritative: a token-capped chunk (`chunk.hasMore`) still has
+			// more raw history after it, so it must use normal discard-last healing and
+			// promotion. Only the actual final chunk keeps its weak-lookahead tail and
+			// skips unanchored promotion.
 			const discardedLast = newCompartments.length < emittedCompartments.length;
+			const weakLookaheadFinalCompartment = forceKeepLastCompartmentForChunk;
+			// discard-last runs must also skip unanchored promotion: facts cannot be
+			// attributed to the persisted range, and a reworded re-emission next run
+			// would double-store.
+			const skipUnanchoredPromotion =
+				discardedLast || weakLookaheadFinalCompartment;
 
 			// Two distinct gates (parity with OpenCode): embeddingActive = memory
 			// feature on (drives registration + embedding, the ctx_search / dreamer
@@ -901,10 +926,17 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 
 			// Events: stored, NOT rendered. Best-effort. discard-last: drop events
 			// anchored to the discarded provisional compartment.
-			const publishableEvents = (validatedPass.events ?? []).filter(
-				(e) =>
-					e.atCompartment == null || e.atCompartment <= newCompartments.length,
-			);
+			const publishableEvents = (validatedPass.events ?? []).filter((e) => {
+				if (typeof e.atCompartment !== "number")
+					return !weakLookaheadFinalCompartment;
+				if (e.atCompartment > newCompartments.length) return false;
+				if (
+					weakLookaheadFinalCompartment &&
+					e.atCompartment >= emittedCompartments.length
+				)
+					return false;
+				return true;
+			});
 			let promotedFactRefs: Array<{ memoryId: number; content: string }> = [];
 			let persistedIds: number[] = [];
 
@@ -947,7 +979,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// No replaceSessionFacts — promoted facts reach the agent through the
 				// renderer's m[1] new-memories watermark. Promotion is in the SAME
 				// transaction as the boundary floor below, so both commit or both roll back.
-				if (promotionActive && !discardedLast) {
+				if (promotionActive && !skipUnanchoredPromotion) {
 					promotedFactRefs = promoteSessionFactsDurable(
 						db,
 						sessionId,
@@ -976,11 +1008,13 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				queueDropsForCompartmentalizedMessages(db, sessionId, lastNewEnd);
 
 				clearHistorianFailureState(db, sessionId);
-				// Healthy historian progress — clear the drain-failure backoff so the
-				// emergency catch-up latch can bypass the budget freely again.
+				// Healthy historian progress clears the drain-failure backoff. Normal
+				// runs also clear overflow recovery; wrapup keeps it armed until the loop
+				// reaches the keep watermark.
 				clearHistorianDrainFailure(db, sessionId);
 				recordProtectedTailPublicationFloor(db, sessionId, lastNewEnd + 1);
-				clearEmergencyRecovery(db, sessionId);
+				if (!isWrapupInProgress(db, sessionId))
+					clearEmergencyRecovery(db, sessionId);
 				// userObservations are inserted POST-COMMIT
 				// (best-effort, below), not inside this publish transaction. An
 				// auxiliary user_memory_candidates failure must never roll back
@@ -1031,7 +1065,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// behavioral candidates persisted (privacy parity with OpenCode).
 			if (
 				userMemoriesEnabled === true &&
-				!discardedLast &&
+				!skipUnanchoredPromotion &&
 				validatedPass.userObservations?.length
 			) {
 				try {
@@ -1058,10 +1092,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			}
 
 			// Primers v1 are recall-only side-table writes (dashboard + ctx_search),
-			// never prompt injection. They share the same !discardedLast gate as facts
-			// and observations so provisional tails do not double-emit evidence.
+			// never prompt injection. They use the same actual-final weak-lookahead
+			// gate as facts and observations.
 			if (
-				!discardedLast &&
+				!skipUnanchoredPromotion &&
 				validatedPass.primerCandidates?.length &&
 				projectPath
 			) {

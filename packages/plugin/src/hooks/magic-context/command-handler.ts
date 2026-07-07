@@ -6,7 +6,7 @@ import {
 } from "../../features/magic-context/dreamer/task-registry";
 import type { ManualRunResult } from "../../features/magic-context/dreamer/task-scheduler";
 import { runSidekick } from "../../features/magic-context/sidekick/agent";
-import { getCompartments } from "../../features/magic-context/storage";
+import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
@@ -33,6 +33,19 @@ interface RecompConfirmation {
 }
 const recompConfirmationBySession = new Map<string, RecompConfirmation>();
 const RECOMP_CONFIRMATION_WINDOW_MS = 60_000;
+
+function isSubagentSession(db: Database, sessionId: string): boolean {
+    const meta = getOrCreateSessionMeta(db, sessionId);
+    if (meta.isSubagent) return true;
+    try {
+        const row = db
+            .prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { is_subagent?: unknown } | null;
+        return row?.is_subagent === 1 || row?.is_subagent === true;
+    } catch {
+        return false;
+    }
+}
 
 const RECOMP_USAGE = [
     "Usage:",
@@ -84,6 +97,25 @@ export function parseRecompArgs(
     }
 
     return { kind: "partial", range: { start, end } };
+}
+
+export function parseWrapupArgs(
+    raw: string,
+): { ok: true; messagesToKeep: number } | { ok: false; message: string } {
+    const trimmed = raw.trim();
+    if (trimmed === "") return { ok: true, messagesToKeep: 20 };
+    if (!/^\d+$/.test(trimmed)) {
+        return {
+            ok: false,
+            message:
+                "Usage: `/ctx-wrapup [messages_to_keep]` where messages_to_keep is a positive integer.",
+        };
+    }
+    const messagesToKeep = Number.parseInt(trimmed, 10);
+    if (!Number.isSafeInteger(messagesToKeep) || messagesToKeep <= 0) {
+        return { ok: false, message: "messages_to_keep must be a positive integer." };
+    }
+    return { ok: true, messagesToKeep };
 }
 
 export interface CommandExecuteInput {
@@ -381,6 +413,8 @@ export function createMagicContextCommandHandler(deps: {
         sessionId: string,
         options?: { range?: PartialRecompRange },
     ) => Promise<string>;
+    /** Runs /ctx-wrapup over the live raw tail, keeping the newest N raw messages. */
+    executeWrapup?: (sessionId: string, options: { messagesToKeep: number }) => Promise<string>;
     /** Runs the once-per-project 5-cat memory migration for /ctx-session-upgrade.
      *  Optional: when unavailable, /ctx-session-upgrade still upgrades compartments
      *  via recomp and skips the memory re-evaluation. */
@@ -438,6 +472,7 @@ export function createMagicContextCommandHandler(deps: {
     const isStatusCommand = (command: string): boolean => command === "ctx-status";
     const isFlushCommand = (command: string): boolean => command === "ctx-flush";
     const isRecompCommand = (command: string): boolean => command === "ctx-recomp";
+    const isWrapupCommand = (command: string): boolean => command === "ctx-wrapup";
     const isAugCommand = (command: string): boolean => command === "ctx-aug";
     const isDreamCommand = (command: string): boolean => command === "ctx-dream";
     const isSessionUpgradeCommand = (command: string): boolean => command === "ctx-session-upgrade";
@@ -452,6 +487,7 @@ export function createMagicContextCommandHandler(deps: {
             const isStatus = isStatusCommand(input.command);
             const isFlush = isFlushCommand(input.command);
             const isRecomp = isRecompCommand(input.command);
+            const isWrapup = isWrapupCommand(input.command);
             const isAug = isAugCommand(input.command);
             const isDream = isDreamCommand(input.command);
             const isSessionUpgrade = isSessionUpgradeCommand(input.command);
@@ -461,6 +497,7 @@ export function createMagicContextCommandHandler(deps: {
                 !isStatus &&
                 !isFlush &&
                 !isRecomp &&
+                !isWrapup &&
                 !isAug &&
                 !isDream &&
                 !isSessionUpgrade &&
@@ -569,6 +606,23 @@ export function createMagicContextCommandHandler(deps: {
                     liveContextLimit,
                 );
                 result += result ? `\n\n${statusOutput}` : statusOutput;
+            }
+
+            if (isWrapup) {
+                const parsed = parseWrapupArgs(input.arguments);
+                if (isSubagentSession(deps.db, sessionId)) {
+                    result =
+                        "## Magic Wrapup — Skipped\n\n/ctx-wrapup is only available in primary sessions.";
+                } else if (!parsed.ok) {
+                    result = `## Magic Wrapup — Invalid Arguments\n\n${parsed.message}`;
+                } else if (!deps.executeWrapup) {
+                    result =
+                        "## Magic Wrapup\n\n/ctx-wrapup is unavailable because the historian handler is not configured.";
+                } else {
+                    result = await deps.executeWrapup(sessionId, {
+                        messagesToKeep: parsed.messagesToKeep,
+                    });
+                }
             }
 
             if (isRecomp) {

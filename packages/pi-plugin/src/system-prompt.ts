@@ -40,7 +40,7 @@ export interface BuildMagicContextBlockOptions {
 	/** When true (default), emit the `## Magic Context` guidance section. */
 	includeGuidance?: boolean;
 	protectedTags?: number;
-	ctxReduceEnabled?: boolean;
+	ctxReduceCallable?: boolean;
 	dreamerEnabled?: boolean;
 	temporalAwarenessEnabled?: boolean;
 	cavemanTextCompressionEnabled?: boolean;
@@ -68,7 +68,7 @@ export function buildMagicContextBlock(
 	const mcBlock = buildMagicContextSection(
 		null,
 		opts.protectedTags ?? 20,
-		opts.ctxReduceEnabled ?? true,
+		opts.ctxReduceCallable ?? true,
 		opts.dreamerEnabled ?? false,
 		opts.temporalAwarenessEnabled ?? false,
 		opts.cavemanTextCompressionEnabled ?? false,

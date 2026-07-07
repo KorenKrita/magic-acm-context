@@ -119,7 +119,6 @@ export function isMagicContextInternalAgent(systemPromptContent: string): boolea
 export function createSystemPromptHashHandler(deps: {
     db: ContextDatabase;
     protectedTags: number;
-    ctxReduceEnabled: boolean;
     dreamerEnabled: boolean;
     /** When false (`memory.enabled: false`), the `<project-memory>` block is
      *  never injected, so ctx_memory guidance is dropped from the prompt and the
@@ -177,8 +176,8 @@ export function createSystemPromptHashHandler(deps: {
     experimentalPinKeyFilesTokenBudget?: number;
     /** When true, add a temporal-awareness guidance paragraph + surface compartment dates */
     experimentalTemporalAwareness?: boolean;
-    /** When true (and ctx_reduce_enabled is false), inject a "BEWARE: history compression is on"
-     *  warning so the agent doesn't mimic its own caveman-compressed past output. */
+    /** When true, inject a "BEWARE: history compression is on" warning so the
+     *  agent doesn't mimic its own caveman-compressed past output. */
     experimentalCavemanTextCompression?: boolean;
 }): {
     handler: (input: { sessionID?: string }, output: { system: string[] }) => Promise<void>;
@@ -279,16 +278,10 @@ export function createSystemPromptHashHandler(deps: {
         }
 
         // ── Step 1: Inject magic-context guidance ──
-        // Subagent guidance depends on whether ctx_reduce is enabled:
-        //   • ctx_reduce ON  → minimal §N§ + ctx_reduce block (subagentReduceMode).
-        //     Subagents share the process-global ctx_reduce tool and get §N§
-        //     prefixes (transform.ts), so they self-manage tool bloat. They take
-        //     NONE of the primary's role (no partner frame, memory/search/note
-        //     guidance, reduction taxonomy) — just the drop mechanics.
-        //   • ctx_reduce OFF → NO block at all. The subagent has no §N§ prefix and
-        //     no ctx_reduce tool to act on, so there's nothing to guide; injecting
-        //     the no-reduce PRIMARY block here would leak the partner frame +
-        //     memory/search/note guidance into a bounded, parent-driven subagent.
+        // Subagents with callable ctx_reduce get only the minimal drop mechanics
+        // guidance. Subagents without the tool get no Magic Context guidance,
+        // because the primary-session no-reduce block would incorrectly describe
+        // memory/search/note behavior for a bounded, parent-driven child task.
         let sessionMetaEarly: import("../../features/magic-context/types").SessionMeta | undefined;
         try {
             sessionMetaEarly = getOrCreateSessionMeta(deps.db, sessionId);
@@ -299,16 +292,19 @@ export function createSystemPromptHashHandler(deps: {
         // A session whose spawn tools map filters ctx_reduce out (parent
         // allow-lists) must be treated like ctx_reduce-disabled: reduce
         // guidance for an uncallable tool is overhead + cargo-cult risk.
-        // Resolved once per session (frozen verdict — no hash flapping).
-        const ctxReduceCallable = resolveCtxReduceAvailability(sessionId);
-        const subagentReduceMode =
-            isSubagentSession && deps.ctxReduceEnabled !== false && ctxReduceCallable;
-        const effectiveCtxReduceEnabled = isSubagentSession
-            ? false
-            : deps.ctxReduceEnabled !== false && ctxReduceCallable;
-        // A subagent with ctx_reduce disabled or uncallable gets no MC guidance.
-        const skipGuidanceForDisabledSubagent =
-            isSubagentSession && (deps.ctxReduceEnabled === false || !ctxReduceCallable);
+        // The verdict freezes on the session's first user message; before that
+        // exists it is a PROVISIONAL fail-open default. Guidance still renders
+        // from the provisional value (a prompt must go out), but the hash write
+        // below is gated on `frozen` so a provisional reduce-enabled prompt is
+        // never persisted as the session's baseline — if the first user message
+        // then denies the tool, the variant settles BEFORE any hash existed,
+        // instead of flipping a persisted hash and busting the prompt cache.
+        const availability = resolveCtxReduceAvailability(sessionId);
+        const ctxReduceCallable = availability.callable;
+        const subagentReduceMode = isSubagentSession && ctxReduceCallable;
+        const effectiveCtxReduceEnabled = isSubagentSession ? false : ctxReduceCallable;
+        // A subagent without callable ctx_reduce gets no MC guidance.
+        const skipGuidanceForDisabledSubagent = isSubagentSession && !ctxReduceCallable;
         const fullPrompt = output.system.join("\n");
         if (
             fullPrompt.length > 0 &&
@@ -377,6 +373,14 @@ export function createSystemPromptHashHandler(deps: {
         // ── Step 3: Detect system prompt changes ──
         const systemContent = output.system.join("\n");
         if (systemContent.length === 0) return;
+
+        // Provisional availability (no first user message persisted yet): the
+        // guidance above may be the wrong variant for this session. Do not
+        // initialize or compare the persisted hash from it — the first pass with
+        // a frozen verdict owns the baseline. Skipping here means the variant
+        // settles before any hash is written, so a deny-list session's prompt
+        // never records a reduce-enabled hash it would immediately flip.
+        if (!availability.frozen) return;
 
         // Use hex digest — numeric strings get coerced by SQLite INTEGER column affinity,
         // causing precision loss on read-back and infinite hash-change flushes.

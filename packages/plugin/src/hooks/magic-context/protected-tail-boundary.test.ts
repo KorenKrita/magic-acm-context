@@ -56,6 +56,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     hasRunnableCompartmentWindow,
     resolveOpenCodeProtectedTailBoundary,
+    resolveWrapupProtectedTailBoundary,
     validateBoundarySnapshot,
 } from "./protected-tail-boundary";
 
@@ -612,4 +613,122 @@ it("treats an emergency-scaled complete small head as runnable even below the fo
             rawRangeFingerprint: "stable",
         }),
     ).toBe(true);
+});
+
+describe("wrapup protected-tail boundary", () => {
+    it("counts raw messages of any role and keeps the newest N raw", () => {
+        useBoundaryTempDataHome("wrapup-boundary-meaningful-");
+        const sessionId = "ses-wrapup-meaningful";
+        createBoundaryOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", parts: [{ type: "text", text: "one" }] },
+            { id: "m2", role: "assistant", parts: [{ type: "text", text: "a" }] },
+            { id: "m3", role: "user", parts: [{ type: "text", text: "ignored", ignored: true }] },
+            { id: "m4", role: "user", parts: [{ type: "text", text: "two" }] },
+            { id: "m5", role: "assistant", parts: [{ type: "text", text: "b" }] },
+            { id: "m6", role: "user", parts: [{ type: "text", text: "three" }] },
+            { id: "m7", role: "assistant", parts: [{ type: "text", text: "c" }] },
+            { id: "m8", role: "user", parts: [{ type: "text", text: "four" }] },
+        ]);
+        const db = createContextDb();
+        const plan = resolveWrapupProtectedTailBoundary({
+            db,
+            sessionId,
+            mode: "manual-wrapup",
+            contextLimit: 128_000,
+            executeThresholdPercentage: 65,
+            usage: null,
+            usageSource: "manual-none",
+            messagesToKeep: 2,
+        });
+
+        expect(plan.rawMessagesAboveLastCompartment).toBe(8);
+        // keep=2 raw messages over 8 ordinals -> candidate ordinal 7 (m7), then the
+        // user-boundary snap prefers the nearby user message m8... snapping only
+        // moves EARLIER, so the nearest user at or before 7 is m6 (ordinal 6).
+        expect(plan.targetProtectedTailStart).toBe(6);
+        expect(plan.snapshot.eligibleEndOrdinal).toBeGreaterThan(1);
+        expect(plan.snapshot.eligibleEndOrdinal).toBeLessThanOrEqual(6);
+        closeQuietly(db);
+    });
+
+    it("snaps outward so a closed tool arc is not split at the keep watermark", () => {
+        useBoundaryTempDataHome("wrapup-boundary-arc-");
+        const sessionId = "ses-wrapup-arc";
+        createBoundaryOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", parts: [{ type: "text", text: "one" }] },
+            {
+                id: "m2",
+                role: "assistant",
+                parts: [{ type: "tool", id: "t1", state: { status: "pending" } }],
+            },
+            { id: "m3", role: "user", parts: [{ type: "text", text: "two" }] },
+            {
+                id: "m4",
+                role: "tool",
+                parts: [{ type: "tool_result", id: "t1", content: "result" }],
+            },
+            { id: "m5", role: "user", parts: [{ type: "text", text: "three" }] },
+        ]);
+        const db = createContextDb();
+        const plan = resolveWrapupProtectedTailBoundary({
+            db,
+            sessionId,
+            mode: "manual-wrapup",
+            contextLimit: 128_000,
+            executeThresholdPercentage: 65,
+            usage: null,
+            usageSource: "manual-none",
+            messagesToKeep: 2,
+        });
+
+        expect(plan.targetProtectedTailStart).toBe(1);
+        expect(plan.snapshot.boundaryReason).toBe("manual-wrapup-user-snap");
+        closeQuietly(db);
+    });
+
+    it("re-fences after user snap when the snapped user is inside an earlier tool arc", () => {
+        useBoundaryTempDataHome("wrapup-boundary-refence-");
+        const sessionId = "ses-wrapup-refence";
+        createBoundaryOpenCodeDb(sessionId, [
+            { id: "m1", role: "user", parts: [{ type: "text", text: "one" }] },
+            {
+                id: "m2",
+                role: "assistant",
+                parts: [{ type: "tool", id: "outer", state: { status: "pending" } }],
+            },
+            { id: "m3", role: "user", parts: [{ type: "text", text: "queued while outer runs" }] },
+            { id: "m4", role: "assistant", parts: [{ type: "text", text: "still working" }] },
+            {
+                id: "m5",
+                role: "assistant",
+                parts: [{ type: "tool", id: "inner", state: { status: "pending" } }],
+            },
+            {
+                id: "m6",
+                role: "tool",
+                parts: [{ type: "tool_result", id: "outer", content: "outer result" }],
+            },
+            { id: "m7", role: "user", parts: [{ type: "text", text: "queued while inner runs" }] },
+            {
+                id: "m8",
+                role: "tool",
+                parts: [{ type: "tool_result", id: "inner", content: "inner result" }],
+            },
+            { id: "m9", role: "user", parts: [{ type: "text", text: "newest kept" }] },
+        ]);
+        const db = createContextDb();
+        const plan = resolveWrapupProtectedTailBoundary({
+            db,
+            sessionId,
+            mode: "manual-wrapup",
+            contextLimit: 128_000,
+            executeThresholdPercentage: 65,
+            usage: null,
+            usageSource: "manual-none",
+            messagesToKeep: 2,
+        });
+
+        expect(plan.targetProtectedTailStart).toBeLessThanOrEqual(2);
+        closeQuietly(db);
+    });
 });

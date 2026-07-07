@@ -1,0 +1,131 @@
+#!/usr/bin/env node
+/**
+ * inject-acm.mjs — Inject ACM glue code into MC's index.ts and system-prompt.ts.
+ *
+ * This script is idempotent: if ACM glue is already present, it does nothing.
+ * It uses string matching on stable anchors (not line numbers), so it survives
+ * upstream refactors that don't rename the anchor functions.
+ *
+ * Usage: node scripts/inject-acm.mjs <index.ts> <system-prompt.ts>
+ */
+import { readFileSync, writeFileSync } from "node:fs";
+
+const [indexPath, promptPath] = process.argv.slice(2);
+if (!indexPath || !promptPath) {
+  console.error("Usage: node inject-acm.mjs <index.ts> <system-prompt.ts>");
+  process.exit(1);
+}
+
+// --- index.ts ---
+let index = readFileSync(indexPath, "utf-8");
+
+// 1. Add import (anchor: after `import { registerMagicContextTools } from "./tools"`)
+const TOOLS_IMPORT = 'import { registerMagicContextTools } from "./tools";';
+const ACM_IMPORT = 'import registerACMExtension from "./acm/tools";';
+if (!index.includes(ACM_IMPORT)) {
+  const pos = index.indexOf(TOOLS_IMPORT);
+  if (pos === -1) {
+    console.error(`ERROR: anchor not found in ${indexPath}: ${TOOLS_IMPORT}`);
+    process.exit(1);
+  }
+  index = index.slice(0, pos + TOOLS_IMPORT.length) +
+    "\n" + ACM_IMPORT +
+    index.slice(pos + TOOLS_IMPORT.length);
+}
+
+// 2. Add registration call (anchor: after registerMagicContextTools(...) block closes with `});`)
+// We find the `info("registered tools:` line and insert before it
+const ACM_REGISTER = "\tregisterACMExtension(pi);";
+if (!index.includes("registerACMExtension(pi)")) {
+  // Find the info() call about registered tools
+  const infoAnchor = index.indexOf('info(\n\t\t"registered tools:') !== -1
+    ? 'info(\n\t\t"registered tools:'
+    : 'info(\n\t\t`registered tools:';
+  const infoPos = index.indexOf(infoAnchor);
+  if (infoPos === -1) {
+    // Fallback: find any `info("registered tools` or `info(`registered tools`
+    const re = /info\(\s*["`]registered tools:/;
+    const m = re.exec(index);
+    if (!m) {
+      console.error(`ERROR: could not find registered tools info() in ${indexPath}`);
+      process.exit(1);
+    }
+    const insertPos = m.index;
+    index = index.slice(0, insertPos) +
+      "// Register ACM tools (acm_checkpoint, acm_timeline, acm_travel)\n\t" +
+      "registerACMExtension(pi);\n\n\t" +
+      index.slice(insertPos);
+  } else {
+    index = index.slice(0, infoPos) +
+      "// Register ACM tools (acm_checkpoint, acm_timeline, acm_travel)\n\t" +
+      "registerACMExtension(pi);\n\n\t" +
+      index.slice(infoPos);
+  }
+}
+
+writeFileSync(indexPath, index);
+console.log(`✓ ${indexPath}: ACM glue injected`);
+
+// --- system-prompt.ts ---
+let prompt = readFileSync(promptPath, "utf-8");
+
+// 1. Add import (anchor: after `import { buildMagicContextSection }`)
+const MC_SECTION_IMPORT = 'import { buildMagicContextSection }';
+const ACM_PROMPT_IMPORT = 'import { ACM_PROMPT_SECTION } from "./acm/prompt";';
+if (!prompt.includes(ACM_PROMPT_IMPORT)) {
+  const pos = prompt.indexOf(MC_SECTION_IMPORT);
+  if (pos === -1) {
+    console.error(`ERROR: anchor not found in ${promptPath}: ${MC_SECTION_IMPORT}`);
+    process.exit(1);
+  }
+  // Find end of this import statement (next semicolon + newline)
+  const importEnd = prompt.indexOf(";", pos);
+  if (importEnd === -1) {
+    console.error(`ERROR: could not find end of import statement in ${promptPath}`);
+    process.exit(1);
+  }
+  prompt = prompt.slice(0, importEnd + 1) +
+    "\n" + ACM_PROMPT_IMPORT +
+    prompt.slice(importEnd + 1);
+}
+
+// 2. Wrap the return in buildMagicContextBlock
+// Anchor: `return buildMagicContextSection(`  →  store in variable + append ACM
+const RETURN_ANCHOR = "\treturn buildMagicContextSection(";
+if (!prompt.includes("ACM_PROMPT_SECTION") || !prompt.includes("mcBlock")) {
+  const returnPos = prompt.indexOf(RETURN_ANCHOR);
+  if (returnPos === -1) {
+    // Maybe already wrapped — check if mcBlock exists
+    if (prompt.includes("const mcBlock = buildMagicContextSection(")) {
+      console.log(`✓ ${promptPath}: ACM return wrapper already present`);
+    } else {
+      console.error(`ERROR: anchor not found in ${promptPath}: ${RETURN_ANCHOR}`);
+      process.exit(1);
+    }
+  } else {
+    // Find the matching closing `);\n` for this return statement
+    // Count parens from the opening `buildMagicContextSection(`
+    const searchStart = returnPos + RETURN_ANCHOR.length;
+    let depth = 1;
+    let i = searchStart;
+    while (i < prompt.length && depth > 0) {
+      if (prompt[i] === "(") depth++;
+      else if (prompt[i] === ")") depth--;
+      i++;
+    }
+    // i now points just after the closing `)` — expect `;` next
+    const closingEnd = prompt.indexOf(";", i - 1) + 1;
+
+    const originalReturn = prompt.slice(returnPos, closingEnd);
+    const mcCall = originalReturn.replace(/^\treturn /, "\tconst mcBlock = ");
+
+    const replacement = mcCall + "\n\n" +
+      "\t// Append ACM discipline section after MC guidance\n" +
+      "\treturn mcBlock ? `${mcBlock}\\n\\n${ACM_PROMPT_SECTION}` : ACM_PROMPT_SECTION;";
+
+    prompt = prompt.slice(0, returnPos) + replacement + prompt.slice(closingEnd);
+  }
+}
+
+writeFileSync(promptPath, prompt);
+console.log(`✓ ${promptPath}: ACM glue injected`);

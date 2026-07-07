@@ -131,6 +131,20 @@ stamps on send.
 
 ---
 
+## 6a. Project-identity dubious-ownership warnings
+
+**OpenCode:** when git refuses a repository as dubious ownership, the shared
+project-identity resolver logs the fallback and the OpenCode transform/hook path
+sends a one-shot session notification with the `safe.directory` command.
+
+**Pi:** `packages/pi-plugin/src/index.ts` surfaces config warnings through the
+standard `warn()` log channel and has no startup/session warning channel
+equivalent to OpenCode's ignored-message fallback. Pi therefore relies on the
+shared resolver's log-only dubious-ownership warning while still using the same
+`dir:` fallback identity and retry cooldown.
+
+---
+
 ## 7. Storage & process model
 
 - Pi sessions are JSONL (`~/.pi/agent/sessions/*.jsonl`); OpenCode uses its own
@@ -703,3 +717,16 @@ tool-arc fencing, and historian eligibility are parity-tested for those fields.
 and is deferred. Tests should assert text + tool-I/O parity and separately track
 Pi's expected undercount for thinking/images rather than treating it as a silent
 regression.
+
+---
+
+## 7. `/ctx-wrapup` progress surfaces as Pi status messages
+
+**OpenCode:** `/ctx-wrapup` uses the shared recomp progress channel, so the TUI
+sidebar can render a live **Wrapup** row with chunk counters.
+
+**Pi:** there is no persistent sidebar row. The command emits one status/toast
+message for the upfront estimate and one per historian chunk, then a final
+summary. The drain loop, durable `wrapup_in_progress` marker, sequential historian
+runs, and deferred compaction semantics are shared in intent; only the progress
+surface differs.

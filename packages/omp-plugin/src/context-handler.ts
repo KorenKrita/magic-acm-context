@@ -9,7 +9,7 @@
  * PARITY.md for the deliberate mechanism-level divergences). Per pass it:
  *   1. Wraps the AgentMessage[] in a Transcript via `createPiTranscript`.
  *   2. Tags eligible parts with the shared `Tagger` and injects `§N§ `
- *      prefixes (unless `ctx_reduce_enabled: false`).
+ *      prefixes (unless the session is a subagent).
  *   3. Applies queued drops (`pending_ops`) + persisted tag statuses so
  *      cross-session drops survive.
  *   4. Prepares m[0]/m[1] history injection, trims the live tail to the
@@ -83,6 +83,7 @@ import {
 	getAutoSearchHintDecisions,
 	getNoteNudgeAnchors,
 	getOverflowState,
+	isWrapupInProgress,
 	peekDeferredExecutePending,
 	pruneAutoSearchHintDecisions,
 	pruneNoteNudgeAnchors,
@@ -703,14 +704,6 @@ export interface PiSchedulerOptions {
 
 export interface PiContextHandlerOptions {
 	db: ContextDatabase;
-	/**
-	 * Whether the agent-facing `ctx_reduce` tool is exposed. When false,
-	 * tag prefixes are still assigned in the DB (so drops still work
-	 * via /ctx-flush or future automatic triggers) but the visible
-	 * `§N§ ` markers are NOT injected — agents shouldn't see markers
-	 * they can't act on. Mirrors OpenCode behavior.
-	 */
-	ctxReduceEnabled: boolean;
 	/** Smart-drops (experimental, default off): also reclaim tool output that a
 	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
 	 *  sent to the model are byte-identical to the age-based-only behavior. */
@@ -2194,7 +2187,7 @@ export function registerPiContextHandler(
 				projectIdentity,
 				projectDirectory,
 				messages: event.messages,
-				ctxReduceEnabled: options.ctxReduceEnabled,
+				isSubagent: sessionMeta.isSubagent,
 				smartDrops: options.smartDrops === true,
 				protectedTags: options.protectedTags ?? 20,
 				heuristics: options.heuristics,
@@ -2413,12 +2406,11 @@ export function registerPiContextHandler(
 			// a missing baseline is how Channel 1 stays off for subagents.
 			try {
 				const sessionMetaForCh1 = getOrCreateSessionMeta(options.db, sessionId);
-				// Gate on ctx_reduce being effective AND not a subagent. Channel 1
-				// nudges the agent to call ctx_reduce; when ctx_reduce is disabled
-				// the tool isn't registered (index.ts), so a baseline/nudge would
-				// point at a missing tool. Mirrors OpenCode's ctxReduceEnabledEffective
-				// gate. A missing baseline is also how Channel 1 stays off.
-				if (options.ctxReduceEnabled && !sessionMetaForCh1.isSubagent) {
+				// Gate on not being a subagent. Channel 1 nudges the agent to call
+				// ctx_reduce; subagents don't have the tool registered (session-scoped
+				// tools are disabled), so a baseline/nudge would point at a missing
+				// tool. A missing baseline is also how Channel 1 stays off.
+				if (!sessionMetaForCh1.isSubagent) {
 					// Resolve through the SCHEDULER config (the real execute
 					// threshold), not options.historian — when historian is disabled
 					// the historian threshold falls back to 65 and ignores the user's
@@ -2859,6 +2851,12 @@ function spawnPiHistorianRun(args: {
 		}
 		const renewal = startPiCompartmentLeaseRenewal(db, sessionId, holderId);
 		try {
+			if (isWrapupInProgress(db, sessionId)) {
+				// Close the cross-process check/lease race: /ctx-wrapup may have published
+				// its marker after the first check but before this process won the lease.
+				sessionLog(sessionId, "historian skipped: /ctx-wrapup became active");
+				return;
+			}
 			await runPiHistorian({
 				db,
 				sessionId,
@@ -2992,6 +2990,17 @@ function maybeFireHistorian(args: {
 
 	if (inFlightHistorian.has(sessionId)) {
 		sessionLog(sessionId, "historian trigger eval: in-flight, skipping");
+		return;
+	}
+
+	if (isWrapupInProgress(db, sessionId)) {
+		// /ctx-wrapup owns compartment-state publication while this marker is live.
+		// The marker has a five-minute TTL renewed by wrapup, so a crashed wrapup
+		// self-expires instead of suppressing trigger-fired historian runs forever.
+		sessionLog(
+			sessionId,
+			"historian trigger eval: /ctx-wrapup active, skipping",
+		);
 		return;
 	}
 
@@ -3284,7 +3293,7 @@ interface RunPipelineArgs {
 	projectIdentity: string;
 	projectDirectory: string;
 	messages: Parameters<typeof createPiTranscript>[0];
-	ctxReduceEnabled: boolean;
+	isSubagent?: boolean;
 	/** Smart-drops (experimental, default off): also reclaim tool output that a
 	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
 	 *  sent to the model are byte-identical to the age-based-only behavior. */
@@ -3597,9 +3606,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			m0HardFoldThisPass ||
 			(args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn));
 
-	// 1. Tagging: assigns tag numbers + injects §N§ prefixes (unless
-	// ctx_reduce_enabled is false, in which case prefixes are skipped
-	// but DB-side tag IDs still get created so drops continue to work).
+	// 1. Tagging: assigns tag numbers + injects §N§ prefixes (unless the
+	// session is a subagent, in which case prefixes are skipped but DB-side
+	// tag IDs still get created so drops continue to work).
 	//
 	// Pi-only fallback-tag adoption: the newest (in-flight) message is tagged
 	// under an unstable pi-msg-* fallback id on the pass it is newest (its real
@@ -3636,13 +3645,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 	const tTag = performance.now();
+	const ctxReduceCallable = !args.isSubagent;
 	const { targets } = tagTranscript(
 		args.sessionId,
 		transcript,
 		args.tagger,
 		args.db,
 		{
-			skipPrefixInjection: !args.ctxReduceEnabled,
+			skipPrefixInjection: !ctxReduceCallable,
 			entryFingerprintByMessageId,
 		},
 	);

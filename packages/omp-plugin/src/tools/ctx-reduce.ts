@@ -8,9 +8,8 @@
  * historian noise out of the working context window without paying for
  * a full historian round.
  *
- * Only registered when `magic_context.ctx_reduce_enabled === true`. When
- * the flag is false, the prompt guidance also drops all `ctx_reduce`
- * mentions, so the agent never sees the tool name or the §N§ syntax.
+ * Registered as part of the primary session-scoped tool surface (omitted only
+ * for `--no-session` child processes where session-scoped tools are disabled).
  */
 
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";

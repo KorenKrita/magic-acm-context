@@ -1,6 +1,6 @@
 {
-	"name": "@magic-acm-context/pi-plugin",
-	"version": "0.30.7",
+	"name": "@cortexkit/pi-magic-context",
+	"version": "0.31.0",
 	"type": "module",
 	"description": "Pi coding agent extension for Magic Context — cross-session memory and context management",
 	"main": "dist/index.js",
@@ -47,6 +47,8 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.1",
+		"@earendil-works/pi-agent-core": "^0.80.2",
+		"@earendil-works/pi-ai": "^0.80.2",
 		"@earendil-works/pi-coding-agent": "^0.80.2",
 		"@earendil-works/pi-tui": "^0.80.2",
 		"@types/better-sqlite3": "^7.6.13",

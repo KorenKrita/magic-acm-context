@@ -86,6 +86,15 @@ export type DeferredCompactionMarkerClearOutcome =
     | "cas-lost-newer-pending"
     | "cas-lost-already-cleared";
 
+function pendingMarkerCoveredByConsumedBoundary(
+    pending: PendingCompactionMarker,
+    injection: PreparedCompartmentInjection | null,
+): boolean {
+    if (!injection) return false;
+    if (pending.endMessageId === injection.compartmentEndMessageId) return true;
+    return pending.ordinal <= injection.compartmentEndMessage;
+}
+
 export function clearPendingCompactionMarkerAfterSuccessfulDrain(args: {
     db: ContextDatabase;
     sessionId: string;
@@ -173,9 +182,9 @@ interface RunPostTransformPhaseArgs {
         ensureProjectRegistered?: (directory: string, db: ContextDatabase) => Promise<void>;
     };
     /**
-     * Age-tier caveman compression (experimental). Only honored when
-     * ctx_reduce_enabled is false. Caller is responsible for zeroing this
-     * out when ctx_reduce is on. Passed through to `applyHeuristicCleanup`.
+     * Age-tier caveman compression (experimental). Caller forwards this only
+     * for primary sessions because subagent context is curated by the parent.
+     * Passed through to `applyHeuristicCleanup`.
      */
     cavemanTextCompression?: {
         enabled: boolean;
@@ -484,10 +493,10 @@ export async function runPostTransformPhase(
         }
         if (shouldRunHeuristics) {
             const t5 = performance.now();
-            // Caveman config is only passed through when ctx_reduce_enabled is
-            // false AND the experimental flag is true. Caller (transform) wires
-            // both conditions so this postprocess path doesn't need to re-check
-            // them. Kept undefined otherwise so the heuristic pass skips entirely.
+            // Caveman config is only passed through for primary sessions when
+            // the experimental flag is true. Caller (transform) wires both
+            // conditions so this postprocess path doesn't need to re-check them.
+            // Kept undefined otherwise so the heuristic pass skips entirely.
             const cavemanConfig = args.cavemanTextCompression?.enabled
                 ? {
                       enabled: true,
@@ -1179,37 +1188,51 @@ export async function runPostTransformPhase(
     if (historyWasConsumedThisPass && args.deferredHistoryWasPendingAtPassStart) {
         const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
         if (pending) {
-            const outcome = applyDeferredCompactionMarker(
-                args.db,
-                args.sessionId,
-                pending,
-                args.sessionDirectory,
-            );
-            switch (outcome.kind) {
-                case "applied":
-                case "already-current":
-                case "stale-skip":
-                    if (
-                        clearPendingCompactionMarkerAfterSuccessfulDrain({
-                            db: args.db,
-                            sessionId: args.sessionId,
-                            pending,
-                            deferredHistoryRefreshSessions: args.deferredHistoryRefreshSessions,
-                        }) === "cas-lost-newer-pending"
-                    ) {
+            if (
+                !pendingMarkerCoveredByConsumedBoundary(pending, args.pendingCompartmentInjection)
+            ) {
+                // One cache bust must cover BOTH the history rebuild and the marker
+                // advance. Never move OpenCode's marker past history that this pass
+                // actually rendered into m[0]/m[1]; the newer blob belongs to a later
+                // consuming pass whose prepare step includes that compartment boundary.
+                suppressV12HistoryDrain = true;
+                sessionLog(
+                    args.sessionId,
+                    `compaction-marker drain: pending ordinal ${pending.ordinal} is newer than consumed boundary ${args.pendingCompartmentInjection?.compartmentEndMessage ?? "<none>"}; preserving deferred history refresh signal`,
+                );
+            } else {
+                const outcome = applyDeferredCompactionMarker(
+                    args.db,
+                    args.sessionId,
+                    pending,
+                    args.sessionDirectory,
+                );
+                switch (outcome.kind) {
+                    case "applied":
+                    case "already-current":
+                    case "stale-skip":
+                        if (
+                            clearPendingCompactionMarkerAfterSuccessfulDrain({
+                                db: args.db,
+                                sessionId: args.sessionId,
+                                pending,
+                                deferredHistoryRefreshSessions: args.deferredHistoryRefreshSessions,
+                            }) === "cas-lost-newer-pending"
+                        ) {
+                            suppressV12HistoryDrain = true;
+                        }
+                        // v12 drain proceeds below unless CAS lost to a newer blob,
+                        // in which case the signal must survive for that blob's pass.
+                        break;
+                    case "retryable-failure":
+                        sessionLog(
+                            args.sessionId,
+                            "compaction-marker drain: retryable failure; preserving deferred history refresh signal",
+                            outcome.error,
+                        );
                         suppressV12HistoryDrain = true;
-                    }
-                    // v12 drain proceeds below unless CAS lost to a newer blob,
-                    // in which case the signal must survive for that blob's pass.
-                    break;
-                case "retryable-failure":
-                    sessionLog(
-                        args.sessionId,
-                        "compaction-marker drain: retryable failure; preserving deferred history refresh signal",
-                        outcome.error,
-                    );
-                    suppressV12HistoryDrain = true;
-                    break;
+                        break;
+                }
             }
         }
     }

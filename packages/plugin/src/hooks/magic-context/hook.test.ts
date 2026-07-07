@@ -4,22 +4,29 @@
 process.env.OPENCODE_CLIENT = "desktop";
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import type { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeTaskScheduleState } from "../../features/magic-context/dreamer/storage-task-schedule";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    __resetProjectIdentityForTests,
+    __setProjectIdentityTestHooks,
+    resolveProjectIdentity,
+} from "../../features/magic-context/memory/project-identity";
 import { __resetMessageIndexAsyncForTests } from "../../features/magic-context/message-index-async";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
     closeDatabase,
     getOrCreateSessionMeta,
     openDatabase,
+    setPendingCompactionMarkerState,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import type { Tagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import { createMagicContextHook, type MagicContextDeps } from "./hook";
+import { createLiveSessionState } from "./live-session-state";
 import { closeReadOnlySessionDb } from "./read-session-db";
 
 type PromptMocks = {
@@ -41,6 +48,7 @@ function makeTempDir(prefix: string): string {
 }
 
 afterEach(() => {
+    __resetProjectIdentityForTests();
     __resetMessageIndexAsyncForTests();
     closeReadOnlySessionDb();
     closeDatabase();
@@ -194,6 +202,42 @@ function countIndexedHookMessage(sessionId: string, messageId: string): number {
 }
 
 describe("magic-context hook", () => {
+    it("constructs with directory fallback when load-time identity resolution throws", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-identity-fallback-data-");
+        const projectDir = makeTempDir("hook-identity-fallback-project-");
+        mkdirSync(join(projectDir, ".git"));
+        __setProjectIdentityTestHooks({
+            execFileSync: mock(() => {
+                const error = new Error("permission denied") as Error & { code?: string };
+                error.code = "EACCES";
+                throw error;
+            }) as unknown as typeof execFileSync,
+        });
+        const deps = createMockDeps();
+        deps.directory = projectDir;
+
+        expect(createMagicContextHook(deps)).not.toBeNull();
+    });
+
+    it("rehydrates pending marker sessions into both deferred signal sets", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-marker-rehydrate-");
+        const db = openDatabase();
+        const sessionId = "ses-marker-rehydrate";
+        setPendingCompactionMarkerState(db, sessionId, {
+            endMessageId: "msg-2",
+            ordinal: 2,
+            publishedAt: 1,
+        });
+        const liveSessionState = createLiveSessionState();
+        const deps = createMockDeps();
+        deps.liveSessionState = liveSessionState;
+
+        expect(createMagicContextHook(deps)).not.toBeNull();
+
+        expect(liveSessionState.deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
+        expect(liveSessionState.deferredMaterializationSessions.has(sessionId)).toBe(true);
+    });
+
     it("indexes terminal message.updated events asynchronously", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-message-index-");
         createOpenCodeDbForHook("ses-index", [

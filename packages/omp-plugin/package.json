@@ -1,5 +1,5 @@
 {
-	"name": "@magic-acm-context/omp-plugin",
+	"name": "@cortexkit/omp-magic-context",
 	"version": "0.30.7",
 	"type": "module",
 	"description": "OMP (Oh My Pi) coding agent extension for Magic Context — cross-session memory and context management",
@@ -48,6 +48,8 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.1",
+		"@oh-my-pi/pi-agent-core": "^16.0.0",
+		"@oh-my-pi/pi-ai": "^16.0.0",
 		"@oh-my-pi/pi-coding-agent": "^16.0.0",
 		"@oh-my-pi/pi-tui": "^16.0.0",
 		"@types/better-sqlite3": "^7.6.13",

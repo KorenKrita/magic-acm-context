@@ -21,7 +21,10 @@ import {
     runDueTasksForProject,
     runManualDream,
 } from "../../features/magic-context/dreamer/task-scheduler";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentityOrFallback,
+    takeDubiousOwnershipProjectIdentityWarning,
+} from "../../features/magic-context/memory/project-identity";
 import {
     embedSessionCompartmentChunks,
     getEmbeddingCoverageStatus,
@@ -52,7 +55,11 @@ import {
     getEmbedDrainUiStatus,
 } from "./embed-session-state";
 import { createEventHandler } from "./event-handler";
-import { resolveContextLimit, resolveModelKey } from "./event-resolvers";
+import {
+    resolveContextLimit,
+    resolveExecuteThresholdDetail,
+    resolveModelKey,
+} from "./event-resolvers";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
@@ -65,6 +72,7 @@ import {
 } from "./recomp-orchestrator";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
+import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
 
 export type { CommandExecuteInput, CommandExecuteOutput } from "./command-handler";
 
@@ -77,7 +85,7 @@ import {
     getLiveNotificationParams,
 } from "./hook-handlers";
 import type { LiveSessionState } from "./live-session-state";
-import { sendIgnoredMessage } from "./send-session-notification";
+import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import { maybeSendUpgradeReminder } from "./upgrade-reminder";
 
@@ -96,7 +104,6 @@ export interface MagicContextDeps {
     config: {
         protected_tags: number;
         language?: string;
-        ctx_reduce_enabled?: boolean;
         smart_drops?: boolean;
         toast_duration_ms?: number;
         clear_reasoning_age?: number;
@@ -197,7 +204,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         return null;
     }
 
-    const projectPath = resolveProjectIdentity(deps.directory);
+    const projectPath = resolveProjectIdentityOrFallback(deps.directory);
 
     // Startup consistency check: reconcile any compaction markers whose state
     // references rows that no longer exist in OpenCode's DB. This can happen
@@ -232,19 +239,22 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         deps.liveSessionState?.historyRefreshSessions ?? new Set<string>();
     const deferredHistoryRefreshSessions =
         deps.liveSessionState?.deferredHistoryRefreshSessions ?? new Set<string>();
+    const systemPromptRefreshSessions =
+        deps.liveSessionState?.systemPromptRefreshSessions ?? new Set<string>();
+    const pendingMaterializationSessions =
+        deps.liveSessionState?.pendingMaterializationSessions ?? new Set<string>();
+    const deferredMaterializationSessions =
+        deps.liveSessionState?.deferredMaterializationSessions ?? new Set<string>();
 
-    // Plan v6 §7: hook-init rehydration of deferred-marker drain state. A
-    // publish that wrote `pending_compaction_marker_state` before the plugin
-    // process exited (crash, restart) must still get its drain pass; seed
-    // `deferredHistoryRefreshSessions` from the persisted pending blobs so the
-    // next consuming transform pass picks them up via
-    // `applyDeferredCompactionMarker`. Idempotent — running twice just re-adds
-    // the same session ids to the Set.
+    // If the process exits after saving pending_compaction_marker_state, reload
+    // both deferred signal sets from that saved state. The next transform pass can
+    // then apply the pending marker exactly like the live publish path would.
     try {
         const sessionsWithPending = getSessionsWithPendingMarker(db);
         if (sessionsWithPending.length > 0) {
             for (const sid of sessionsWithPending) {
                 deferredHistoryRefreshSessions.add(sid);
+                deferredMaterializationSessions.add(sid);
             }
             log(
                 `[magic-context] rehydrated ${sessionsWithPending.length} session(s) with pending compaction-marker drain at hook init`,
@@ -253,13 +263,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     } catch (error) {
         log("[magic-context] hook init: pending-marker rehydration failed:", error);
     }
-
-    const systemPromptRefreshSessions =
-        deps.liveSessionState?.systemPromptRefreshSessions ?? new Set<string>();
-    const pendingMaterializationSessions =
-        deps.liveSessionState?.pendingMaterializationSessions ?? new Set<string>();
-    const deferredMaterializationSessions =
-        deps.liveSessionState?.deferredMaterializationSessions ?? new Set<string>();
     const lastHeuristicsTurnId = new Map<string, string>();
     const commitSeenLastPass = new Map<string, boolean>();
     const variantBySession =
@@ -304,7 +307,25 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         }
         return undefined;
     };
-    const ctxReduceEnabled = deps.config.ctx_reduce_enabled !== false;
+
+    const maybeSendProjectIdentitySessionWarning = (sessionId: string, directory: string): void => {
+        const warning = takeDubiousOwnershipProjectIdentityWarning(directory);
+        if (!warning) return;
+        const notificationParams: NotificationParams = getLiveNotificationParams(
+            sessionId,
+            liveModelBySession,
+            variantBySession,
+            agentBySession,
+            deps.config.toast_duration_ms,
+        );
+        void sendIgnoredMessage(deps.client, sessionId, warning, notificationParams).catch(
+            (error) => {
+                log(
+                    `[magic-context] failed to send project identity warning for ${directory}: ${getErrorMessage(error)}`,
+                );
+            },
+        );
+    };
     const dreamerRunnable = isDreamerRunnable(deps.config);
     const dreamerConfig = dreamerRunnable ? deps.config.dreamer : undefined;
     const historianRunnable = isHistorianRunnable(deps.config);
@@ -362,6 +383,35 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 deps.config.toast_duration_ms,
             ),
     });
+    const buildManagedWrapupCtx = (sessionId: string): ManagedWrapupContext => ({
+        ...buildManagedRecompCtx(sessionId),
+        contextLimit: (() => {
+            const model = resolveLiveModel(sessionId);
+            return model
+                ? resolveContextLimit(model.providerID, model.modelID, { db, sessionID: sessionId })
+                : 128_000;
+        })(),
+        executeThresholdPercentage: (() => {
+            const model = resolveLiveModel(sessionId);
+            const contextLimit = model
+                ? resolveContextLimit(model.providerID, model.modelID, { db, sessionID: sessionId })
+                : 128_000;
+            return resolveExecuteThresholdDetail(
+                deps.config.execute_threshold_percentage ?? 65,
+                model ? `${model.providerID}/${model.modelID}` : undefined,
+                65,
+                {
+                    tokensConfig: deps.config.execute_threshold_tokens,
+                    contextLimit,
+                    sessionId,
+                },
+            ).percentage;
+        })(),
+        hasPendingNaturalBust: (sid) =>
+            historyRefreshSessions.has(sid) ||
+            systemPromptRefreshSessions.has(sid) ||
+            pendingMaterializationSessions.has(sid),
+    });
     // /ctx-embed start: backfill THIS session's compartment chunk embeddings,
     // reusing the recomp progress surface (sidebar + status bar) with kind="embed".
     const executeEmbedHistory = async (
@@ -380,7 +430,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return "Embedding is already running for this session.";
         }
         await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-        const sessionProjectIdentity = resolveProjectIdentity(directory);
+        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        maybeSendProjectIdentitySessionWarning(sessionId, directory);
         embedPauseBySession.delete(sessionId);
         const prior = embedRunStateBySession.get(sessionId);
         if (prior) prior.abort();
@@ -471,14 +522,16 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         const ctrl = embedRunStateBySession.get(sessionId);
         if (ctrl) ctrl.abort();
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentity(directory);
+        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const cov = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
         return `Paused at ${cov.session.embedded}/${cov.session.total} compartments embedded.`;
     };
 
     const getEmbedStatusText = (sessionId: string): string => {
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentity(directory);
+        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
         const progress = recompProgressBySession.get(sessionId);
         const drainUi = getEmbedDrainUiStatus(sessionId, progress);
@@ -505,7 +558,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 // transform return first, keeping the hot path clean.
                 await new Promise((resolve) => setTimeout(resolve, 0));
                 await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-                const sessionProjectIdentity = resolveProjectIdentity(directory);
+                const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+                maybeSendProjectIdentitySessionWarning(sessionId, directory);
                 const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
                 if (!coverage.enabled) return;
                 const remaining = coverage.session.total - coverage.session.embedded;
@@ -544,7 +598,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         db,
         channel1StateBySession,
         protectedTags: deps.config.protected_tags,
-        ctxReduceEnabled,
         smartDrops: deps.config.smart_drops === true,
         clearReasoningAge: deps.config.clear_reasoning_age ?? 50,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
@@ -606,12 +659,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
               }
             : undefined,
-        // Age-tier caveman text compression — only honored when
-        // ctx_reduce_enabled: false. Transform gates this itself too, but we
-        // avoid wiring the feature at all when ctx_reduce is on so the
-        // transform deps stay clean.
+        // Age-tier caveman text compression is an opt-in primary-session pass.
+        // Subagents are excluded in transform.ts because their context is curated
+        // by the parent and they have no ctx_expand recovery path.
         cavemanTextCompression:
-            ctxReduceEnabled === false && deps.config.caveman_text_compression?.enabled === true
+            deps.config.caveman_text_compression?.enabled === true
                 ? {
                       enabled: true,
                       minChars: deps.config.caveman_text_compression.min_chars ?? 500,
@@ -741,6 +793,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // had fallback but no progress (sidebar stuck on stale "failed") while
         // the RPC dialog had progress but no fallback (failed on empty primary
         // model). One runner closes both gaps.
+        executeWrapup: historianRunnable
+            ? async (sessionId, options) =>
+                  runManagedWrapup(buildManagedWrapupCtx(sessionId), sessionId, options)
+            : undefined,
         executeRecomp: historianRunnable
             ? async (sessionId, options) =>
                   runManagedRecomp(buildManagedRecompCtx(sessionId), sessionId, options)
@@ -809,7 +865,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const systemPromptHash = createSystemPromptHashHandler({
         db,
         protectedTags: deps.config.protected_tags,
-        ctxReduceEnabled,
         dreamerEnabled: dreamerRunnable,
         // Gates ctx_memory guidance out of the prompt when memory is off (the
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
@@ -833,12 +888,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         internalChildSessions,
         experimentalUserMemories: userMemoryCollectionEnabled(deps.config.dreamer),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
-        // Caveman text compression only runs when ctx_reduce_enabled === false
-        // (gated in transform.ts and in hook.ts cavemanTextCompression wiring above).
-        // Mirror that gate here so the prompt warning never appears in modes where
-        // caveman won't actually compress anything.
-        experimentalCavemanTextCompression:
-            ctxReduceEnabled === false && deps.config.caveman_text_compression?.enabled === true,
+        // Mirror the primary-session caveman opt-in so the agent knows older
+        // prose may be rewritten even when ctx_reduce is available.
+        experimentalCavemanTextCompression: deps.config.caveman_text_compression?.enabled === true,
     });
     const systemPromptHashHandler = systemPromptHash.handler;
 
@@ -859,7 +911,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         commitSeenLastPass,
         client: deps.client,
         protectedTags: deps.config.protected_tags,
-        ctxReduceEnabled,
     });
 
     return {
@@ -875,7 +926,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions,
             pendingMaterializationSessions,
             lastHeuristicsTurnId,
-            ctxReduceEnabled,
             // E5 — only offer the upgrade reminder when historian can run (so
             // /ctx-session-upgrade is actually actionable). Self-gates per session.
             upgradeReminder: historianRunnable
