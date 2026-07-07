@@ -200297,7 +200297,7 @@ function registerStatusLine(pi, deps) {
     const sessionId = resolveSessionId3(ctx);
     if (sessionId)
       lastRenderedBySession.delete(sessionId);
-    ctx.ui.setStatus(STATUS_KEY, undefined);
+    ctx.ui.setWidget(STATUS_KEY, undefined);
   });
 }
 function updateStatusLine(ctx, deps, force = false) {
@@ -200308,7 +200308,7 @@ function updateStatusLine(ctx, deps, force = false) {
   if (!force && lastRenderedBySession.get(sessionId) === text)
     return;
   lastRenderedBySession.set(sessionId, text);
-  ctx.ui.setStatus(STATUS_KEY, text);
+  ctx.ui.setWidget(STATUS_KEY, [text], { placement: "belowEditor" });
 }
 function renderStatusText(ctx, db, sessionId) {
   const usage = ctx.getContextUsage?.();
