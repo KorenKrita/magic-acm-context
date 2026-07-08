@@ -1,5 +1,5 @@
 {
-  "name": "@cortexkit/opencode-magic-context",
+  "name": "@magic-context/core",
   "version": "0.31.3",
   "type": "module",
   "description": "OpenCode plugin for Magic Context — cross-session memory and context management",
@@ -67,6 +67,7 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./*": "./src/*",
     "./tui": {
       "types": "./src/tui/index.tsx",
       "import": "./src/tui/entry.mjs"
