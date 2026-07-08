@@ -17,10 +17,11 @@ SCRIPT_DIR="$ACM_ROOT/scripts"
 echo "Syncing from: $MC_ROOT"
 echo "Into:         $ACM_ROOT"
 
-# --- 1. Sync packages/plugin (no ACM modifications, straight copy) ---
+# --- 1. Sync packages/plugin (preserve package.json for workspace config) ---
 echo "→ Syncing packages/plugin..."
 rsync -a --delete \
   --exclude='node_modules/' \
+  --exclude='package.json' \
   "$MC_ROOT/packages/plugin/" "$ACM_ROOT/packages/plugin/"
 
 # --- 2. Sync packages/pi-plugin (preserve src/acm/) ---
