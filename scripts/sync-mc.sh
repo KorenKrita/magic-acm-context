@@ -27,6 +27,7 @@ rsync -a --delete \
 echo "→ Syncing packages/pi-plugin..."
 rsync -a --delete \
   --exclude='node_modules/' \
+  --exclude='dist/' \
   --exclude='src/acm/' \
   --exclude='package.json' \
   "$MC_ROOT/packages/pi-plugin/" "$ACM_ROOT/packages/pi-plugin/"
@@ -35,6 +36,7 @@ rsync -a --delete \
 echo "→ Syncing packages/omp-plugin..."
 rsync -a --delete \
   --exclude='node_modules/' \
+  --exclude='dist/' \
   --exclude='src/acm/' \
   --exclude='package.json' \
   "$MC_ROOT/packages/omp-plugin/" "$ACM_ROOT/packages/omp-plugin/"

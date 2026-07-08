@@ -29,11 +29,22 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Sync MC packages
         run: ./scripts/sync-mc.sh /tmp/magic-context
 
       - name: Sync ACM code
         run: ./scripts/sync-acm.sh /tmp/pi-context /tmp/omp-context
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Rebuild dist (includes ACM)
+        run: |
+          cd packages/pi-plugin && bun run build && cd -
+          cd packages/omp-plugin && bun run build && cd -
 
       - name: Check for changes
         id: changes
