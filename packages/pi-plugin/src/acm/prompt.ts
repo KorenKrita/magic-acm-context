@@ -1,12 +1,38 @@
 /**
- * ACM (Active Context Management) system prompt section.
+ * Unified Magic-Acm-Context prompt injection.
  *
- * Appended after the Magic Context guidance block in the unified system prompt.
- * Content is from the original SKILL.md + playbook.md, mechanically converted
- * to a template literal for injection.
+ * Structure (all ## sections under one # heading):
+ *   # Magic-Acm-Context
+ *   ## Foreword          — ACM+MC relationship, leading words, mental model
+ *   ## Context Management (ACM) — full ACM discipline (structure)
+ *   ## Magic Context     — MC guidance block (hygiene) [injected externally]
+ *   ## Closing           — reinforcement of parallel operation
+ *
+ * The MC section is built by buildMagicContextSection() and spliced between
+ * ACM and Closing at injection time. This file owns everything else.
  */
 
-export const ACM_PROMPT_SECTION = `## Context Management (ACM)
+// ── Foreword ──────────────────────────────────────────────────────────────
+
+export const FOREWORD_SECTION = `# Magic-Acm-Context
+
+## Foreword
+
+Two systems manage your context in parallel — one owns **structure**, the other owns **hygiene**. They run concurrently, never conflict, and together keep your working set lean without losing recoverability.
+
+**Structure** (ACM) — coarse-grain, tree-level decisions. Checkpoints mark recoverable positions; travel folds entire phases, tasks, or failed directions out of the working set into an archived branch. Structure sets the ceiling: without it, no amount of fine-grain cleanup prevents context from growing unbounded.
+
+**Hygiene** (Magic Context) — fine-grain, content-level maintenance. Tagging marks individual tool outputs as spent; the runtime compresses or removes them when space is needed. Hygiene optimizes below the ceiling: between structural folds, it keeps the surviving content lightweight and current.
+
+ACM is primary. A session that only does hygiene accumulates finished work indefinitely — the working set bloats with completed phases that no tag-level cleanup can remove. A session that only does structure still benefits because each fold naturally discards the noise inside. Both together compound: structure removes large done blocks, hygiene thins what remains.
+
+Unbounded context does not mean unmanaged context. You will not be truncated — but your working set should contain only material the next action needs. Structure decides what stays in the set; hygiene decides how clean it is.
+
+Follow both systems' guidance as written. They are parallel by design: ACM folds at boundaries, Magic Context reduces between them. No coordination is required — doing each correctly is sufficient.`;
+
+// ── ACM Section ───────────────────────────────────────────────────────────
+
+export const ACM_SECTION = `## Context Management (ACM)
 
 A context window is a **working set**: the live material needed for the next action.
 
@@ -206,3 +232,30 @@ Batch work accumulates hidden context debt because each item feels small.
 #### None of these fit
 
 Use the fold gate: Boundary named. NEXT executable. Raw recoverable. If any gate fails, keep the context live and checkpoint the next stable point.`;
+
+// ── Closing ───────────────────────────────────────────────────────────────
+
+export const CLOSING_SECTION = `## Closing
+
+Structure and hygiene are parallel, not sequential. You do not finish one before starting the other — checkpoint and fold at boundaries (structure), tag and reduce between them (hygiene). Both run continuously throughout every task.
+
+When in doubt: if the completed work is a phase or larger, it is a structural fold. If it is a single tool output you already used, it is hygiene. Act on whichever applies; both is often correct.`;
+
+// ── Unified builder ───────────────────────────────────────────────────────
+
+/**
+ * Assemble the complete Magic-Acm-Context prompt section.
+ *
+ * @param mcSection - The Magic Context guidance block produced by
+ *   buildMagicContextSection(). Spliced between ACM and Closing.
+ * @returns The full unified prompt string.
+ */
+export function buildUnifiedPromptSection(mcSection: string): string {
+	return `${FOREWORD_SECTION}\n\n${ACM_SECTION}\n\n${mcSection}\n\n${CLOSING_SECTION}`;
+}
+
+/**
+ * @deprecated Use buildUnifiedPromptSection() instead. Retained for
+ * compatibility during migration of the omp-plugin package.
+ */
+export const ACM_PROMPT_SECTION = ACM_SECTION;
