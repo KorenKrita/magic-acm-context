@@ -7,11 +7,11 @@ import {
     getMemoriesByProject,
     getMemoryByHash,
     getMemoryById,
-    insertMemory,
+    insertMemoryIdempotent,
     type Memory,
     type MemoryCategory,
     mergeMemoryStats,
-    saveEmbedding,
+    saveEmbeddingIfHashMatches,
     supersededMemory,
     updateMemorySeenCount,
     V2_MEMORY_CATEGORIES,
@@ -158,6 +158,7 @@ function queueMemoryEmbedding(args: {
         return;
     }
 
+    const normalizedHash = computeNormalizedHash(args.content);
     void (async () => {
         const result = await embedTextForProject(args.projectPath, args.content);
         if (!result) {
@@ -168,7 +169,21 @@ function queueMemoryEmbedding(args: {
             return;
         }
 
-        saveEmbedding(args.deps.db, args.memoryId, result.vector, result.modelId);
+        const saved = saveEmbeddingIfHashMatches(
+            args.deps.db,
+            args.memoryId,
+            result.vector,
+            result.modelId,
+            normalizedHash,
+        );
+        if (!saved) {
+            sessionLog(
+                args.sessionId,
+                `memory embedding skipped for memory ${args.memoryId}: content changed before the embedding finished.`,
+            );
+            return;
+        }
+
         sessionLog(args.sessionId, `proactively embedded memory ${args.memoryId}.`);
     })().catch((error: unknown) => {
         sessionLog(args.sessionId, `memory embedding failed for memory ${args.memoryId}:`, error);
@@ -320,18 +335,18 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                           expandedWorkspace.canonicalIdentityByStoredPath,
                       ) ?? projectIdentityForStoredPath(rawProjectPath))
                     : projectIdentityForStoredPath(rawProjectPath);
-            // The workspace's share-category policy, identical to the render path
-            // (resolveWorkspaceRenderContext): null = share all categories.
+            // The workspace's share-category policy matches the render path.
+            // null means there is no workspace filter; a workspaced caller gets
+            // an explicit list where [] shares no foreign categories.
             const toolShareCategories =
                 workspaceIdentitySet.identities.length > 1
                     ? resolveWorkspaceShareCategories(deps.db, projectPath)
                     : null;
-            // Tool visibility MUST match render visibility, or the agent could
-            // mutate (update/archive) a foreign workspace memory it can't even
-            // see. Own-project memories: every category is mutable. Foreign
-            // member memories: only when shared — shareCategories===null shares
-            // all, an empty list shares none, otherwise only the listed
-            // categories. Mirrors buildWorkspaceMemorySqlFilter's own/foreign split.
+            // Visibility is the READ contract: own memories are visible in every
+            // category, while foreign workspace memories are visible only in
+            // categories the workspace explicitly shares. Mutations by primary
+            // agents use memoryOwnedByTool below so shared visibility never
+            // grants write access to another project.
             const memoryVisibleToTool = (memory: Memory): boolean => {
                 if (workspaceIdentitySet.identities.length <= 1) {
                     return memoryBelongsToProject(memory, projectPath);
@@ -348,10 +363,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 }
                 const isOwn = targetIdentityForStoredPath(memory.projectPath) === projectPath;
                 if (isOwn) return true;
-                return (
-                    toolShareCategories === null || toolShareCategories.includes(memory.category)
-                );
+                return toolShareCategories?.includes(memory.category) ?? false;
             };
+            const memoryOwnedByTool = (memory: Memory): boolean =>
+                workspaceIdentitySet.identities.length > 1
+                    ? targetIdentityForStoredPath(memory.projectPath) === projectPath
+                    : memoryBelongsToProject(memory, projectPath);
             const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
             if (
                 embeddingSnapshot
@@ -388,7 +405,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     return `Memory already exists [ID: ${existingMemory.id}] in ${category} (seen count incremented).`;
                 }
 
-                const memory = insertMemory(deps.db, {
+                const insertResult = insertMemoryIdempotent(deps.db, {
                     projectPath: projectPath,
                     category,
                     content,
@@ -396,16 +413,19 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     sourceType:
                         toolContext.agent === DREAMER_AGENT ? "dreamer" : getSourceType(deps),
                 });
+                if (!insertResult.inserted) {
+                    return `Memory already exists [ID: ${insertResult.memory.id}] in ${category} (seen count incremented).`;
+                }
 
                 queueMemoryEmbedding({
                     deps,
                     sessionId: toolContext.sessionID,
                     projectPath,
-                    memoryId: memory.id,
+                    memoryId: insertResult.memory.id,
                     content,
                 });
 
-                return `Saved memory [ID: ${memory.id}] in ${category}.`;
+                return `Saved memory [ID: ${insertResult.memory.id}] in ${category}.`;
             }
 
             if (args.action === "list") {
@@ -433,7 +453,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
 
                 const rawProjectPath = projectPathForMemoryId(deps.db, updateId);
                 const memory = getMemoryById(deps.db, updateId);
-                if (!memory || !rawProjectPath || !memoryVisibleToTool(memory)) {
+                const updateAllowed = memory
+                    ? toolContext.agent === DREAMER_AGENT
+                        ? memoryVisibleToTool(memory)
+                        : memoryOwnedByTool(memory)
+                    : false;
+                if (!memory || !rawProjectPath || !updateAllowed) {
                     return `Error: Memory with ID ${updateId} was not found.`;
                 }
                 if (toolContext.agent !== DREAMER_AGENT && !isPrimaryMutableMemory(memory)) {
@@ -508,7 +533,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 // its own resolved project. The dreamer keeps the cross-identity
                 // path (see the "merging across identities" test).
                 if (toolContext.agent !== DREAMER_AGENT) {
-                    const foreign = sourceMemories.find((memory) => !memoryVisibleToTool(memory));
+                    const foreign = sourceMemories.find((memory) => !memoryOwnedByTool(memory));
                     if (foreign) {
                         return `Error: Memory with ID ${foreign.id} was not found.`;
                     }
@@ -550,12 +575,6 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 }
 
                 const normalizedHash = computeNormalizedHash(content);
-                const duplicate = getMemoryByHash(deps.db, projectPath, category, normalizedHash);
-                const canonicalExisting =
-                    duplicate && ids.includes(duplicate.id) ? duplicate : null;
-                if (duplicate && !canonicalExisting) {
-                    return `Error: Memory content already exists as ID ${duplicate.id}; update or archive existing duplicates instead.`;
-                }
 
                 const mergedFrom = JSON.stringify(
                     Array.from(
@@ -591,19 +610,36 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     ? "permanent"
                     : "active";
 
-                const canonicalMemory = deps.db.transaction(() => {
+                let mergeConflict: string | null = null;
+                const canonicalMemory = runImmediateTransaction(deps.db, () => {
+                    const lockedDuplicate = getMemoryByHash(
+                        deps.db,
+                        projectPath,
+                        category,
+                        normalizedHash,
+                    );
+                    const canonicalExisting =
+                        lockedDuplicate && ids.includes(lockedDuplicate.id)
+                            ? lockedDuplicate
+                            : null;
+                    if (lockedDuplicate && !canonicalExisting) {
+                        mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
+                        return null;
+                    }
+
                     const nextCanonical =
-                        canonicalExisting ??
-                        insertMemory(deps.db, {
-                            projectPath: projectPath,
-                            category,
-                            content,
-                            sourceSessionId: toolContext.sessionID,
-                            sourceType:
-                                toolContext.agent === DREAMER_AGENT
-                                    ? "dreamer"
-                                    : getSourceType(deps),
-                        });
+                        canonicalExisting?.id != null
+                            ? canonicalExisting
+                            : insertMemoryIdempotent(deps.db, {
+                                  projectPath: projectPath,
+                                  category,
+                                  content,
+                                  sourceSessionId: toolContext.sessionID,
+                                  sourceType:
+                                      toolContext.agent === DREAMER_AGENT
+                                          ? "dreamer"
+                                          : getSourceType(deps),
+                              }).memory;
                     const canonicalContentChanged =
                         nextCanonical.content !== content ||
                         nextCanonical.normalizedHash !== normalizedHash;
@@ -650,7 +686,10 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     }
 
                     return nextCanonical;
-                })();
+                });
+                if (mergeConflict || !canonicalMemory) {
+                    return mergeConflict ?? "Error: Failed to merge memories.";
+                }
 
                 queueMemoryEmbedding({
                     deps,
@@ -686,7 +725,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 for (const memoryId of archiveIds) {
                     const rawProjectPath = projectPathForMemoryId(deps.db, memoryId);
                     const memory = getMemoryById(deps.db, memoryId);
-                    if (!memory || !rawProjectPath || !memoryVisibleToTool(memory)) {
+                    const archiveAllowed = memory
+                        ? toolContext.agent === DREAMER_AGENT
+                            ? memoryVisibleToTool(memory)
+                            : memoryOwnedByTool(memory)
+                        : false;
+                    if (!memory || !rawProjectPath || !archiveAllowed) {
                         return `Error: Memory with ID ${memoryId} was not found.`;
                     }
                     if (toolContext.agent !== DREAMER_AGENT && !isPrimaryMutableMemory(memory)) {

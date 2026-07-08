@@ -21,7 +21,7 @@
  */
 
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isDreamerRunnable } from "@magic-context/core/config/agent-disable";
 import { migrateMagicContextConfigLocations } from "@magic-context/core/config/migrate-config-location";
@@ -196,6 +196,99 @@ export function persistPiMessageEndModelMeta(args: {
 	}
 }
 
+type TodoOverlayUpdater = { update: (sessionId?: string) => void };
+
+type CompatiblePiTodoCapture = {
+	normalized: string;
+	todos: unknown[];
+};
+
+function getCompatiblePiTodoCapture(
+	todos: unknown,
+): CompatiblePiTodoCapture | null {
+	if (!Array.isArray(todos)) return null;
+	const normalized = normalizeTodoStateJson(todos);
+	if (normalized === null) return null;
+	return { normalized, todos };
+}
+
+function applyCompatiblePiTodoCapture(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	todowriteEnabled: boolean;
+	todoOverlay?: TodoOverlayUpdater;
+	persist: boolean;
+	capture: CompatiblePiTodoCapture;
+}): void {
+	if (args.todowriteEnabled) {
+		setTodoSnapshot(args.sessionId, args.capture.todos);
+		args.todoOverlay?.update(args.sessionId);
+	}
+	if (args.persist) {
+		updateSessionMeta(args.db, args.sessionId, {
+			lastTodoState: args.capture.normalized,
+		});
+	}
+}
+
+/**
+ * Capture a `todowrite` args.todos payload only when it matches Magic Context's
+ * exact todo enum contract. Third-party Pi extensions can reuse the same tool
+ * name, so incompatible shapes must leave `last_todo_state` untouched.
+ */
+export function capturePiTodowriteArgsIfCompatible(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	todos: unknown;
+	todowriteEnabled: boolean;
+	todoOverlay?: TodoOverlayUpdater;
+	persist: boolean;
+}): boolean {
+	const capture = getCompatiblePiTodoCapture(args.todos);
+	if (capture === null) return false;
+	applyCompatiblePiTodoCapture({ ...args, capture });
+	return true;
+}
+
+/**
+ * Scan an assistant `message_end` payload for the first compatible `todowrite`
+ * call. This keeps interop with third-party tools that share the name but only
+ * captures state when their payload matches Magic Context's todo enums exactly.
+ */
+export function capturePiTodowriteMessageIfCompatible(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	message: unknown;
+	todowriteEnabled: boolean;
+	todoOverlay?: TodoOverlayUpdater;
+	persist: boolean;
+}): boolean {
+	const msg = args.message as { role?: unknown; content?: unknown } | undefined;
+	if (msg?.role !== "assistant" || !Array.isArray(msg.content)) {
+		return false;
+	}
+
+	for (const block of msg.content) {
+		if (!block || typeof block !== "object") continue;
+		const b = block as {
+			type?: unknown;
+			name?: unknown;
+			arguments?: unknown;
+		};
+		if (b.type !== "toolCall") continue;
+		if (typeof b.name !== "string") continue;
+		if (b.name !== "todowrite") continue;
+		const capture = getCompatiblePiTodoCapture(
+			(b.arguments as { todos?: unknown } | null | undefined)?.todos,
+		);
+		if (capture === null) continue;
+		applyCompatiblePiTodoCapture({ ...args, capture });
+		return true;
+	}
+
+	return false;
+}
+
 function info(message: string, data?: unknown): void {
 	log(`${PREFIX} ${message}`, data);
 }
@@ -205,10 +298,14 @@ function warn(message: string, data?: unknown): void {
 }
 
 // Migrate config from the legacy per-harness locations to the shared CortexKit
-// location BEFORE any loadPiConfig (hard cutover: the loader reads only
-// CortexKit). Memoized per directory so the per-cwd switch sites don't re-run
-// the (idempotent, lock-guarded) migration on every pass. Fails open.
+// location BEFORE any loadPiConfig. The loader prefers the shared CortexKit
+// paths and only falls back to Pi-owned legacy files when that base is absent.
+// Memoized per directory so the per-cwd switch sites don't re-run the
+// (idempotent, lock-guarded) migration on every pass. Fails open.
 const migratedConfigDirs = new Set<string>();
+// Memoized per directory so repeated /cd lookups do not spam the same config
+// summary/warning lines on every hot-path config resolution.
+const loggedPiConfigDirs = new Set<string>();
 function ensureConfigLocationsMigrated(dir: string): void {
 	if (migratedConfigDirs.has(dir)) return;
 	migratedConfigDirs.add(dir);
@@ -217,6 +314,34 @@ function ensureConfigLocationsMigrated(dir: string): void {
 		info: (m) => info(m),
 	});
 }
+
+function logPiConfigLoad(args: {
+	dir: string;
+	loadedFromPaths: string[];
+	warnings: string[];
+	dedupe?: boolean;
+}): void {
+	const key = resolve(args.dir);
+	if (args.dedupe && loggedPiConfigDirs.has(key)) return;
+	if (args.dedupe) {
+		loggedPiConfigDirs.add(key);
+	}
+	if (args.loadedFromPaths.length > 0) {
+		info(`config loaded from: ${args.loadedFromPaths.join(", ")}`);
+	} else {
+		info("config: no magic-context.jsonc found, using schema defaults");
+	}
+	for (const warning of args.warnings) {
+		warn(`config: ${warning}`);
+	}
+}
+
+export const __test = {
+	logPiConfigLoad,
+	resetLoggedPiConfigDirs(): void {
+		loggedPiConfigDirs.clear();
+	},
+};
 
 function formatTokens(value: number): string {
 	return value.toLocaleString();
@@ -357,9 +482,10 @@ setHarness("pi");
 // ---------------------------------------------------------------------------
 // Config-driven resolvers
 //
-// Step 5b replaced the env-var stop-gaps with `loadPiConfig()` which reads
-// $cwd/.pi/magic-context.jsonc (project) + ~/.pi/agent/magic-context.jsonc
-// (user) and merges them through the shared Zod schema. The resolvers below
+// Step 5b replaced the env-var stop-gaps with `loadPiConfig()`, which reads
+// the shared CortexKit config paths (project `.cortexkit/`, user `~/.config/`)
+// and falls back to Pi-owned legacy files only until migration completes. The
+// resolvers below
 // adapt the schema-shaped config into the Pi-specific options the various
 // registration helpers expect.
 //
@@ -563,10 +689,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	);
 
 	// Step 5b: load the user's full magic-context.jsonc config. The loader
-	// reads $cwd/.pi/magic-context.jsonc and ~/.pi/agent/magic-context.jsonc
-	// (Pi convention), validates them through the shared Zod schema, falls
-	// back to defaults for invalid fields per-key, and returns merged
-	// config + warnings.
+	// reads the shared CortexKit project/user paths, validates them through the
+	// shared Zod schema, falls back to Pi-owned legacy files only while migration
+	// is incomplete, and uses defaults for invalid fields per-key. It returns
+	// the merged config plus warnings.
 	//
 	// We surface warnings via the standard `warn()` channel so users see
 	// them in the magic-context log. Loading never throws — bad config
@@ -575,14 +701,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const { config, warnings, loadedFromPaths } = loadPiConfig({
 		cwd: projectDir,
 	});
-	if (loadedFromPaths.length > 0) {
-		info(`config loaded from: ${loadedFromPaths.join(", ")}`);
-	} else {
-		info("config: no magic-context.jsonc found, using schema defaults");
-	}
-	for (const w of warnings) {
-		warn(`config: ${w}`);
-	}
+	logPiConfigLoad({
+		dir: projectDir,
+		loadedFromPaths,
+		warnings,
+		dedupe: true,
+	});
 
 	// Pi opens the shared DB before config is available (above), so apply the
 	// configured SQLite tuning to the already-open connection now. cache_size /
@@ -717,7 +841,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		const cached = projectDepsByDir.get(dir);
 		if (cached) return cached;
 		ensureConfigLocationsMigrated(dir);
-		const switchedConfig = loadPiConfig({ cwd: dir }).config;
+		const switchedLoad = loadPiConfig({ cwd: dir });
+		logPiConfigLoad({
+			dir,
+			loadedFromPaths: switchedLoad.loadedFromPaths,
+			warnings: switchedLoad.warnings,
+			dedupe: true,
+		});
+		const switchedConfig = switchedLoad.config;
 		const switchedIdentity =
 			identityOverride ?? resolveProjectIdentityOrFallback(dir);
 		const built = buildProjectDeps(dir, switchedIdentity, switchedConfig);
@@ -1249,7 +1380,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 			// Use effectiveConfig (re-resolved from the CURRENT checkout's cwd on
 			// a project switch) for every system-prompt decision below — a
-			// switched-into project may carry its own .pi/magic-context.jsonc
+			// switched-into project may carry its own .cortexkit/magic-context.jsonc
 			// (memory/docs/key-files/injection toggles). Reusing boot `config`
 			// would render the launch project's adjuncts in the new checkout.
 			if (effectiveConfig.system_prompt_injection?.enabled === false) {
@@ -1474,10 +1605,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				const sessionMeta = Array.isArray(todos)
 					? getOrCreateSessionMeta(db, sessionId)
 					: null;
-				if (todowriteEnabled && Array.isArray(todos)) {
-					setTodoSnapshot(sessionId, todos);
-					todoOverlay?.update(sessionId);
-				}
 
 				// Synthetic-todowrite snapshot capture (Pi parity with
 				// OpenCode hook-handlers.ts:386-401). Persist normalized
@@ -1486,15 +1613,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				// snapshot to replay on the next cache-busting pass.
 				// Cache-safe: this is a pure DB write with no message
 				// mutation. Subagents skip — they do not get synthetic
-				// todowrite injection.
-				if (sessionMeta && !sessionMeta.isSubagent) {
-					const normalizedTodos = normalizeTodoStateJson(todos);
-					if (normalizedTodos !== null) {
-						updateSessionMeta(db, sessionId, {
-							lastTodoState: normalizedTodos,
-						});
-					}
-				}
+				// todowrite injection. Foreign Pi extensions can share the
+				// `todowrite` name, so only the exact Magic Context todo
+				// shape updates the stored snapshot.
+				capturePiTodowriteArgsIfCompatible({
+					db,
+					sessionId,
+					todos,
+					todowriteEnabled,
+					todoOverlay,
+					persist: Boolean(sessionMeta && !sessionMeta.isSubagent),
+				});
 
 				if (
 					Array.isArray(todos) &&
@@ -1729,43 +1858,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			try {
 				const sessionMetaForTodo = getOrCreateSessionMeta(db, sessionId);
 				if (!sessionMetaForTodo.isSubagent) {
-					const msg = event.message as
-						| { role?: string; content?: unknown }
-						| undefined;
-					if (msg && msg.role === "assistant" && Array.isArray(msg.content)) {
-						for (const block of msg.content) {
-							if (!block || typeof block !== "object") continue;
-							const b = block as {
-								type?: unknown;
-								name?: unknown;
-								arguments?: unknown;
-							};
-							if (b.type !== "toolCall") continue;
-							if (typeof b.name !== "string") continue;
-							if (b.name !== "todowrite") {
-								continue;
-							}
-							const args = b.arguments as
-								| { todos?: unknown }
-								| null
-								| undefined;
-							const todos = args?.todos;
-							if (!Array.isArray(todos)) continue;
-							const normalized = normalizeTodoStateJson(todos);
-							if (normalized === null) continue;
-							if (todowriteEnabled) {
-								setTodoSnapshot(sessionId, todos);
-								todoOverlay?.update(sessionId);
-							}
-							updateSessionMeta(db, sessionId, {
-								lastTodoState: normalized,
-							});
-							// First valid todowrite block wins — mirrors OpenCode's
-							// `tool.execute.after` behavior of capturing one
-							// snapshot per tool invocation.
-							break;
-						}
-					}
+					capturePiTodowriteMessageIfCompatible({
+						db,
+						sessionId,
+						message: event.message,
+						todowriteEnabled,
+						todoOverlay,
+						persist: true,
+					});
 				}
 			} catch (err) {
 				warn("message_end: synthetic todowrite capture failed:", err);

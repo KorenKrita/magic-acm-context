@@ -240,11 +240,92 @@ describe("unifiedSearch", () => {
         expect(memoryIds).not.toContain(foreignHidden.id);
     });
 
+    it("fails closed for malformed workspace share categories during memory search", async () => {
+        db.exec(`
+            INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
+            VALUES (1, 'ws', 'not-json', 1, 1);
+            INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+            VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
+        `);
+        const own = insertMemory(db, {
+            projectPath: "git:own",
+            category: "CONSTRAINTS",
+            content: "own malformed-policy needle",
+        });
+        const foreign = insertMemory(db, {
+            projectPath: "git:foreign",
+            category: "CONSTRAINTS",
+            content: "foreign malformed-policy needle",
+        });
+
+        const results = await unifiedSearch(db, "ses-1", "git:own", "malformed-policy", {
+            limit: 10,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            sources: ["memory"],
+        });
+
+        const memoryIds = results
+            .filter((result) => result.source === "memory")
+            .map((result) => result.memoryId);
+        expect(memoryIds).toContain(own.id);
+        expect(memoryIds).not.toContain(foreign.id);
+    });
+
+    it("uses the designed CONSTRAINTS default for legacy NULL workspace share categories", async () => {
+        db.exec(`
+            DROP TABLE workspace_members;
+            DROP TABLE workspaces;
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                share_categories TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE workspace_members (
+                workspace_id INTEGER NOT NULL,
+                project_path TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                display_path TEXT NOT NULL,
+                added_at INTEGER NOT NULL,
+                PRIMARY KEY (workspace_id, project_path)
+            );
+            INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
+            VALUES (1, 'ws', NULL, 1, 1);
+            INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+            VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
+        `);
+        const foreignConstraint = insertMemory(db, {
+            projectPath: "git:foreign",
+            category: "CONSTRAINTS",
+            content: "foreign legacy-null constraint needle",
+        });
+        const foreignNaming = insertMemory(db, {
+            projectPath: "git:foreign",
+            category: "NAMING",
+            content: "foreign legacy-null naming needle",
+        });
+
+        const results = await unifiedSearch(db, "ses-1", "git:own", "legacy-null", {
+            limit: 10,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            sources: ["memory"],
+        });
+
+        const memoryIds = results
+            .filter((result) => result.source === "memory")
+            .map((result) => result.memoryId);
+        expect(memoryIds).toContain(foreignConstraint.id);
+        expect(memoryIds).not.toContain(foreignNaming.id);
+    });
+
     it("ignores workspace memory vectors from inactive embedding models", async () => {
         const snapshot = registerEmbeddingProject(db, "git:own");
         db.exec(`
             INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
-            VALUES (1, 'ws', NULL, 1, 1);
+            VALUES (1, 'ws', '["NAMING"]', 1, 1);
             INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
             VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
         `);
@@ -700,6 +781,55 @@ describe("unifiedSearch", () => {
         const probedMessages = probed.filter((r) => r.source === "message");
         expect(probedMessages.some((r) => r.messageId === "m1")).toBe(true);
         expect(probedMessages[0]?.messageId).toBe("m1");
+    });
+
+    it("counts probe corpus statistics only inside the message cutoff", async () => {
+        rawMessagesBySession.set("ses-cutoff-probes", [
+            {
+                ordinal: 1,
+                id: "common-1",
+                role: "assistant",
+                parts: [{ type: "text", text: "CommonTerm is the eligible early hit." }],
+            },
+            {
+                ordinal: 2,
+                id: "rare-2",
+                role: "assistant",
+                parts: [{ type: "text", text: "RareSymbolXyz is the eligible late hit." }],
+            },
+            ...Array.from({ length: 12 }, (_, i) => ({
+                ordinal: i + 3,
+                id: `tail-${i}`,
+                role: "assistant" as const,
+                parts: [
+                    {
+                        type: "text" as const,
+                        text: `CommonTerm appears again in excluded live-tail row ${i}.`,
+                    },
+                ],
+            })),
+        ]);
+        ensureMessagesIndexed(db, "ses-cutoff-probes", readMessages);
+
+        const results = await unifiedSearch(
+            db,
+            "ses-cutoff-probes",
+            "/repo/probe-cutoff",
+            "RareSymbolXyz CommonTerm",
+            {
+                memoryEnabled: false,
+                embeddingEnabled: false,
+                readMessages,
+                embedQuery,
+                isEmbeddingRuntimeEnabled,
+                sources: ["message"],
+                explicitSearch: true,
+                maxMessageOrdinal: 2,
+            },
+        );
+
+        const messages = results.filter((r) => r.source === "message");
+        expect(messages.map((r) => r.messageId)).toEqual(["common-1", "rare-2"]);
     });
 
     it("multi-probe scores decay linearly instead of flattening into a ~1.0 band", async () => {
