@@ -307,6 +307,7 @@ describe("loadPluginConfig — secret redaction", () => {
         // The custom message explains WHY, not just "too big".
         expect(combined).toContain("capped at 80% for cache safety");
     });
+
     it("defaults omitted embedding configuration to off", () => {
         const result = loadWithUserConfig(JSON.stringify({ enabled: true }));
 
