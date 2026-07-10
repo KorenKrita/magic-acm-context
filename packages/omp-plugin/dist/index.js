@@ -196882,7 +196882,11 @@ A context window is a **working set**: the live material needed for the next act
 
 Keep the working set live. Compress everything else into a recoverable **handoff** at stable **boundaries**. Manage it yourself, mid-task, without being asked and without asking permission.
 
+Use this discipline continuously in multi-step work: before bursts or risks, at phase, attempt, batch, and task-chain boundaries, and before final answers or task switches.
+
 ### Leading words
+
+Use these words consistently; they are the skill's decision vocabulary.
 
 **Working set** — context the next action will directly reason over. Keep exact detail live while it is still needed.
 
@@ -196949,11 +196953,13 @@ Fold by boundary, not proximity. The nearest anchor is only a candidate.
 | Batch item | item finished and more remain | method or batch anchor |
 | Task chain | final answer next, or new request over finished work | semantic chain start |
 
-Call \`acm_travel\` at these stable boundaries by default. Skip only when the fold preview shows almost no saving.
+Call \`acm_travel\` at these stable boundaries by default. The boundary establishes whether folding is semantically appropriate; the preview only measures the likely saving. **Preview measures; boundary decides.**
 
 #### Task end
 
-The final answer should be written from the handoff, not the trail. At task end, fold before answering:
+A task-chain boundary is semantically foldable by default. Inspect the fold preview before answering:
+
+- If it shows meaningful structural saving, fold to the semantic task-chain start:
 
 \`\`\`javascript
 acm_travel({
@@ -196963,7 +196969,12 @@ acm_travel({
 });
 \`\`\`
 
-Then answer from the handoff branch. If a \`-done\` checkpoint already bookmarks the raw path, name it in the handoff's \`Recover\` slot.
+  Then answer from the handoff branch, not the archived trail.
+- If it shows almost no saving, checkpoint \`<task>-done\` and answer directly without traveling.
+
+If a \`-done\` checkpoint already bookmarks the raw path, name it in the handoff's \`Recover\` slot.
+
+Task-end context management is complete when either a meaningful fold has landed or the no-saving fallback has created a unique \`-done\` checkpoint. Give the answer from the surviving branch.
 
 #### New request over unfolded work
 
@@ -196989,94 +197000,184 @@ Pointers over dumps. Copy raw values only when small, volatile, or needed immedi
 
 ### Target selection
 
-Name the boundary first, then choose the target:
-
-- Burst → pre-burst anchor or last clean node before the output.
-- Phase → the phase's \`-start\`.
-- Failed direction → where the attempt began, or the last \`-done\` milestone behind it.
-- Batch item → the method anchor that should survive item-to-item.
-- Task chain → earliest \`-start\` of the semantic chain being compressed, not the earliest start in the whole conversation.
-- Missing anchor → \`acm_timeline\`, pick the last clean node ID before the boundary, then travel to that node.
-
-Older anchors can be better targets when the handoff can carry the state. A newer anchor is not automatically better.
+Use the boundary table, then verify that the target sits before the material being compressed. Older semantic anchors can be better than newer ones. If no anchor fits, use \`acm_timeline\` to find the last clean node before the boundary and travel to that raw node ID.
 
 ### After travel
 
-You are on the handoff branch. Execute \`NEXT\`, then checkpoint the next phase before its first action. Disk and external systems were not rolled back; inspect them directly when in doubt. If a handoff dropped detail, re-fetch from \`Evidence\` first, then recover from \`Archive\` by traveling to the backup or off-path node.
+You are on the handoff branch. Read the tool result before continuing: confirm the reported structural effect and context refresh or synchronization status. If \`NEXT\` is the first action of a new phase, checkpoint that phase before executing \`NEXT\`; otherwise execute \`NEXT\` directly.
+
+Disk and external systems were not rolled back; inspect them directly when in doubt. If a handoff dropped detail, re-fetch from \`Evidence\` first, then recover from \`Archive\` by following the round-trip procedure in the playbook.
 
 ### Mechanics
 
-- Checkpoint names are unique across the tree and case-sensitive; one node may hold multiple aliases.
+- Checkpoint names are unique across the tree and case-sensitive; one node may hold multiple aliases. If a semantic name already exists, preserve its base and add the smallest useful scope, ordinal, or date, such as \`parser-fix-api-v2-start\`. Generic names like \`checkpoint-1\` carry no recovery meaning.
 - Omitting checkpoint \`target\` auto-anchors the nearest meaningful USER/AI turn near HEAD; passing a node ID anchors any past node retroactively.
-- \`acm_timeline\` mode precedence: \`list_checkpoints\` > \`search\` > \`full_tree\` > active path. Never conclude an anchor is missing from a truncated \`full_tree\`.
+- \`acm_timeline\` mode precedence: \`list_checkpoints\` > \`search\` > \`full_tree\` > active path. Treat a truncated \`full_tree\` as incomplete; use \`list_checkpoints\` or \`search\` to verify whether an anchor exists.
 - Travel can shrink or grow context: traveling to a later or off-path target can restore raw history. Read the reported usage and structural effect.
-- Judge fill level by reported usage, never by file bytes or lines read.
+- Judge fill level by reported usage; file bytes and line counts are not context usage.
 - If runtime auto-compacts, a \`pre-compact-<timestamp>\` checkpoint is created automatically.
 
 ### Boundary playbook
 
-#### Burst boundary
+Read this before acting when target selection is non-obvious, fronts are interleaved, an anchor is missing, archived detail must be recovered, task-end travel would save almost nothing, or a checkpoint name collides. The core rules above own the discipline; this embedded playbook adds decisions and worked examples.
 
-A burst is a temporary expansion: big read, broad search, log fetch, large diff, subagent, or any tool output you could not bound before calling it.
+#### Decision tree
 
-**Signal**: you have extracted the finding, paths, commands, errors, or IDs needed for the next action.
+Ask in order:
 
-**Target**: the pre-burst checkpoint. If missing, use \`acm_timeline\` and choose the last clean node ID before the burst.
+1. Does \`NEXT\` still need the raw detail? Keep it live; checkpoint if useful.
+2. Is the final answer next, or did a new request arrive after finished work? **Task chain.**
+3. Was temporary output distilled into findings, paths, errors, or IDs? **Burst.**
+4. Was an attempt rejected, falsified, or superseded? **Failed direction.**
+5. Is one repeatable item done while more remain? **Batch item.**
+6. Will \`NEXT\` use a conclusion rather than its trail? **Phase.**
+7. None fit? Keep the context live and checkpoint the next stable point.
 
-**Handoff owns**: extract, evidence pointer, NEXT.
+Before travel: name the boundary, choose a target before it, reject anchors from the wrong front, and confirm one executable \`NEXT\`. Nearest and earliest anchors are candidates, not defaults. **Preview measures; boundary decides.**
 
-**Failure mode**: keeping raw output live after the extract is stable.
+#### Filled handoffs
 
-#### Phase boundary
+Each example demonstrates information density and fact placement; adapt its shape to the current boundary.
 
-A phase boundary appears when the next action uses the phase result, not the raw path that produced it.
+##### Burst → implementation
 
-**Signal**: investigation becomes implementation; implementation becomes validation; diagnosis becomes fix; reading becomes answer.
+\`\`\`text
+Goal: Fix excessive CPU use while preserving the sidebar.
+State: Profiling confirmed hidden tabs keep rendering and retain workers; implementation is next.
+Evidence: src/sidebar/session-manager.ts; artifacts/sidebar-profile.json; \`bun test sidebar\`.
+External: No files changed; profiler stopped.
+Exclusions: Preserve the sidebar; disabling or killing it violates the goal.
+Recover: checkpoint sidebar-profile-start; raw profiling trail is archived.
+NEXT: Checkpoint sidebar-lifecycle-fix-start, then inspect tab disposal in src/sidebar/session-manager.ts.
+\`\`\`
 
-**Target**: the phase \`-start\`.
+Travel to \`sidebar-profile-start\`. Because \`NEXT\` starts a phase, checkpoint it before inspecting the file.
 
-**Handoff owns**: conclusion, decision, next phase.
+##### Failed direction → next attempt
 
-**Failure mode**: waiting for a new user message even though the next phase has already begun.
+\`\`\`text
+Goal: Stop duplicate API requests after session restore.
+State: Disabling the response cache did not change request count; duplication occurs before cache lookup.
+Evidence: logs/restore-debug.log; test restore-replay shows two dispatch calls.
+External: Debug logging remains enabled in config/local.json.
+Exclusions: Cache invalidation is ruled out; both requests enter dispatch independently.
+Recover: cache-hypothesis-start; backup cache-hypothesis-done.
+NEXT: Checkpoint dispatch-replay-start, then trace callers of dispatchRestoredRequest.
+\`\`\`
 
-#### Failed-direction boundary
+Travel to \`cache-hypothesis-start\`. Put the rejected approach in \`Exclusions\`, and surviving facts in \`State\` and \`Evidence\`.
 
-A failed direction is a branch whose raw trail should not pollute the next attempt.
+##### Batch item → reusable method
 
-**Signal**: an approach failed, a hypothesis was falsified, a design direction was rejected, or a path was superseded.
+\`\`\`text
+Goal: Migrate twelve provider fixtures to the normalized schema.
+State: Items 1-4 pass; eight remain. Method: rename model_id, normalize headers, run the fixture test.
+Evidence: fixtures/providers/a.json through d.json; \`bun test provider-fixtures\`.
+External: Four fixture files changed; no remote changes.
+Exclusions: Provider C uses the standard parser; a stale snapshot caused its failure.
+Recover: checkpoint migration-method-ready.
+NEXT: Migrate fixtures/providers/e.json with the established method.
+\`\`\`
 
-**Target**: the attempt start or last milestone.
+Travel to \`migration-method-ready\`. Preserve the tally and method, not item-specific exploration.
 
-**Handoff owns**: what failed, why, what survives.
+##### Finished chain → new request
 
-**Failure mode**: continuing with a dead trail in the working set because it was expensive to produce.
+\`\`\`text
+Goal: Release fix complete. New request: "Add a dry-run mode to the migration command."
+State: Validation passed and v2.4.1 was pushed; migration work has not started.
+Evidence: commit 1a2b3c4; \`bun test\`; tag v2.4.1.
+External: Commit and tag pushed to origin.
+Exclusions: The version-detection workaround remains rejected.
+Recover: backup release-fix-done.
+NEXT: Checkpoint migration-dry-run-start, then inspect the migration command entry point.
+\`\`\`
 
-#### Batch boundary
+Travel to \`release-fix-start\` with \`backupCurrentHeadAs: "release-fix-done"\`. Quote the triggering request because its turn leaves context.
 
-Batch work accumulates hidden context debt because each item feels small.
+#### Interleaved fronts
 
-**Signal**: one item is complete and more remain.
+1. List active, parked, and completed fronts.
+2. Compress one named front at a time.
+3. Choose that front's pre-boundary anchor or raw node, even when another front has a newer checkpoint.
+4. Use an older anchor or \`root\` only when the handoff can carry a small capsule for every surviving front.
+5. Give parked fronts state and recovery pointers, but keep one global \`NEXT\`.
 
-**Target**: the method anchor: the point after the reusable method is known and before item-specific noise begins.
+\`\`\`text
+State: Active — auth retry. Parked — release notes awaiting CI. Done — provider audit.
+Evidence: Auth: src/auth/retry.ts. Release: run 4182. Audit: docs/provider-audit.md.
+Recover: auth-trace-done; release-notes-paused; provider-audit-done.
+NEXT: Add the bounded retry guard in src/auth/retry.ts.
+\`\`\`
 
-**Handoff owns**: tally, method refinements, next item.
+#### Missing anchor
 
-**Failure mode**: judging each fold by small immediate savings. Batch folds compound.
+1. If orientation is poor, checkpoint the current meaningful turn as an archive pointer.
+2. Call \`acm_timeline\`; on large trees prefer \`list_checkpoints\` or \`search\` before \`full_tree\`.
+3. Find the last clean node before the named boundary.
+4. Confirm it is outside the material being folded.
+5. Travel to that raw node ID with the handoff.
 
-#### Task-chain boundary
+The target is the last clean node outside the boundary; a labeled node inside the burst, phase, or failed attempt is invalid.
 
-**Signal**: the final answer is next; or a new user request arrives over finished work.
+#### Recover archived detail and return
 
-**Target**: the earliest \`-start\` of the semantic chain being compressed.
+Recovery is a round trip:
 
-**Handoff owns**: final state, answer material, recovery pointer.
+1. Checkpoint the summary branch as \`<front>-resume\`.
+2. Travel to the archive pointer with a temporary handoff whose \`NEXT\` is the exact lookup.
+3. Extract only the needed value, wording, error, or reasoning.
+4. Travel back to \`<front>-resume\` with that extract and its evidence pointer.
+5. Confirm structural effect and refresh/sync status; resume the original \`NEXT\`.
 
-**Failure mode**: anchor gravity toward the most recent task or phase anchor. Fold by boundary, not proximity.
+\`\`\`javascript
+acm_checkpoint({ name: "parser-fix-resume" });
+acm_travel({ target: "parser-investigation-done", summary: "<lookup handoff>" });
+// Recover: Unexpected token at byte 418.
+acm_travel({ target: "parser-fix-resume", summary: "<resume handoff carrying byte 418>" });
+\`\`\`
 
-#### None of these fit
+Return to \`<front>-resume\` before unrelated implementation. Stay on the archive branch only when intentionally abandoning the summary branch.
 
-Use the fold gate: Boundary named. NEXT executable. Raw recoverable. If any gate fails, keep the context live and checkpoint the next stable point.`;
-var ACM_PROMPT_SECTION = ACM_SECTION;
+#### Task end with almost no saving
+
+If the final answer is next and preview shows almost no saving, create a unique \`<task>-done\` checkpoint and answer directly. If saving is meaningful, use task-end travel with \`backupCurrentHeadAs\` and answer from the handoff branch.
+
+#### Checkpoint name collision
+
+Names are tree-wide, unique, and case-sensitive. Search existing names, preserve the semantic base, then add the smallest useful scope, ordinal, or date:
+
+\`\`\`text
+parser-fix-api-v2-start
+release-validation-20260710-start
+sidebar-power-investigation-2-start
+\`\`\`
+
+Generic names such as \`checkpoint-1\`, \`new-start\`, or \`temp-done\` carry no recovery meaning.
+
+#### Failure patterns
+
+- **Anchor gravity** — choosing the nearest checkpoint before naming the boundary.
+- **Preview authority** — allowing estimated saving to define the boundary.
+- **Premature fold** — removing detail still needed by \`NEXT\`.
+- **Placeholder handoff** — writing field labels instead of conclusions and pointers.
+- **Competing NEXTs** — assigning several fronts immediate actions.
+- **Archive drift** — recovering detail, then accidentally continuing on the archive branch.
+- **Task-end no-op** — traveling when a done checkpoint preserves the same working set.`;
+var CLOSING_SECTION = `## Closing
+
+Structure and hygiene are parallel, not sequential. You do not finish one before starting the other — checkpoint and fold at boundaries (structure), tag and reduce between them (hygiene). Both run continuously throughout every task.
+
+When in doubt: if the completed work is a phase or larger, it is a structural fold. If it is a single tool output you already used, it is hygiene. Act on whichever applies; both is often correct.`;
+function buildUnifiedPromptSection(mcSection) {
+  return `${FOREWORD_SECTION}
+
+${ACM_SECTION}
+
+${mcSection}
+
+${CLOSING_SECTION}`;
+}
 
 // src/system-prompt.ts
 init_logger();

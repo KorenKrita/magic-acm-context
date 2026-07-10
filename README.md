@@ -31,13 +31,12 @@ Magic Context + ACM (Active Context Management) unified extension for pi and omp
 └── Reduction triggers
 
 ## Context Management (ACM)
-├── Core concepts (working set, boundary, handoff, chain)
-├── Fold gate (3 conditions)
-├── Checkpoint discipline
-├── Fold discipline (boundary → target table)
-├── Handoff contract (7 slots)
-├── Target selection rules
-└── Boundary playbook
+├── Core decision vocabulary (working set, boundary, handoff, chain)
+├── Fold gate (boundary named, NEXT executable, raw recoverable)
+├── Checkpoint discipline and semantic anchor naming
+├── Boundary-first fold discipline and task-end no-saving fallback
+├── Handoff contract (7 slots) and after-travel ordering
+└── Embedded playbook (decision tree, filled handoffs, recovery edge cases)
 ```
 
 ### Collaboration Model
