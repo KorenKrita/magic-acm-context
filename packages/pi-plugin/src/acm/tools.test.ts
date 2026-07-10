@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { fixOrphanedToolUse } from "./tools";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import registerACMExtension, { fixOrphanedToolUse } from "./tools";
 
 const text = (value: string) => [{ type: "text", text: value }];
 const toolCall = (id: string) => ({
@@ -8,6 +9,22 @@ const toolCall = (id: string) => ({
 	name: "bash",
 	arguments: {},
 });
+
+type Handler = (event: unknown, ctx: unknown) => unknown;
+
+function captureHandlers(): Map<string, Handler[]> {
+	const handlers = new Map<string, Handler[]>();
+	const pi = {
+		on(name: string, handler: Handler) {
+			const existing = handlers.get(name) ?? [];
+			existing.push(handler);
+			handlers.set(name, existing);
+		},
+		registerTool() {},
+	};
+	registerACMExtension(pi as unknown as ExtensionAPI);
+	return handlers;
+}
 
 describe("fixOrphanedToolUse", () => {
 	it("removes a function call output whose call_id has no preceding tool call", () => {
@@ -21,7 +38,7 @@ describe("fixOrphanedToolUse", () => {
 			},
 		];
 
-		fixOrphanedToolUse(messages);
+		expect(fixOrphanedToolUse(messages)).toBe(true);
 
 		expect(messages).toEqual([{ role: "user", content: text("continue") }]);
 	});
@@ -41,7 +58,7 @@ describe("fixOrphanedToolUse", () => {
 			},
 		];
 
-		fixOrphanedToolUse(messages);
+		expect(fixOrphanedToolUse(messages)).toBe(true);
 
 		expect(messages).toHaveLength(1);
 		expect(messages[0]?.role).toBe("assistant");
@@ -56,7 +73,7 @@ describe("fixOrphanedToolUse", () => {
 			},
 		];
 
-		fixOrphanedToolUse(messages);
+		expect(fixOrphanedToolUse(messages)).toBe(true);
 
 		expect(messages).toHaveLength(2);
 		expect(messages[1]).toMatchObject({
@@ -64,6 +81,47 @@ describe("fixOrphanedToolUse", () => {
 			toolCallId: "call_missing_output",
 			toolName: "bash",
 			isError: true,
+		});
+	});
+});
+
+describe("restored session context sanitation", () => {
+	it("removes a persisted travel tool result after session_start cleared pending state", async () => {
+		const handlers = captureHandlers();
+		const sessionStart = handlers.get("session_start")?.[0];
+		const context = handlers.get("context")?.[0];
+		expect(sessionStart).toBeDefined();
+		expect(context).toBeDefined();
+
+		const sessionManager = {};
+		const ctx = { sessionManager };
+		await sessionStart?.({ reason: "resume" }, ctx);
+
+		const callId = "call_WuALCbwjVXJ6Z4O8toPpen9a";
+		const messages = [
+			{
+				role: "branchSummary",
+				summary: "Continue from the handoff branch",
+			},
+			{
+				role: "toolResult",
+				toolCallId: callId,
+				toolName: "acm_travel",
+				content: text("Travel complete"),
+			},
+			{ role: "user", content: text("new request after restore") },
+		];
+
+		const result = await context?.({ messages }, ctx);
+
+		expect(result).toEqual({
+			messages: [
+				{
+					role: "branchSummary",
+					summary: "Continue from the handoff branch",
+				},
+				{ role: "user", content: text("new request after restore") },
+			],
 		});
 	});
 });
