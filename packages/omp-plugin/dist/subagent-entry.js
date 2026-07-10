@@ -8198,6 +8198,7 @@ function healNullTextColumns(db) {
     ["cache_ttl", ""],
     ["last_nudge_band", ""],
     ["last_nudge_level", ""],
+    ["channel2_nudge_claim_token", ""],
     ["last_transform_error", ""],
     ["nudge_anchor_message_id", ""],
     ["nudge_anchor_text", ""],
@@ -8261,6 +8262,7 @@ function healNullIntegerColumns(db) {
 }
 
 // ../plugin/src/features/magic-context/workspaces.ts
+init_logger();
 import { createHash as createHash2 } from "node:crypto";
 
 // ../plugin/src/features/magic-context/memory/constants.ts
@@ -8615,6 +8617,7 @@ function storedPathBelongsToIdentity(storedProjectPath, projectIdentity) {
 }
 // ../plugin/src/features/magic-context/workspaces.ts
 var VALID_SHARE_CATEGORIES = new Set(V2_MEMORY_CATEGORIES);
+var DEFAULT_WORKSPACE_SHARE_CATEGORIES = ["CONSTRAINTS"];
 function tableExists(db, tableName) {
   const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1").get(tableName);
   return Boolean(row);
@@ -8629,23 +8632,39 @@ function uniqueSorted(values) {
 function placeholders(values) {
   return values.map(() => "?").join(", ");
 }
+function defaultWorkspaceShareCategories() {
+  return [...DEFAULT_WORKSPACE_SHARE_CATEGORIES];
+}
+function warnInvalidShareCategories(reason, raw) {
+  log("[magic-context] WARN: invalid workspace share_categories; sharing no foreign memory categories", {
+    reason,
+    raw
+  });
+}
 function normalizeShareCategories(raw) {
-  if (raw === null || raw === undefined)
-    return null;
-  if (typeof raw !== "string")
-    return null;
+  if (raw === null || raw === undefined) {
+    return defaultWorkspaceShareCategories();
+  }
+  if (typeof raw !== "string") {
+    warnInvalidShareCategories("not a string", raw);
+    return [];
+  }
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null;
+    warnInvalidShareCategories("malformed JSON", raw);
+    return [];
   }
-  if (!Array.isArray(parsed))
-    return null;
+  if (!Array.isArray(parsed)) {
+    warnInvalidShareCategories("not a JSON array", raw);
+    return [];
+  }
   const categories = [];
   for (const value of parsed) {
     if (typeof value !== "string" || !VALID_SHARE_CATEGORIES.has(value)) {
-      return null;
+      warnInvalidShareCategories("unknown category", raw);
+      return [];
     }
     if (!categories.includes(value))
       categories.push(value);
@@ -8654,8 +8673,21 @@ function normalizeShareCategories(raw) {
 }
 function selectWorkspaceShareCategories(db, identities) {
   const candidates = uniqueSorted(identities.filter((identity) => identity.length > 0));
-  if (candidates.length === 0 || !tableExists(db, "workspace_members") || !tableExists(db, "workspaces") || !columnExists(db, "workspaces", "share_categories")) {
+  if (candidates.length === 0 || !tableExists(db, "workspace_members")) {
     return null;
+  }
+  const hasMembership = Boolean(db.prepare(`SELECT 1
+                   FROM workspace_members
+                  WHERE project_path IN (${placeholders(candidates)})
+                  LIMIT 1`).get(...candidates));
+  if (!hasMembership)
+    return null;
+  if (!tableExists(db, "workspaces")) {
+    log("[magic-context] WARN: workspace member has no workspaces table; sharing no foreign memory categories");
+    return [];
+  }
+  if (!columnExists(db, "workspaces", "share_categories")) {
+    return defaultWorkspaceShareCategories();
   }
   const row = db.prepare(`SELECT workspace.share_categories AS shareCategories
                FROM workspace_members AS member
@@ -8663,7 +8695,11 @@ function selectWorkspaceShareCategories(db, identities) {
               WHERE member.project_path IN (${placeholders(candidates)})
               ORDER BY workspace.id ASC
               LIMIT 1`).get(...candidates);
-  return normalizeShareCategories(row?.shareCategories ?? null);
+  if (!row) {
+    log("[magic-context] WARN: workspace member has no workspace share_categories row; sharing no foreign memory categories");
+    return [];
+  }
+  return normalizeShareCategories(row.shareCategories);
 }
 function resolveWorkspaceShareCategories(db, projectIdentity) {
   return selectWorkspaceShareCategories(db, [projectIdentity]);
@@ -8768,7 +8804,7 @@ function computeWorkspaceEpochFingerprint(db, identities) {
   const hash = createHash2("sha256");
   hash.update("share_categories", "utf8");
   hash.update("\x00");
-  hash.update(shareCategories === null ? "ALL" : JSON.stringify(shareCategories), "utf8");
+  hash.update(shareCategories === null ? "NO_WORKSPACE" : JSON.stringify(shareCategories), "utf8");
   hash.update(`
 `);
   for (const identity of canonical) {
@@ -143735,6 +143771,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,
       last_indexed_ordinal INTEGER NOT NULL DEFAULT 0,
+      dirty_floor_ordinal INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
@@ -143764,6 +143801,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_nudge_level TEXT DEFAULT '',
       channel2_nudge_state TEXT DEFAULT '',
       channel2_nudge_claimed_at INTEGER DEFAULT 0,
+      channel2_nudge_claim_token TEXT DEFAULT '',
       last_emergency_input_sample INTEGER DEFAULT 0,
       last_transform_error TEXT DEFAULT '',
       nudge_anchor_message_id TEXT DEFAULT '',
@@ -144010,6 +144048,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
   ensureColumn(db, "session_meta", "last_nudge_level", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "channel2_nudge_state", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "channel2_nudge_claimed_at", "INTEGER DEFAULT 0");
+  ensureColumn(db, "session_meta", "channel2_nudge_claim_token", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "last_emergency_input_sample", "INTEGER DEFAULT 0");
   ensureColumn(db, "session_meta", "last_transform_error", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "nudge_anchor_message_id", "TEXT DEFAULT ''");
@@ -144222,6 +144261,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         ON transform_decisions(session_id, harness);
     `);
   ensureColumn(db, "tags", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
+  ensureColumn(db, "message_history_index", "dirty_floor_ordinal", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "pending_ops", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
   ensureColumn(db, "source_contents", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
   ensureColumn(db, "compartments", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
@@ -144237,7 +144277,7 @@ var CHANNEL2_CLAIM_TTL_MS = 120000;
 function healWedgedChannel2Claims(db) {
   try {
     const staleBefore = Date.now() - CHANNEL2_CLAIM_TTL_MS;
-    db.prepare("UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0 WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)").run(staleBefore);
+    db.prepare("UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)").run(staleBefore);
   } catch {}
 }
 function openDatabase(dbPathOrOptions) {
@@ -145054,92 +145094,6 @@ function migrateLegacyExperimental(rawConfig, warnings) {
   return patched;
 }
 
-// ../plugin/src/config/project-security.ts
-var HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"];
-var AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"];
-var EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider"];
-function isPlainObject2(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function stripUnsafeProjectConfigFields(projectRaw) {
-  const warnings = [];
-  if ("auto_update" in projectRaw) {
-    delete projectRaw.auto_update;
-    warnings.push("Ignoring auto_update from project config (security: this setting only honors user-level config).");
-  }
-  if ("language" in projectRaw) {
-    delete projectRaw.language;
-    warnings.push("Ignoring language from project config (security: output language is a user-level setting).");
-  }
-  if ("sqlite" in projectRaw) {
-    delete projectRaw.sqlite;
-    warnings.push("Ignoring sqlite.* from project config (security: SQLite cache/mmap PRAGMAs apply to the " + "process-global shared database handle; only user-level config may set them).");
-  }
-  const embedding = projectRaw.embedding;
-  if (isPlainObject2(embedding)) {
-    const removed = [];
-    for (const field of EMBEDDING_DESTINATION_FIELDS) {
-      if (field in embedding) {
-        delete embedding[field];
-        removed.push(field);
-      }
-    }
-    if (removed.length > 0) {
-      warnings.push(`Ignoring embedding.${removed.join("/")} from project config ` + "(security: a repository cannot choose where private text is embedded).");
-    }
-  }
-  for (const agentKey of HIDDEN_AGENT_KEYS) {
-    const block = projectRaw[agentKey];
-    if (!isPlainObject2(block))
-      continue;
-    const removed = [];
-    for (const field of AGENT_ESCALATION_FIELDS) {
-      if (field in block) {
-        delete block[field];
-        removed.push(field);
-      }
-    }
-    if (removed.length > 0) {
-      warnings.push(`Ignoring ${agentKey}.${removed.join("/")} from project config ` + "(security: a repository cannot reprogram or re-permission hidden agents).");
-    }
-  }
-  return warnings;
-}
-function normalizeEndpoint(value) {
-  if (typeof value !== "string")
-    return;
-  const trimmed = value.trim().replace(/\/+$/, "");
-  return trimmed.length > 0 ? trimmed.toLowerCase() : undefined;
-}
-function dropInheritedEmbeddingKeyOnRedirect(projectRaw, mergedRaw, userRaw) {
-  const projectEmbedding = projectRaw.embedding;
-  if (!isPlainObject2(projectEmbedding))
-    return [];
-  const redirectsEndpoint = "endpoint" in projectEmbedding;
-  if (!redirectsEndpoint)
-    return [];
-  const userEmbedding = userRaw?.embedding;
-  if (isPlainObject2(userEmbedding)) {
-    const projectEndpoint = normalizeEndpoint(projectEmbedding.endpoint);
-    const userEndpoint = normalizeEndpoint(userEmbedding.endpoint);
-    if (projectEndpoint !== undefined && projectEndpoint === userEndpoint) {
-      return [];
-    }
-  }
-  const providesOwnKey = typeof projectEmbedding.api_key === "string" && projectEmbedding.api_key.length > 0;
-  if (providesOwnKey)
-    return [];
-  const mergedEmbedding = mergedRaw.embedding;
-  if (!isPlainObject2(mergedEmbedding))
-    return [];
-  if (!("api_key" in mergedEmbedding))
-    return [];
-  delete mergedEmbedding.api_key;
-  return [
-    "Dropped inherited user embedding api_key because project config redirected " + "embedding.endpoint without supplying its own key (security: prevents key " + "exfiltration to a repository-chosen endpoint)."
-  ];
-}
-
 // ../../node_modules/.bun/zod@4.4.3/node_modules/zod/v4/classic/external.js
 var exports_external = {};
 __export(exports_external, {
@@ -145771,7 +145725,7 @@ __export(exports_util, {
   jsonStringifyReplacer: () => jsonStringifyReplacer,
   joinValues: () => joinValues,
   issue: () => issue,
-  isPlainObject: () => isPlainObject3,
+  isPlainObject: () => isPlainObject2,
   isObject: () => isObject,
   hexToUint8Array: () => hexToUint8Array,
   getSizableOrigin: () => getSizableOrigin,
@@ -145953,7 +145907,7 @@ var allowsEval = /* @__PURE__ */ cached(() => {
     return false;
   }
 });
-function isPlainObject3(o) {
+function isPlainObject2(o) {
   if (isObject(o) === false)
     return false;
   const ctor = o.constructor;
@@ -145970,7 +145924,7 @@ function isPlainObject3(o) {
   return true;
 }
 function shallowClone(o) {
-  if (isPlainObject3(o))
+  if (isPlainObject2(o))
     return { ...o };
   if (Array.isArray(o))
     return [...o];
@@ -146174,7 +146128,7 @@ function omit(schema, mask) {
   return clone(schema, def);
 }
 function extend(schema, shape) {
-  if (!isPlainObject3(shape)) {
+  if (!isPlainObject2(shape)) {
     throw new Error("Invalid input to extend: expected a plain object");
   }
   const checks = schema._zod.def.checks;
@@ -146197,7 +146151,7 @@ function extend(schema, shape) {
   return clone(schema, def);
 }
 function safeExtend(schema, shape) {
-  if (!isPlainObject3(shape)) {
+  if (!isPlainObject2(shape)) {
     throw new Error("Invalid input to safeExtend: expected a plain object");
   }
   const def = mergeDefs(schema._zod.def, {
@@ -148540,7 +148494,7 @@ function mergeValues(a, b) {
   if (a instanceof Date && b instanceof Date && +a === +b) {
     return { valid: true, data: a };
   }
-  if (isPlainObject3(a) && isPlainObject3(b)) {
+  if (isPlainObject2(a) && isPlainObject2(b)) {
     const bKeys = Object.keys(b);
     const sharedKeys = Object.keys(a).filter((key) => bKeys.indexOf(key) !== -1);
     const newObj = { ...a, ...b };
@@ -148726,7 +148680,7 @@ var $ZodRecord = /* @__PURE__ */ $constructor("$ZodRecord", (inst, def) => {
   $ZodType.init(inst, def);
   inst._zod.parse = (payload, ctx) => {
     const input = payload.value;
-    if (!isPlainObject3(input)) {
+    if (!isPlainObject2(input)) {
       payload.issues.push({
         expected: "record",
         code: "invalid_type",
@@ -159937,6 +159891,295 @@ var MagicContextConfigSchema = exports_external.object({
   };
 });
 
+// ../plugin/src/config/project-security.ts
+var HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"];
+var HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"];
+var AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"];
+var EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider"];
+var PERCENTAGE_THRESHOLD_REASON = "security: a repository may only raise compaction thresholds above the user's effective value; it cannot force earlier historian work or cloned-repo cost escalation.";
+var TOKEN_THRESHOLD_REASON = "security: a repository may only raise execute_threshold_tokens above the user's trusted token threshold; it cannot force earlier historian work or cloned-repo cost escalation.";
+var TOKEN_THRESHOLD_INTRODUCTION_REASON = "security: a repository cannot introduce a new execute_threshold_tokens override when the user has no trusted token threshold for that key; that could force earlier historian work or cloned-repo cost escalation.";
+function isPlainObject3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isValidPercentageThreshold(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 20 && value <= 80;
+}
+function isValidTokenThreshold(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 5000 && value <= 2000000;
+}
+function normalizeTrustedPercentageThresholds(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return { defaultValue: value, overrides: new Map };
+  }
+  if (isPlainObject3(value) && typeof value.default === "number" && Number.isFinite(value.default)) {
+    const overrides = new Map;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "default")
+        continue;
+      if (typeof child === "number" && Number.isFinite(child)) {
+        overrides.set(key, child);
+      }
+    }
+    return { defaultValue: value.default, overrides };
+  }
+  return { defaultValue: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, overrides: new Map };
+}
+function normalizeTrustedTokenThresholds(value) {
+  if (!isPlainObject3(value)) {
+    return { defaultValue: undefined, overrides: new Map };
+  }
+  const overrides = new Map;
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "default")
+      continue;
+    if (typeof child === "number" && Number.isFinite(child)) {
+      overrides.set(key, child);
+    }
+  }
+  return {
+    defaultValue: typeof value.default === "number" && Number.isFinite(value.default) ? value.default : undefined,
+    overrides
+  };
+}
+function clonePercentageThresholds(value) {
+  return {
+    defaultValue: value.defaultValue,
+    overrides: new Map(value.overrides)
+  };
+}
+function cloneTokenThresholds(value) {
+  return {
+    defaultValue: value.defaultValue,
+    overrides: new Map(value.overrides)
+  };
+}
+function percentageThresholdsEqual(left, right) {
+  if (left.defaultValue !== right.defaultValue)
+    return false;
+  if (left.overrides.size !== right.overrides.size)
+    return false;
+  for (const [key, value] of left.overrides) {
+    if (right.overrides.get(key) !== value)
+      return false;
+  }
+  return true;
+}
+function setMergedPercentageThreshold(mergedRaw, value) {
+  if (value.overrides.size === 0) {
+    mergedRaw.execute_threshold_percentage = value.defaultValue;
+    return;
+  }
+  const serialized = { default: value.defaultValue };
+  for (const [key, threshold] of value.overrides) {
+    serialized[key] = threshold;
+  }
+  mergedRaw.execute_threshold_percentage = serialized;
+}
+function setMergedTokenThreshold(mergedRaw, value) {
+  if (value.defaultValue === undefined && value.overrides.size === 0) {
+    delete mergedRaw.execute_threshold_tokens;
+    return;
+  }
+  const serialized = {};
+  if (value.defaultValue !== undefined) {
+    serialized.default = value.defaultValue;
+  }
+  for (const [key, threshold] of value.overrides) {
+    serialized[key] = threshold;
+  }
+  mergedRaw.execute_threshold_tokens = serialized;
+}
+function makeProjectThresholdWarning(field, reason) {
+  return `Ignoring ${field} from project config (${reason})`;
+}
+function stripUnsafeProjectConfigFields(projectRaw) {
+  const warnings = [];
+  if ("auto_update" in projectRaw) {
+    delete projectRaw.auto_update;
+    warnings.push("Ignoring auto_update from project config (security: this setting only honors user-level config).");
+  }
+  if ("language" in projectRaw) {
+    delete projectRaw.language;
+    warnings.push("Ignoring language from project config (security: output language is a user-level setting).");
+  }
+  if ("sqlite" in projectRaw) {
+    delete projectRaw.sqlite;
+    warnings.push("Ignoring sqlite.* from project config (security: SQLite cache/mmap PRAGMAs apply to the " + "process-global shared database handle; only user-level config may set them).");
+  }
+  const embedding = projectRaw.embedding;
+  if (isPlainObject3(embedding)) {
+    const removed = [];
+    for (const field of EMBEDDING_DESTINATION_FIELDS) {
+      if (field in embedding) {
+        delete embedding[field];
+        removed.push(field);
+      }
+    }
+    if (removed.length > 0) {
+      warnings.push(`Ignoring embedding.${removed.join("/")} from project config ` + "(security: a repository cannot choose where private text is embedded).");
+    }
+  }
+  const historian = projectRaw.historian;
+  if (isPlainObject3(historian)) {
+    const removed = [];
+    for (const field of HISTORIAN_USER_ONLY_FIELDS) {
+      if (field in historian) {
+        delete historian[field];
+        removed.push(field);
+      }
+    }
+    if (removed.length > 0) {
+      warnings.push(`Ignoring historian.${removed.join("/")} from project config ` + "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).");
+    }
+  }
+  for (const agentKey of HIDDEN_AGENT_KEYS) {
+    const block = projectRaw[agentKey];
+    if (!isPlainObject3(block))
+      continue;
+    const removed = [];
+    for (const field of AGENT_ESCALATION_FIELDS) {
+      if (field in block) {
+        delete block[field];
+        removed.push(field);
+      }
+    }
+    if (removed.length > 0) {
+      warnings.push(`Ignoring ${agentKey}.${removed.join("/")} from project config ` + "(security: a repository cannot reprogram or re-permission hidden agents).");
+    }
+  }
+  return warnings;
+}
+function constrainProjectThresholdOverrides(args) {
+  const warnings = [];
+  const basePercentage = normalizeTrustedPercentageThresholds(args.trustedBaseConfig.execute_threshold_percentage);
+  const baseTokens = normalizeTrustedTokenThresholds(args.trustedBaseConfig.execute_threshold_tokens);
+  if ("execute_threshold_percentage" in args.projectRaw) {
+    const projectValue = args.projectRaw.execute_threshold_percentage;
+    if (isValidPercentageThreshold(projectValue)) {
+      const constrained = clonePercentageThresholds(basePercentage);
+      constrained.defaultValue = Math.max(basePercentage.defaultValue, projectValue);
+      for (const [modelKey, threshold] of basePercentage.overrides) {
+        const raisedThreshold = Math.max(threshold, projectValue);
+        if (raisedThreshold === constrained.defaultValue) {
+          constrained.overrides.delete(modelKey);
+        } else {
+          constrained.overrides.set(modelKey, raisedThreshold);
+        }
+      }
+      setMergedPercentageThreshold(args.mergedRaw, constrained);
+      if (percentageThresholdsEqual(constrained, basePercentage)) {
+        warnings.push(makeProjectThresholdWarning("execute_threshold_percentage", PERCENTAGE_THRESHOLD_REASON));
+      }
+    } else if (isPlainObject3(projectValue)) {
+      const constrained = clonePercentageThresholds(basePercentage);
+      let touchedValidEntry = false;
+      if (isValidPercentageThreshold(projectValue.default)) {
+        touchedValidEntry = true;
+        if (projectValue.default > basePercentage.defaultValue) {
+          constrained.defaultValue = projectValue.default;
+        } else {
+          warnings.push(makeProjectThresholdWarning("execute_threshold_percentage.default", PERCENTAGE_THRESHOLD_REASON));
+        }
+      }
+      for (const [modelKey, rawValue] of Object.entries(projectValue)) {
+        if (modelKey === "default")
+          continue;
+        if (!isValidPercentageThreshold(rawValue))
+          continue;
+        touchedValidEntry = true;
+        const baseValue = basePercentage.overrides.get(modelKey) ?? basePercentage.defaultValue;
+        if (rawValue > baseValue) {
+          if (rawValue === constrained.defaultValue) {
+            constrained.overrides.delete(modelKey);
+          } else {
+            constrained.overrides.set(modelKey, rawValue);
+          }
+        } else {
+          warnings.push(makeProjectThresholdWarning(`execute_threshold_percentage.${modelKey}`, PERCENTAGE_THRESHOLD_REASON));
+        }
+      }
+      if (touchedValidEntry) {
+        setMergedPercentageThreshold(args.mergedRaw, constrained);
+      }
+    }
+  }
+  if ("execute_threshold_tokens" in args.projectRaw && isPlainObject3(args.projectRaw.execute_threshold_tokens)) {
+    const projectValue = args.projectRaw.execute_threshold_tokens;
+    const constrained = cloneTokenThresholds(baseTokens);
+    let touchedValidEntry = false;
+    if (isValidTokenThreshold(projectValue.default)) {
+      touchedValidEntry = true;
+      if (baseTokens.defaultValue === undefined) {
+        warnings.push(makeProjectThresholdWarning("execute_threshold_tokens.default", TOKEN_THRESHOLD_INTRODUCTION_REASON));
+      } else if (projectValue.default > baseTokens.defaultValue) {
+        constrained.defaultValue = projectValue.default;
+      } else {
+        warnings.push(makeProjectThresholdWarning("execute_threshold_tokens.default", TOKEN_THRESHOLD_REASON));
+      }
+    }
+    for (const [modelKey, rawValue] of Object.entries(projectValue)) {
+      if (modelKey === "default")
+        continue;
+      if (!isValidTokenThreshold(rawValue))
+        continue;
+      touchedValidEntry = true;
+      const baseValue = baseTokens.overrides.get(modelKey) ?? baseTokens.defaultValue;
+      if (baseValue === undefined) {
+        warnings.push(makeProjectThresholdWarning(`execute_threshold_tokens.${modelKey}`, TOKEN_THRESHOLD_INTRODUCTION_REASON));
+        continue;
+      }
+      if (rawValue > baseValue) {
+        if (rawValue === constrained.defaultValue) {
+          constrained.overrides.delete(modelKey);
+        } else {
+          constrained.overrides.set(modelKey, rawValue);
+        }
+      } else {
+        warnings.push(makeProjectThresholdWarning(`execute_threshold_tokens.${modelKey}`, TOKEN_THRESHOLD_REASON));
+      }
+    }
+    if (touchedValidEntry) {
+      setMergedTokenThreshold(args.mergedRaw, constrained);
+    }
+  }
+  return warnings;
+}
+function normalizeEndpoint(value) {
+  if (typeof value !== "string")
+    return;
+  const trimmed = value.trim().replace(/\/+$/, "");
+  return trimmed.length > 0 ? trimmed.toLowerCase() : undefined;
+}
+function dropInheritedEmbeddingKeyOnRedirect(projectRaw, mergedRaw, userRaw) {
+  const projectEmbedding = projectRaw.embedding;
+  if (!isPlainObject3(projectEmbedding))
+    return [];
+  const redirectsEndpoint = "endpoint" in projectEmbedding;
+  if (!redirectsEndpoint)
+    return [];
+  const userEmbedding = userRaw?.embedding;
+  if (isPlainObject3(userEmbedding)) {
+    const projectEndpoint = normalizeEndpoint(projectEmbedding.endpoint);
+    const userEndpoint = normalizeEndpoint(userEmbedding.endpoint);
+    if (projectEndpoint !== undefined && projectEndpoint === userEndpoint) {
+      return [];
+    }
+  }
+  const providesOwnKey = typeof projectEmbedding.api_key === "string" && projectEmbedding.api_key.length > 0;
+  if (providesOwnKey)
+    return [];
+  const mergedEmbedding = mergedRaw.embedding;
+  if (!isPlainObject3(mergedEmbedding))
+    return [];
+  if (!("api_key" in mergedEmbedding))
+    return [];
+  delete mergedEmbedding.api_key;
+  return [
+    "Dropped inherited user embedding api_key because project config redirected " + "embedding.endpoint without supplying its own key (security: prevents key " + "exfiltration to a repository-chosen endpoint)."
+  ];
+}
+
 // ../plugin/src/config/variable.ts
 import { existsSync as existsSync6, readFileSync as readFileSync3 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
@@ -160269,6 +160512,7 @@ function loadPiConfig(opts = {}) {
     return a.scope === "user" ? -1 : 1;
   });
   const userRaw = mergeFiles.find((f) => f.scope === "user")?.config;
+  const trustedBaseConfig = parsePiConfig(userRaw ?? {}).config;
   for (const loaded of mergeFiles) {
     const prefix = loaded.scope === "user" ? "[user config]" : "[project config]";
     warnings.push(...loaded.warnings.map((warning) => `${prefix} ${warning}`));
@@ -160279,6 +160523,13 @@ function loadPiConfig(opts = {}) {
       }
       rawConfig = mergeRawConfigs(rawConfig, projectRaw);
       for (const warning of dropInheritedEmbeddingKeyOnRedirect(projectRaw, rawConfig, userRaw)) {
+        warnings.push(`${prefix} ${warning}`);
+      }
+      for (const warning of constrainProjectThresholdOverrides({
+        mergedRaw: rawConfig,
+        projectRaw,
+        trustedBaseConfig
+      })) {
         warnings.push(`${prefix} ${warning}`);
       }
     } else {
@@ -160379,6 +160630,7 @@ function loadPiConfigDetailed(opts = {}) {
     return a.scope === "user" ? -1 : 1;
   });
   const userRaw = mergeFiles.find((f) => f.scope === "user")?.config;
+  const trustedBaseConfig = parsePiConfig(userRaw ?? {}).config;
   for (const loaded of mergeFiles) {
     const prefix = loaded.scope === "user" ? "[user config]" : "[project config]";
     warnings.push(...loaded.warnings.map((warning) => `${prefix} ${warning}`));
@@ -160389,6 +160641,13 @@ function loadPiConfigDetailed(opts = {}) {
       }
       rawConfig = mergeRawConfigs(rawConfig, projectRaw);
       for (const warning of dropInheritedEmbeddingKeyOnRedirect(projectRaw, rawConfig, userRaw)) {
+        warnings.push(`${prefix} ${warning}`);
+      }
+      for (const warning of constrainProjectThresholdOverrides({
+        mergedRaw: rawConfig,
+        projectRaw,
+        trustedBaseConfig
+      })) {
         warnings.push(`${prefix} ${warning}`);
       }
     } else {
@@ -161775,6 +162034,7 @@ class OpenAICompatibleEmbeddingProvider {
 
 // ../plugin/src/features/magic-context/memory/storage-memory-embeddings.ts
 var saveEmbeddingStatements = new WeakMap;
+var saveEmbeddingIfHashMatchesStatements = new WeakMap;
 var loadAllEmbeddingsStatements = new WeakMap;
 var deleteEmbeddingStatements = new WeakMap;
 var getStoredModelIdStatements = new WeakMap;
@@ -161805,6 +162065,14 @@ function getSaveEmbeddingStatement(db) {
   }
   return stmt;
 }
+function getSaveEmbeddingIfHashMatchesStatement(db) {
+  let stmt = saveEmbeddingIfHashMatchesStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO memory_embeddings (memory_id, embedding, model_id) SELECT ?, ?, ? FROM memories WHERE id = ? AND normalized_hash = ? ON CONFLICT(memory_id, model_id) DO UPDATE SET embedding = excluded.embedding");
+    saveEmbeddingIfHashMatchesStatements.set(db, stmt);
+  }
+  return stmt;
+}
 function getLoadAllEmbeddingsStatement(db) {
   let stmt = loadAllEmbeddingsStatements.get(db);
   if (!stmt) {
@@ -161832,6 +162100,10 @@ function getClearModelEmbeddingsStatement(db) {
 function saveEmbedding(db, memoryId, embedding, modelId) {
   const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
   getSaveEmbeddingStatement(db).run(memoryId, blob, modelId);
+}
+function saveEmbeddingIfHashMatches(db, memoryId, embedding, modelId, normalizedHash) {
+  const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+  return getSaveEmbeddingIfHashMatchesStatement(db).run(memoryId, blob, modelId, memoryId, normalizedHash).changes > 0;
 }
 function loadAllEmbeddings(db, projectPath, modelId) {
   const rows = getLoadAllEmbeddingsStatement(db).all(projectPath, modelId).filter(isEmbeddingRow);
@@ -162764,12 +163036,12 @@ function isUnembeddedMemoryRow(row) {
   if (row === null || typeof row !== "object")
     return false;
   const candidate = row;
-  return typeof candidate.id === "number" && typeof candidate.content === "string";
+  return typeof candidate.id === "number" && typeof candidate.content === "string" && typeof candidate.normalized_hash === "string";
 }
 function getLoadUnembeddedMemoriesStatement(db) {
   let stmt = loadUnembeddedMemoriesStatements.get(db);
   if (!stmt) {
-    stmt = db.prepare("SELECT m.id AS id, m.content AS content FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL LIMIT ?");
+    stmt = db.prepare("SELECT m.id AS id, m.content AS content, m.normalized_hash AS normalized_hash FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL LIMIT ?");
     loadUnembeddedMemoriesStatements.set(db, stmt);
   }
   return stmt;
@@ -162792,8 +163064,9 @@ async function embedUnembeddedMemoriesForProject(db, projectIdentity, batchSize 
         const embedding = result.vectors[index];
         if (!embedding)
           continue;
-        saveEmbedding(db, memory.id, embedding, result.modelId);
-        embeddedCount += 1;
+        if (saveEmbeddingIfHashMatches(db, memory.id, embedding, result.modelId, memory.normalized_hash)) {
+          embeddedCount += 1;
+        }
       }
     })();
     return embeddedCount;
@@ -164299,12 +164572,19 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
   let totalTokens = 0;
   let messagesProcessed = 0;
   let lastOrdinal = startOrdinal - 1;
+  let highestScannedOrdinal = startOrdinal - 1;
   let lastMessageId = "";
   let firstMessageId = "";
   let currentBlock = null;
   let pendingNoiseMeta = [];
   let commitClusters = 0;
   let lastFlushedRole = "";
+  function recordFilteredNoise(meta3) {
+    pendingNoiseMeta.push(meta3);
+    if (!currentBlock) {
+      highestScannedOrdinal = Math.max(highestScannedOrdinal, meta3.ordinal);
+    }
+  }
   function flushCurrentBlock() {
     if (!currentBlock)
       return true;
@@ -164320,6 +164600,7 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     if (!firstMessageId)
       firstMessageId = currentBlock.meta[0]?.messageId ?? "";
     lastOrdinal = currentBlock.meta[currentBlock.meta.length - 1]?.ordinal ?? currentBlock.endOrdinal;
+    highestScannedOrdinal = Math.max(highestScannedOrdinal, lastOrdinal);
     lastMessageId = currentBlock.meta[currentBlock.meta.length - 1]?.messageId ?? "";
     messagesProcessed += currentBlock.meta.length;
     lines.push(blockText);
@@ -164343,7 +164624,7 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     if (msg.role === "user" && !hasMeaningfulUserText(msg.parts)) {
       const tcSummaries = extractToolCallSummaries(msg.parts);
       if (tcSummaries.length === 0) {
-        pendingNoiseMeta.push(meta3);
+        recordFilteredNoise(meta3);
         continue;
       }
       const tcText = tcSummaries.join(" / ");
@@ -164375,7 +164656,7 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     const compacted = compactTextForSummary(allParts.join(" / "), msg.role);
     const text = compacted.text;
     if (!text) {
-      pendingNoiseMeta.push(meta3);
+      recordFilteredNoise(meta3);
       continue;
     }
     const msgHasNarrative = textParts.length > 0;
@@ -164402,7 +164683,9 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     };
     pendingNoiseMeta = [];
   }
-  flushCurrentBlock();
+  if (flushCurrentBlock() && pendingNoiseMeta.length > 0) {
+    highestScannedOrdinal = Math.max(highestScannedOrdinal, pendingNoiseMeta[pendingNoiseMeta.length - 1]?.ordinal ?? highestScannedOrdinal);
+  }
   const toolOnlyRanges = [];
   for (const range of flushedToolOnlyBlocks) {
     const last = toolOnlyRanges[toolOnlyRanges.length - 1];
@@ -164419,7 +164702,7 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     endMessageId: lastMessageId,
     messageCount: messagesProcessed,
     tokenEstimate: totalTokens,
-    hasMore: lastOrdinal < (eligibleEndOrdinal !== undefined ? Math.min(eligibleEndOrdinal - 1, totalMessageCount) : totalMessageCount),
+    hasMore: Math.max(lastOrdinal, highestScannedOrdinal) < (eligibleEndOrdinal !== undefined ? Math.min(eligibleEndOrdinal - 1, totalMessageCount) : totalMessageCount),
     text: lines.join(`
 `),
     lines: lineMeta,
@@ -168870,6 +169153,8 @@ function isMidTurnPi(event, _sessionId) {
   }
   if (latestAssistant === null)
     return false;
+  if (hasRealUserAfter(messages, latestAssistantIndex))
+    return false;
   if (latestAssistant.stopReason === "toolUse")
     return true;
   const toolCallIds = getToolCallIds(latestAssistant.content);
@@ -168888,6 +169173,15 @@ function isMidTurnPi(event, _sessionId) {
   }
   for (const id of toolCallIds) {
     if (!pairedToolResultIds.has(id))
+      return true;
+  }
+  return false;
+}
+function hasRealUserAfter(messages, latestAssistantIndex) {
+  for (const msg of messages.slice(latestAssistantIndex + 1)) {
+    if (msg === null || typeof msg !== "object")
+      continue;
+    if (msg.role === "user")
       return true;
   }
   return false;
@@ -169616,25 +169910,33 @@ function getMemoryCountsByStatusStatement(db) {
   }
   return stmt;
 }
-function insertMemory(db, input) {
-  const now = Date.now();
-  const normalizedHash = computeNormalizedHash(input.content);
+function buildInsertMemoryValues(input, normalizedHash, now, includeImportance) {
   const insertValues = [
     input.projectPath,
     input.category,
     input.content,
     normalizedHash
   ];
-  if (hasMemoryImportanceColumn(db)) {
+  if (includeImportance) {
     insertValues.push(input.importance ?? 50);
   }
   insertValues.push(input.sourceSessionId ?? null, input.sourceType ?? "historian", 1, 0, now, now, now, now, null, "active", input.expiresAt ?? null, "unverified", null, null, null, input.metadataJson ?? null);
-  const result = getInsertMemoryStatement(db).run(...insertValues);
-  const insertedResult = result;
-  const inserted = getMemoryById(db, Number(insertedResult.lastInsertRowid));
+  return insertValues;
+}
+function loadInsertedMemory(db, rowid) {
+  const inserted = getMemoryById(db, Number(rowid));
   if (!inserted) {
     throw new Error("Failed to load inserted memory row");
   }
+  return inserted;
+}
+function insertMemory(db, input) {
+  const now = Date.now();
+  const normalizedHash = computeNormalizedHash(input.content);
+  const insertValues = buildInsertMemoryValues(input, normalizedHash, now, hasMemoryImportanceColumn(db));
+  const result = getInsertMemoryStatement(db).run(...insertValues);
+  const insertedResult = result;
+  const inserted = loadInsertedMemory(db, insertedResult.lastInsertRowid);
   invalidateProject(input.projectPath);
   return inserted;
 }
@@ -170303,7 +170605,10 @@ async function normalizeVerificationFiles(args) {
 var lastIndexedStatements = new WeakMap;
 var insertMessageStatements = new WeakMap;
 var upsertIndexStatements = new WeakMap;
+var upsertCleanIndexStatements = new WeakMap;
+var upsertDirtyFloorStatements = new WeakMap;
 var deleteFtsStatements = new WeakMap;
+var deleteFtsFromOrdinalStatements = new WeakMap;
 var deleteIndexStatements = new WeakMap;
 var countIndexedMessageStatements = new WeakMap;
 function normalizeIndexText(text) {
@@ -170312,7 +170617,7 @@ function normalizeIndexText(text) {
 function getLastIndexedStatement(db) {
   let stmt = lastIndexedStatements.get(db);
   if (!stmt) {
-    stmt = db.prepare("SELECT last_indexed_ordinal FROM message_history_index WHERE session_id = ?");
+    stmt = db.prepare("SELECT last_indexed_ordinal, dirty_floor_ordinal FROM message_history_index WHERE session_id = ?");
     lastIndexedStatements.set(db, stmt);
   }
   return stmt;
@@ -170333,11 +170638,35 @@ function getUpsertIndexStatement(db) {
   }
   return stmt;
 }
+function getUpsertCleanIndexStatement(db) {
+  let stmt = upsertCleanIndexStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO message_history_index (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness) VALUES (?, ?, 0, ?, ?) ON CONFLICT(session_id) DO UPDATE SET last_indexed_ordinal = excluded.last_indexed_ordinal, dirty_floor_ordinal = 0, updated_at = excluded.updated_at");
+    upsertCleanIndexStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpsertDirtyFloorStatement(db) {
+  let stmt = upsertDirtyFloorStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO message_history_index (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET last_indexed_ordinal = MAX(message_history_index.last_indexed_ordinal, excluded.last_indexed_ordinal), dirty_floor_ordinal = CASE WHEN message_history_index.dirty_floor_ordinal <= 0 THEN excluded.dirty_floor_ordinal WHEN excluded.dirty_floor_ordinal <= 0 THEN message_history_index.dirty_floor_ordinal ELSE MIN(message_history_index.dirty_floor_ordinal, excluded.dirty_floor_ordinal) END, updated_at = excluded.updated_at");
+    upsertDirtyFloorStatements.set(db, stmt);
+  }
+  return stmt;
+}
 function getDeleteFtsStatement(db) {
   let stmt = deleteFtsStatements.get(db);
   if (!stmt) {
     stmt = db.prepare("DELETE FROM message_history_fts WHERE session_id = ?");
     deleteFtsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getDeleteFtsFromOrdinalStatement(db) {
+  let stmt = deleteFtsFromOrdinalStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) >= ?");
+    deleteFtsFromOrdinalStatements.set(db, stmt);
   }
   return stmt;
 }
@@ -170360,6 +170689,14 @@ function getCountIndexedMessageStatement(db) {
 function getLastIndexedOrdinal(db, sessionId) {
   const row = getLastIndexedStatement(db).get(sessionId);
   return typeof row?.last_indexed_ordinal === "number" ? row.last_indexed_ordinal : 0;
+}
+function getDirtyIndexFloor(db, sessionId) {
+  const row = getLastIndexedStatement(db).get(sessionId);
+  return typeof row?.dirty_floor_ordinal === "number" && row.dirty_floor_ordinal > 0 ? row.dirty_floor_ordinal : null;
+}
+function markMessageIndexDirty(db, sessionId, floorOrdinal) {
+  const dirtyFloor = Math.max(1, Math.floor(floorOrdinal));
+  getUpsertDirtyFloorStatement(db).run(sessionId, getLastIndexedOrdinal(db, sessionId), dirtyFloor, Date.now(), getHarness());
 }
 function isMessageAlreadyIndexed(db, sessionId, messageId) {
   const row = getCountIndexedMessageStatement(db).get(sessionId, messageId);
@@ -170428,7 +170765,15 @@ function indexMessagesAfterOrdinal(db, sessionId, messages, lastIndexedOrdinal, 
   db.exec("BEGIN IMMEDIATE");
   let committed = false;
   try {
-    const effectiveWatermark = Math.max(lastIndexedOrdinal, getLastIndexedOrdinal(db, sessionId));
+    let effectiveWatermark = Math.max(lastIndexedOrdinal, getLastIndexedOrdinal(db, sessionId));
+    const dirtyFloor = getDirtyIndexFloor(db, sessionId);
+    if (dirtyFloor !== null) {
+      const rewindOrdinal = Math.max(1, Math.min(dirtyFloor, finalWatermark + 1));
+      if (rewindOrdinal <= finalWatermark) {
+        getDeleteFtsFromOrdinalStatement(db).run(sessionId, rewindOrdinal);
+      }
+      effectiveWatermark = Math.min(effectiveWatermark, rewindOrdinal - 1);
+    }
     const insertMessage = getInsertMessageStatement(db);
     for (const message of messages) {
       if (message.ordinal <= effectiveWatermark) {
@@ -170445,7 +170790,7 @@ function indexMessagesAfterOrdinal(db, sessionId, messages, lastIndexedOrdinal, 
       inserted++;
     }
     const newWatermark = Math.max(effectiveWatermark, finalWatermark);
-    getUpsertIndexStatement(db).run(sessionId, newWatermark, now, getHarness());
+    getUpsertCleanIndexStatement(db).run(sessionId, newWatermark, now, getHarness());
     db.exec("COMMIT");
     committed = true;
   } finally {
@@ -171216,7 +171561,7 @@ function setChannel2NudgeState(db, sessionId, state) {
   db.transaction(() => {
     ensureSessionMetaRow(db, sessionId);
     const claimedAt = state === "claimed" ? Date.now() : 0;
-    db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ? WHERE session_id = ?").run(state, claimedAt, sessionId);
+    db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ?").run(state, claimedAt, sessionId);
   })();
 }
 function casChannel2NudgeState(db, sessionId, from, to) {
@@ -171224,7 +171569,7 @@ function casChannel2NudgeState(db, sessionId, from, to) {
   db.transaction(() => {
     ensureSessionMetaRow(db, sessionId);
     const claimedAt = to === "claimed" ? Date.now() : 0;
-    const result = db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ? WHERE session_id = ? AND channel2_nudge_state = ?").run(to, claimedAt, sessionId, from);
+    const result = db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ? AND channel2_nudge_state = ?").run(to, claimedAt, sessionId, from);
     changed = (result.changes ?? 0) > 0;
   })();
   return changed;
@@ -173068,8 +173413,9 @@ function createCtxMemoryTool(deps) {
         const isOwn = targetIdentityForStoredPath(memory2.projectPath) === projectIdentity;
         if (isOwn)
           return true;
-        return toolShareCategories === null || toolShareCategories.includes(memory2.category);
+        return toolShareCategories?.includes(memory2.category) ?? false;
       };
+      const memoryOwnedByTool = (memory2) => workspaceIdentitySet.identities.length > 1 ? targetIdentityForStoredPath(memory2.projectPath) === projectIdentity : storedPathBelongsToIdentity(memory2.projectPath, projectIdentity);
       const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
       if (snapshot ? !snapshot.features.memoryEnabled : deps.memoryEnabled === false) {
         return err2("Cross-session memory is disabled for this project.");
@@ -173116,7 +173462,8 @@ function createCtxMemoryTool(deps) {
           return err2("Error: 'content' is required when action is 'update'.");
         }
         const memory2 = getMemoryById(deps.db, updateId);
-        if (!memory2 || !memoryVisibleToTool(memory2)) {
+        const updateAllowed = memory2 ? dreamerAllowed ? memoryVisibleToTool(memory2) : memoryOwnedByTool(memory2) : false;
+        if (!memory2 || !updateAllowed) {
           return err2(`Error: Memory with ID ${updateId} was not found.`);
         }
         if (!dreamerAllowed && !isPrimaryMutableMemory(memory2)) {
@@ -173163,7 +173510,7 @@ function createCtxMemoryTool(deps) {
           return err2("Error: One or more source memories were not found.");
         }
         if (!dreamerAllowed) {
-          const foreign = sourceMemories.find((memory2) => !memoryVisibleToTool(memory2));
+          const foreign = sourceMemories.find((memory2) => !memoryOwnedByTool(memory2));
           if (foreign) {
             return err2(`Error: Memory with ID ${foreign.id} was not found.`);
           }
@@ -173265,7 +173612,8 @@ function createCtxMemoryTool(deps) {
         const archiveIds = [...new Set(rawArchiveIds)];
         for (const memoryId of archiveIds) {
           const memory2 = getMemoryById(deps.db, memoryId);
-          if (!memory2 || !memoryVisibleToTool(memory2)) {
+          const archiveAllowed = memory2 ? dreamerAllowed ? memoryVisibleToTool(memory2) : memoryOwnedByTool(memory2) : false;
+          if (!memory2 || !archiveAllowed) {
             return err2(`Error: Memory with ID ${memoryId} was not found.`);
           }
           if (!dreamerAllowed && !isPrimaryMutableMemory(memory2)) {
@@ -174218,24 +174566,46 @@ function getMessageSearchStatementWithCutoff(db) {
   return stmt;
 }
 var ftsRowCountStatements = new WeakMap;
+var ftsRowCountStatementsWithCutoff = new WeakMap;
 var ftsMatchCountStatements = new WeakMap;
-function getSessionFtsRowCount(db, sessionId) {
-  let stmt = ftsRowCountStatements.get(db);
-  if (!stmt) {
-    stmt = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ?");
-    ftsRowCountStatements.set(db, stmt);
-  }
-  const row = stmt.get(sessionId);
+var ftsMatchCountStatementsWithCutoff = new WeakMap;
+function getSessionFtsRowCount(db, sessionId, cutoff) {
+  const stmt = cutoff === null ? (() => {
+    let cached2 = ftsRowCountStatements.get(db);
+    if (!cached2) {
+      cached2 = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ?");
+      ftsRowCountStatements.set(db, cached2);
+    }
+    return cached2;
+  })() : (() => {
+    let cached2 = ftsRowCountStatementsWithCutoff.get(db);
+    if (!cached2) {
+      cached2 = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) <= ?");
+      ftsRowCountStatementsWithCutoff.set(db, cached2);
+    }
+    return cached2;
+  })();
+  const row = cutoff === null ? stmt.get(sessionId) : stmt.get(sessionId, cutoff);
   return typeof row?.n === "number" ? row.n : 0;
 }
-function countSessionFtsMatches(db, sessionId, ftsQuery) {
-  let stmt = ftsMatchCountStatements.get(db);
-  if (!stmt) {
-    stmt = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?");
-    ftsMatchCountStatements.set(db, stmt);
-  }
+function countSessionFtsMatches(db, sessionId, ftsQuery, cutoff) {
+  const stmt = cutoff === null ? (() => {
+    let cached2 = ftsMatchCountStatements.get(db);
+    if (!cached2) {
+      cached2 = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?");
+      ftsMatchCountStatements.set(db, cached2);
+    }
+    return cached2;
+  })() : (() => {
+    let cached2 = ftsMatchCountStatementsWithCutoff.get(db);
+    if (!cached2) {
+      cached2 = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? AND CAST(message_ordinal AS INTEGER) <= ?");
+      ftsMatchCountStatementsWithCutoff.set(db, cached2);
+    }
+    return cached2;
+  })();
   try {
-    const row = stmt.get(sessionId, ftsQuery);
+    const row = cutoff === null ? stmt.get(sessionId, ftsQuery) : stmt.get(sessionId, ftsQuery, cutoff);
     return typeof row?.n === "number" ? row.n : 0;
   } catch {
     return 0;
@@ -174485,7 +174855,7 @@ function searchMessages(args) {
       role: row.role
     }));
   }
-  const corpusSize = getSessionFtsRowCount(args.db, args.sessionId);
+  const corpusSize = getSessionFtsRowCount(args.db, args.sessionId, cutoff);
   const queryLists = [];
   if (baseQuery.length > 0) {
     queryLists.push({
@@ -174498,7 +174868,7 @@ function searchMessages(args) {
     const probeQuery = sanitizeFtsQuery(probe);
     if (probeQuery.length === 0)
       continue;
-    const df = countSessionFtsMatches(args.db, args.sessionId, probeQuery);
+    const df = countSessionFtsMatches(args.db, args.sessionId, probeQuery, cutoff);
     const weight = probeDiscriminationWeight(df, corpusSize);
     probeWeights.set(probe, weight);
     queryLists.push({
@@ -175673,17 +176043,119 @@ function createCtxSearchTool(deps) {
 import {
   truncateToWidth
 } from "@oh-my-pi/pi-tui";
+
+// ../plugin/src/hooks/magic-context/todo-view.ts
+import { createHash as createHash8 } from "node:crypto";
+var TODO_STATUS_PENDING = "pending";
+var TODO_STATUS_IN_PROGRESS = "in_progress";
+var TODO_STATUS_COMPLETED = "completed";
+var TODO_STATUS_CANCELLED = "cancelled";
+var TODO_PRIORITY_HIGH = "high";
+var TODO_PRIORITY_MEDIUM = "medium";
+var TODO_PRIORITY_LOW = "low";
+var TODO_STATUSES = [
+  TODO_STATUS_PENDING,
+  TODO_STATUS_IN_PROGRESS,
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+];
+var TODO_PRIORITIES = [
+  TODO_PRIORITY_HIGH,
+  TODO_PRIORITY_MEDIUM,
+  TODO_PRIORITY_LOW
+];
+var TODO_STATUS_SET = new Set(TODO_STATUSES);
+var TODO_PRIORITY_SET = new Set(TODO_PRIORITIES);
+var TERMINAL_STATUSES = new Set([
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+]);
+var TITLE_DONE_STATUSES = new Set([TODO_STATUS_COMPLETED]);
+var SYNTHETIC_CALL_ID_PREFIX = "mc_synthetic_todo_";
+function normalizeTodoStateJson(todos) {
+  if (!Array.isArray(todos))
+    return null;
+  const normalized = [];
+  for (const todo of todos) {
+    if (!isTodoItem(todo))
+      return null;
+    normalized.push({
+      content: todo.content,
+      status: todo.status,
+      priority: todo.priority ?? TODO_PRIORITY_MEDIUM
+    });
+  }
+  return JSON.stringify(normalized);
+}
+function buildSyntheticTodoPart(stateJson) {
+  const todos = parseTodoState(stateJson);
+  if (todos === null || todos.length === 0)
+    return null;
+  if (todos.every((t) => TERMINAL_STATUSES.has(t.status)))
+    return null;
+  const callID = computeSyntheticCallId(stateJson);
+  const activeCount = todos.filter((t) => !TITLE_DONE_STATUSES.has(t.status)).length;
+  const output = JSON.stringify(todos, null, 2);
+  const ts = 0;
+  return {
+    type: "tool",
+    callID,
+    tool: "todowrite",
+    state: {
+      status: "completed",
+      input: { todos },
+      output,
+      title: `${activeCount} todos`,
+      metadata: { todos, truncated: false },
+      time: { start: ts, end: ts }
+    },
+    syntheticTodoMarker: true
+  };
+}
+function computeSyntheticCallId(stateJson) {
+  const hash2 = createHash8("sha256").update(stateJson).digest("hex").slice(0, 16);
+  return `${SYNTHETIC_CALL_ID_PREFIX}${hash2}`;
+}
+function parseTodoState(stateJson) {
+  if (stateJson.length === 0)
+    return null;
+  try {
+    const parsed = JSON.parse(stateJson);
+    if (!Array.isArray(parsed))
+      return null;
+    const result = [];
+    for (const item of parsed) {
+      if (!isTodoItem(item))
+        return null;
+      result.push({
+        content: item.content,
+        status: item.status,
+        priority: item.priority ?? TODO_PRIORITY_MEDIUM
+      });
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+function isTodoStatus(value) {
+  return typeof value === "string" && TODO_STATUS_SET.has(value);
+}
+function isTodoPriority(value) {
+  return typeof value === "string" && TODO_PRIORITY_SET.has(value);
+}
+function isTodoItem(value) {
+  if (value === null || typeof value !== "object")
+    return false;
+  const todo = value;
+  return typeof todo.content === "string" && isTodoStatus(todo.status) && (todo.priority === undefined || isTodoPriority(todo.priority));
+}
+
+// src/tools/todo-view-pi.ts
 var TODO_TOOL_NAME = "todowrite";
 var TODOS_COMMAND_NAME = "todos";
 var WIDGET_KEY = "magic-context-todos";
-var MAX_OVERLAY_CONTENT_ROWS = 12;
-var TODO_STATUSES = [
-  "pending",
-  "in_progress",
-  "completed",
-  "cancelled"
-];
-var TODO_PRIORITIES = ["high", "medium", "low"];
+var MAX_TODO_CONTENT_ROWS = 12;
 var STATUS_GLYPH = {
   pending: "○",
   in_progress: "◐",
@@ -175697,10 +176169,10 @@ var STATUS_COLOR = {
   cancelled: "error"
 };
 var snapshotsBySession = new Map;
-function isTodoStatus(value) {
+function isTodoStatus2(value) {
   return TODO_STATUSES.includes(value);
 }
-function isTodoPriority(value) {
+function isTodoPriority2(value) {
   return TODO_PRIORITIES.includes(value);
 }
 function cloneTodos(todos) {
@@ -175714,14 +176186,14 @@ function parseTodos(input) {
     if (item === null || typeof item !== "object")
       return null;
     const raw = item;
-    if (typeof raw.content !== "string" || !isTodoStatus(raw.status)) {
+    if (typeof raw.content !== "string" || !isTodoStatus2(raw.status)) {
       return null;
     }
     const todo = {
       content: raw.content,
       status: raw.status
     };
-    if (isTodoPriority(raw.priority))
+    if (isTodoPriority2(raw.priority))
       todo.priority = raw.priority;
     if (typeof raw.id === "string" && raw.id.length > 0)
       todo.id = raw.id;
@@ -175798,7 +176270,7 @@ function countTodos(todos) {
   return counts;
 }
 function activeTitleCount(todos) {
-  return todos.filter((todo) => todo.status !== "completed").length;
+  return todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
 }
 function formatCounts(counts) {
   if (counts.total === 0)
@@ -175832,6 +176304,16 @@ function lineComponent(renderLines) {
     invalidate() {}
   };
 }
+function capTodoRows(rows) {
+  if (rows.length <= MAX_TODO_CONTENT_ROWS) {
+    return { visible: [...rows], hiddenCount: 0 };
+  }
+  const visibleCount = Math.max(0, MAX_TODO_CONTENT_ROWS - 1);
+  return {
+    visible: rows.slice(0, visibleCount),
+    hiddenCount: rows.length - visibleCount
+  };
+}
 function renderTodowriteCall(args, theme) {
   const todos = parseTodos(args.todos) ?? [];
   const active = activeTitleCount(todos);
@@ -175854,7 +176336,12 @@ function renderTodowriteResult(result, theme) {
   return lineComponent((width) => {
     if (renderedTodos.length === 0)
       return [theme.fg("dim", "No todos")];
-    return renderedTodos.map((todo) => truncateToWidth(formatTodoLine(todo, theme, { showId: true }), width, "…"));
+    const { visible, hiddenCount } = capTodoRows(renderedTodos);
+    const lines = visible.map((todo) => truncateToWidth(formatTodoLine(todo, theme, { showId: true }), width, "…"));
+    if (hiddenCount > 0) {
+      lines.push(truncateToWidth(theme.fg("dim", `+${hiddenCount} more`), width, "…"));
+    }
+    return lines;
   });
 }
 function registerTodosCommand(pi) {
@@ -175884,8 +176371,11 @@ function registerTodosCommand(pi) {
         if (group.length === 0)
           continue;
         lines.push(heading);
-        for (const todo of group)
+        const { visible, hiddenCount } = capTodoRows(group);
+        for (const todo of visible)
           lines.push(formatCommandLine(todo));
+        if (hiddenCount > 0)
+          lines.push(`  +${hiddenCount} more`);
       }
       ctx.ui.notify(lines.join(`
 `), "info");
@@ -176013,19 +176503,16 @@ class TodoOverlay {
     const heading = `${theme.fg(headingColor, headingIcon)} ${theme.fg(headingColor, "Todos")} ${theme.fg("muted", "—")} ${theme.fg("dim", formatCounts(counts))}`;
     const truncate2 = (line) => truncateToWidth(line, width, "…");
     const lines = [truncate2(heading)];
-    const hasTruncatedTail = overlayTodos.length > MAX_OVERLAY_CONTENT_ROWS;
-    const visibleRows = hasTruncatedTail ? MAX_OVERLAY_CONTENT_ROWS - 1 : MAX_OVERLAY_CONTENT_ROWS;
-    const truncatedTail = Math.max(0, overlayTodos.length - visibleRows);
-    const visible = overlayTodos.slice(0, visibleRows);
+    const { visible, hiddenCount } = capTodoRows(overlayTodos);
     for (const [index, { todo, key }] of visible.entries()) {
-      const isLast = index === visible.length - 1 && truncatedTail === 0;
+      const isLast = index === visible.length - 1 && hiddenCount === 0;
       const branch = theme.fg("dim", isLast ? "└─" : "├─");
       lines.push(truncate2(`${branch} ${formatTodoLine(todo, theme, { showId: true })}`));
       if (todo.status === "completed")
         this.completedTaskIdsPendingHide.add(key);
     }
-    if (truncatedTail > 0) {
-      lines.push(truncate2(`${theme.fg("dim", "└─")} ${theme.fg("dim", `+${truncatedTail} more`)}`));
+    if (hiddenCount > 0) {
+      lines.push(truncate2(`${theme.fg("dim", "└─")} ${theme.fg("dim", `+${hiddenCount} more`)}`));
     }
     return lines;
   }
@@ -176081,17 +176568,10 @@ function registerTodoStateLifecycle(pi, deps) {
 }
 
 // src/tools/todowrite.ts
-var STATUS_VALUES = [
-  "pending",
-  "in_progress",
-  "completed",
-  "cancelled"
-];
-var PRIORITY_VALUES = ["high", "medium", "low"];
 var TodoItem = exports_typebox.Object({
   content: exports_typebox.String({ description: "Brief description of the task" }),
-  status: exports_typebox.Union(STATUS_VALUES.map((v) => exports_typebox.Literal(v))),
-  priority: exports_typebox.Optional(exports_typebox.Union(PRIORITY_VALUES.map((v) => exports_typebox.Literal(v)))),
+  status: exports_typebox.Union(TODO_STATUSES.map((v) => exports_typebox.Literal(v))),
+  priority: exports_typebox.Optional(exports_typebox.Union(TODO_PRIORITIES.map((v) => exports_typebox.Literal(v)))),
   id: exports_typebox.Optional(exports_typebox.String({ description: "Optional stable id for the todo" }))
 });
 var TodowriteParams = exports_typebox.Object({
@@ -176116,8 +176596,7 @@ function createTodowriteTool() {
     parameters: TodowriteParams,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const todos = params.todos ?? [];
-      const completed = todos.filter((t) => t.status === "completed").length;
-      const active = todos.length - completed;
+      const active = todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
       return {
         content: [
           {

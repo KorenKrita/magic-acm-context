@@ -805,6 +805,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,
       last_indexed_ordinal INTEGER NOT NULL DEFAULT 0,
+      dirty_floor_ordinal INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
@@ -834,6 +835,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_nudge_level TEXT DEFAULT '',
       channel2_nudge_state TEXT DEFAULT '',
       channel2_nudge_claimed_at INTEGER DEFAULT 0,
+      channel2_nudge_claim_token TEXT DEFAULT '',
       last_emergency_input_sample INTEGER DEFAULT 0,
       last_transform_error TEXT DEFAULT '',
       nudge_anchor_message_id TEXT DEFAULT '',
@@ -1082,6 +1084,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "last_nudge_level", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "channel2_nudge_state", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "channel2_nudge_claimed_at", "INTEGER DEFAULT 0");
+    ensureColumn(db, "session_meta", "channel2_nudge_claim_token", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "last_emergency_input_sample", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "last_transform_error", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "nudge_anchor_message_id", "TEXT DEFAULT ''");
@@ -1416,6 +1419,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // ships in a later commit once Pi can write to the same DB concurrently
     // and we can validate the safety property end-to-end.
     ensureColumn(db, "tags", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
+    ensureColumn(db, "message_history_index", "dirty_floor_ordinal", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "pending_ops", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "source_contents", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "compartments", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
@@ -1451,7 +1455,7 @@ function healWedgedChannel2Claims(db: Database): void {
     try {
         const staleBefore = Date.now() - CHANNEL2_CLAIM_TTL_MS;
         db.prepare(
-            "UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0 WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
+            "UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
         ).run(staleBefore);
     } catch {
         // Columns may be missing on a very fresh DB before ensureColumn/migration

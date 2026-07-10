@@ -14990,12 +14990,41 @@ function pushNotification(type, payload, sessionId) {
     queue = kept.sort((a, b) => a.id - b.id);
   }
 }
-function drainNotifications(lastReceivedId = 0, sessionId) {
-  const matchesClient = (notification) => sessionId === undefined || notification.sessionId === undefined || notification.sessionId === sessionId;
-  if (lastReceivedId > 0) {
-    queue = queue.filter((notification) => !(notification.id <= lastReceivedId && matchesClient(notification)));
+function cursor(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+function drainNotifications(lastReceivedId = 0, sessionId, options = {}) {
+  const sessionCursor = cursor(lastReceivedId);
+  if (options.globalOnly) {
+    queue = queue.filter((notification) => notification.sessionId !== undefined || notification.id > sessionCursor);
+    return queue.filter((notification) => notification.sessionId === undefined && notification.id > sessionCursor);
   }
-  return queue.filter((notification) => notification.id > lastReceivedId && matchesClient(notification));
+  if (options.sessionOnly) {
+    if (sessionId === undefined)
+      return [];
+    queue = queue.filter((notification) => notification.sessionId !== sessionId || notification.id > sessionCursor);
+    return queue.filter((notification) => notification.sessionId === sessionId && notification.id > sessionCursor);
+  }
+  if (sessionId !== undefined && options.globalLastReceivedId !== undefined) {
+    const globalCursor = cursor(options.globalLastReceivedId);
+    queue = queue.filter((notification) => {
+      if (notification.sessionId === undefined)
+        return notification.id > globalCursor;
+      if (notification.sessionId === sessionId)
+        return notification.id > sessionCursor;
+      return true;
+    });
+    return queue.filter((notification) => {
+      if (notification.sessionId === undefined)
+        return notification.id > globalCursor;
+      return notification.sessionId === sessionId && notification.id > sessionCursor;
+    });
+  }
+  const matchesClient = (notification) => sessionId === undefined || notification.sessionId === undefined || notification.sessionId === sessionId;
+  if (sessionCursor > 0) {
+    queue = queue.filter((notification) => !(notification.id <= sessionCursor && matchesClient(notification)));
+  }
+  return queue.filter((notification) => notification.id > sessionCursor && matchesClient(notification));
 }
 function isTuiConnected(sessionId) {
   if (sinks.size === 0)
@@ -15138,7 +15167,7 @@ var PROMPT_CONTEXT_MESSAGE_LIMIT = 50;
 
 // src/index.ts
 import { createRequire as createRequire3 } from "node:module";
-import { join as join13 } from "node:path";
+import { join as join13, resolve as resolve3 } from "node:path";
 
 // ../plugin/src/config/agent-disable.ts
 function isDreamerRunnable(config) {
@@ -149215,12 +149244,19 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
   let totalTokens = 0;
   let messagesProcessed = 0;
   let lastOrdinal = startOrdinal - 1;
+  let highestScannedOrdinal = startOrdinal - 1;
   let lastMessageId = "";
   let firstMessageId = "";
   let currentBlock = null;
   let pendingNoiseMeta = [];
   let commitClusters = 0;
   let lastFlushedRole = "";
+  function recordFilteredNoise(meta) {
+    pendingNoiseMeta.push(meta);
+    if (!currentBlock) {
+      highestScannedOrdinal = Math.max(highestScannedOrdinal, meta.ordinal);
+    }
+  }
   function flushCurrentBlock() {
     if (!currentBlock)
       return true;
@@ -149236,6 +149272,7 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     if (!firstMessageId)
       firstMessageId = currentBlock.meta[0]?.messageId ?? "";
     lastOrdinal = currentBlock.meta[currentBlock.meta.length - 1]?.ordinal ?? currentBlock.endOrdinal;
+    highestScannedOrdinal = Math.max(highestScannedOrdinal, lastOrdinal);
     lastMessageId = currentBlock.meta[currentBlock.meta.length - 1]?.messageId ?? "";
     messagesProcessed += currentBlock.meta.length;
     lines.push(blockText);
@@ -149259,7 +149296,7 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     if (msg.role === "user" && !hasMeaningfulUserText(msg.parts)) {
       const tcSummaries = extractToolCallSummaries(msg.parts);
       if (tcSummaries.length === 0) {
-        pendingNoiseMeta.push(meta);
+        recordFilteredNoise(meta);
         continue;
       }
       const tcText = tcSummaries.join(" / ");
@@ -149291,7 +149328,7 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     const compacted = compactTextForSummary(allParts.join(" / "), msg.role);
     const text = compacted.text;
     if (!text) {
-      pendingNoiseMeta.push(meta);
+      recordFilteredNoise(meta);
       continue;
     }
     const msgHasNarrative = textParts.length > 0;
@@ -149318,7 +149355,9 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     };
     pendingNoiseMeta = [];
   }
-  flushCurrentBlock();
+  if (flushCurrentBlock() && pendingNoiseMeta.length > 0) {
+    highestScannedOrdinal = Math.max(highestScannedOrdinal, pendingNoiseMeta[pendingNoiseMeta.length - 1]?.ordinal ?? highestScannedOrdinal);
+  }
   const toolOnlyRanges = [];
   for (const range of flushedToolOnlyBlocks) {
     const last = toolOnlyRanges[toolOnlyRanges.length - 1];
@@ -149335,7 +149374,7 @@ function readSessionChunk(sessionId, tokenBudget, offset = 1, eligibleEndOrdinal
     endMessageId: lastMessageId,
     messageCount: messagesProcessed,
     tokenEstimate: totalTokens,
-    hasMore: lastOrdinal < (eligibleEndOrdinal !== undefined ? Math.min(eligibleEndOrdinal - 1, totalMessageCount) : totalMessageCount),
+    hasMore: Math.max(lastOrdinal, highestScannedOrdinal) < (eligibleEndOrdinal !== undefined ? Math.min(eligibleEndOrdinal - 1, totalMessageCount) : totalMessageCount),
     text: lines.join(`
 `),
     lines: lineMeta,
@@ -149370,7 +149409,10 @@ function clearCompressionDepthRange(db, sessionId, startOrdinal, endOrdinal) {
 var lastIndexedStatements = new WeakMap;
 var insertMessageStatements = new WeakMap;
 var upsertIndexStatements = new WeakMap;
+var upsertCleanIndexStatements = new WeakMap;
+var upsertDirtyFloorStatements = new WeakMap;
 var deleteFtsStatements = new WeakMap;
+var deleteFtsFromOrdinalStatements = new WeakMap;
 var deleteIndexStatements = new WeakMap;
 var countIndexedMessageStatements = new WeakMap;
 function normalizeIndexText(text) {
@@ -149379,7 +149421,7 @@ function normalizeIndexText(text) {
 function getLastIndexedStatement(db) {
   let stmt = lastIndexedStatements.get(db);
   if (!stmt) {
-    stmt = db.prepare("SELECT last_indexed_ordinal FROM message_history_index WHERE session_id = ?");
+    stmt = db.prepare("SELECT last_indexed_ordinal, dirty_floor_ordinal FROM message_history_index WHERE session_id = ?");
     lastIndexedStatements.set(db, stmt);
   }
   return stmt;
@@ -149400,11 +149442,35 @@ function getUpsertIndexStatement(db) {
   }
   return stmt;
 }
+function getUpsertCleanIndexStatement(db) {
+  let stmt = upsertCleanIndexStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO message_history_index (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness) VALUES (?, ?, 0, ?, ?) ON CONFLICT(session_id) DO UPDATE SET last_indexed_ordinal = excluded.last_indexed_ordinal, dirty_floor_ordinal = 0, updated_at = excluded.updated_at");
+    upsertCleanIndexStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getUpsertDirtyFloorStatement(db) {
+  let stmt = upsertDirtyFloorStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO message_history_index (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET last_indexed_ordinal = MAX(message_history_index.last_indexed_ordinal, excluded.last_indexed_ordinal), dirty_floor_ordinal = CASE WHEN message_history_index.dirty_floor_ordinal <= 0 THEN excluded.dirty_floor_ordinal WHEN excluded.dirty_floor_ordinal <= 0 THEN message_history_index.dirty_floor_ordinal ELSE MIN(message_history_index.dirty_floor_ordinal, excluded.dirty_floor_ordinal) END, updated_at = excluded.updated_at");
+    upsertDirtyFloorStatements.set(db, stmt);
+  }
+  return stmt;
+}
 function getDeleteFtsStatement(db) {
   let stmt = deleteFtsStatements.get(db);
   if (!stmt) {
     stmt = db.prepare("DELETE FROM message_history_fts WHERE session_id = ?");
     deleteFtsStatements.set(db, stmt);
+  }
+  return stmt;
+}
+function getDeleteFtsFromOrdinalStatement(db) {
+  let stmt = deleteFtsFromOrdinalStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("DELETE FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) >= ?");
+    deleteFtsFromOrdinalStatements.set(db, stmt);
   }
   return stmt;
 }
@@ -149427,6 +149493,14 @@ function getCountIndexedMessageStatement(db) {
 function getLastIndexedOrdinal(db, sessionId) {
   const row = getLastIndexedStatement(db).get(sessionId);
   return typeof row?.last_indexed_ordinal === "number" ? row.last_indexed_ordinal : 0;
+}
+function getDirtyIndexFloor(db, sessionId) {
+  const row = getLastIndexedStatement(db).get(sessionId);
+  return typeof row?.dirty_floor_ordinal === "number" && row.dirty_floor_ordinal > 0 ? row.dirty_floor_ordinal : null;
+}
+function markMessageIndexDirty(db, sessionId, floorOrdinal) {
+  const dirtyFloor = Math.max(1, Math.floor(floorOrdinal));
+  getUpsertDirtyFloorStatement(db).run(sessionId, getLastIndexedOrdinal(db, sessionId), dirtyFloor, Date.now(), getHarness());
 }
 function isMessageAlreadyIndexed(db, sessionId, messageId) {
   const row = getCountIndexedMessageStatement(db).get(sessionId, messageId);
@@ -149495,7 +149569,15 @@ function indexMessagesAfterOrdinal(db, sessionId, messages, lastIndexedOrdinal, 
   db.exec("BEGIN IMMEDIATE");
   let committed = false;
   try {
-    const effectiveWatermark = Math.max(lastIndexedOrdinal, getLastIndexedOrdinal(db, sessionId));
+    let effectiveWatermark = Math.max(lastIndexedOrdinal, getLastIndexedOrdinal(db, sessionId));
+    const dirtyFloor = getDirtyIndexFloor(db, sessionId);
+    if (dirtyFloor !== null) {
+      const rewindOrdinal = Math.max(1, Math.min(dirtyFloor, finalWatermark + 1));
+      if (rewindOrdinal <= finalWatermark) {
+        getDeleteFtsFromOrdinalStatement(db).run(sessionId, rewindOrdinal);
+      }
+      effectiveWatermark = Math.min(effectiveWatermark, rewindOrdinal - 1);
+    }
     const insertMessage = getInsertMessageStatement(db);
     for (const message of messages) {
       if (message.ordinal <= effectiveWatermark) {
@@ -149512,7 +149594,7 @@ function indexMessagesAfterOrdinal(db, sessionId, messages, lastIndexedOrdinal, 
       inserted++;
     }
     const newWatermark = Math.max(effectiveWatermark, finalWatermark);
-    getUpsertIndexStatement(db).run(sessionId, newWatermark, now, getHarness());
+    getUpsertCleanIndexStatement(db).run(sessionId, newWatermark, now, getHarness());
     db.exec("COMMIT");
     committed = true;
   } finally {
@@ -149609,8 +149691,9 @@ function scheduleReconciliation(db, sessionId, readMessages) {
   reconciliationScheduledSessions.add(sessionId);
   defer(() => {
     reconcileSessionIndex(db, sessionId, readMessages).catch((error) => {
-      reconciliationScheduledSessions.delete(sessionId);
       logIndexingError(sessionId, "reconciliation", error);
+    }).finally(() => {
+      reconciliationScheduledSessions.delete(sessionId);
     });
   });
 }
@@ -149622,13 +149705,17 @@ function scheduleIncrementalIndex(db, sessionId, messageId, readSingleMessage) {
   const timer = setTimeout(() => {
     incrementalTimers.delete(key);
     pendingIncrementalKeys.add(key);
+    let attemptedOrdinal = null;
     runWithSessionLock(sessionId, () => {
       const message = readSingleMessage(sessionId, messageId);
       if (!message) {
         return;
       }
+      attemptedOrdinal = message.ordinal;
       indexSingleMessage(db, sessionId, message);
     }).catch((error) => {
+      markMessageIndexDirty(db, sessionId, attemptedOrdinal ?? getLastIndexedOrdinal(db, sessionId) + 1);
+      reconciledSessions.delete(sessionId);
       logIndexingError(sessionId, `incremental index for ${messageId}`, error);
     }).finally(() => {
       pendingIncrementalKeys.delete(key);
@@ -150580,6 +150667,7 @@ function healNullTextColumns(db) {
     ["cache_ttl", ""],
     ["last_nudge_band", ""],
     ["last_nudge_level", ""],
+    ["channel2_nudge_claim_token", ""],
     ["last_transform_error", ""],
     ["nudge_anchor_message_id", ""],
     ["nudge_anchor_text", ""],
@@ -150643,6 +150731,7 @@ function healNullIntegerColumns(db) {
 }
 
 // ../plugin/src/features/magic-context/workspaces.ts
+init_logger();
 import { createHash as createHash2 } from "node:crypto";
 
 // ../plugin/src/features/magic-context/memory/constants.ts
@@ -150693,6 +150782,7 @@ var CATEGORY_DEFAULT_TTL = {
 };
 // ../plugin/src/features/magic-context/workspaces.ts
 var VALID_SHARE_CATEGORIES = new Set(V2_MEMORY_CATEGORIES);
+var DEFAULT_WORKSPACE_SHARE_CATEGORIES = ["CONSTRAINTS"];
 function tableExists(db, tableName) {
   const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1").get(tableName);
   return Boolean(row);
@@ -150707,23 +150797,39 @@ function uniqueSorted(values) {
 function placeholders(values) {
   return values.map(() => "?").join(", ");
 }
+function defaultWorkspaceShareCategories() {
+  return [...DEFAULT_WORKSPACE_SHARE_CATEGORIES];
+}
+function warnInvalidShareCategories(reason, raw) {
+  log("[magic-context] WARN: invalid workspace share_categories; sharing no foreign memory categories", {
+    reason,
+    raw
+  });
+}
 function normalizeShareCategories(raw) {
-  if (raw === null || raw === undefined)
-    return null;
-  if (typeof raw !== "string")
-    return null;
+  if (raw === null || raw === undefined) {
+    return defaultWorkspaceShareCategories();
+  }
+  if (typeof raw !== "string") {
+    warnInvalidShareCategories("not a string", raw);
+    return [];
+  }
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null;
+    warnInvalidShareCategories("malformed JSON", raw);
+    return [];
   }
-  if (!Array.isArray(parsed))
-    return null;
+  if (!Array.isArray(parsed)) {
+    warnInvalidShareCategories("not a JSON array", raw);
+    return [];
+  }
   const categories = [];
   for (const value of parsed) {
     if (typeof value !== "string" || !VALID_SHARE_CATEGORIES.has(value)) {
-      return null;
+      warnInvalidShareCategories("unknown category", raw);
+      return [];
     }
     if (!categories.includes(value))
       categories.push(value);
@@ -150732,8 +150838,21 @@ function normalizeShareCategories(raw) {
 }
 function selectWorkspaceShareCategories(db, identities) {
   const candidates = uniqueSorted(identities.filter((identity) => identity.length > 0));
-  if (candidates.length === 0 || !tableExists(db, "workspace_members") || !tableExists(db, "workspaces") || !columnExists(db, "workspaces", "share_categories")) {
+  if (candidates.length === 0 || !tableExists(db, "workspace_members")) {
     return null;
+  }
+  const hasMembership = Boolean(db.prepare(`SELECT 1
+                   FROM workspace_members
+                  WHERE project_path IN (${placeholders(candidates)})
+                  LIMIT 1`).get(...candidates));
+  if (!hasMembership)
+    return null;
+  if (!tableExists(db, "workspaces")) {
+    log("[magic-context] WARN: workspace member has no workspaces table; sharing no foreign memory categories");
+    return [];
+  }
+  if (!columnExists(db, "workspaces", "share_categories")) {
+    return defaultWorkspaceShareCategories();
   }
   const row = db.prepare(`SELECT workspace.share_categories AS shareCategories
                FROM workspace_members AS member
@@ -150741,7 +150860,11 @@ function selectWorkspaceShareCategories(db, identities) {
               WHERE member.project_path IN (${placeholders(candidates)})
               ORDER BY workspace.id ASC
               LIMIT 1`).get(...candidates);
-  return normalizeShareCategories(row?.shareCategories ?? null);
+  if (!row) {
+    log("[magic-context] WARN: workspace member has no workspace share_categories row; sharing no foreign memory categories");
+    return [];
+  }
+  return normalizeShareCategories(row.shareCategories);
 }
 function resolveWorkspaceShareCategories(db, projectIdentity) {
   return selectWorkspaceShareCategories(db, [projectIdentity]);
@@ -150846,7 +150969,7 @@ function computeWorkspaceEpochFingerprint(db, identities) {
   const hash = createHash2("sha256");
   hash.update("share_categories", "utf8");
   hash.update("\x00");
-  hash.update(shareCategories === null ? "ALL" : JSON.stringify(shareCategories), "utf8");
+  hash.update(shareCategories === null ? "NO_WORKSPACE" : JSON.stringify(shareCategories), "utf8");
   hash.update(`
 `);
   for (const identity of canonical) {
@@ -153418,6 +153541,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,
       last_indexed_ordinal INTEGER NOT NULL DEFAULT 0,
+      dirty_floor_ordinal INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
@@ -153447,6 +153571,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_nudge_level TEXT DEFAULT '',
       channel2_nudge_state TEXT DEFAULT '',
       channel2_nudge_claimed_at INTEGER DEFAULT 0,
+      channel2_nudge_claim_token TEXT DEFAULT '',
       last_emergency_input_sample INTEGER DEFAULT 0,
       last_transform_error TEXT DEFAULT '',
       nudge_anchor_message_id TEXT DEFAULT '',
@@ -153693,6 +153818,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
   ensureColumn(db, "session_meta", "last_nudge_level", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "channel2_nudge_state", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "channel2_nudge_claimed_at", "INTEGER DEFAULT 0");
+  ensureColumn(db, "session_meta", "channel2_nudge_claim_token", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "last_emergency_input_sample", "INTEGER DEFAULT 0");
   ensureColumn(db, "session_meta", "last_transform_error", "TEXT DEFAULT ''");
   ensureColumn(db, "session_meta", "nudge_anchor_message_id", "TEXT DEFAULT ''");
@@ -153905,6 +154031,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         ON transform_decisions(session_id, harness);
     `);
   ensureColumn(db, "tags", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
+  ensureColumn(db, "message_history_index", "dirty_floor_ordinal", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "pending_ops", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
   ensureColumn(db, "source_contents", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
   ensureColumn(db, "compartments", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
@@ -153920,7 +154047,7 @@ var CHANNEL2_CLAIM_TTL_MS = 120000;
 function healWedgedChannel2Claims(db) {
   try {
     const staleBefore = Date.now() - CHANNEL2_CLAIM_TTL_MS;
-    db.prepare("UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0 WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)").run(staleBefore);
+    db.prepare("UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)").run(staleBefore);
   } catch {}
 }
 function openDatabase(dbPathOrOptions) {
@@ -154613,7 +154740,7 @@ function setChannel2NudgeState(db, sessionId, state) {
   db.transaction(() => {
     ensureSessionMetaRow(db, sessionId);
     const claimedAt = state === "claimed" ? Date.now() : 0;
-    db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ? WHERE session_id = ?").run(state, claimedAt, sessionId);
+    db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ?").run(state, claimedAt, sessionId);
   })();
 }
 function casChannel2NudgeState(db, sessionId, from, to) {
@@ -154621,7 +154748,7 @@ function casChannel2NudgeState(db, sessionId, from, to) {
   db.transaction(() => {
     ensureSessionMetaRow(db, sessionId);
     const claimedAt = to === "claimed" ? Date.now() : 0;
-    const result = db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ? WHERE session_id = ? AND channel2_nudge_state = ?").run(to, claimedAt, sessionId, from);
+    const result = db.prepare("UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ? AND channel2_nudge_state = ?").run(to, claimedAt, sessionId, from);
     changed = (result.changes ?? 0) > 0;
   })();
   return changed;
@@ -156833,8 +156960,31 @@ function clearNoteNudgeTriggerOnly(db, sessionId) {
 
 // ../plugin/src/hooks/magic-context/todo-view.ts
 import { createHash as createHash5 } from "node:crypto";
-var TERMINAL_STATUSES = new Set(["completed", "cancelled"]);
-var TITLE_DONE_STATUSES = new Set(["completed"]);
+var TODO_STATUS_PENDING = "pending";
+var TODO_STATUS_IN_PROGRESS = "in_progress";
+var TODO_STATUS_COMPLETED = "completed";
+var TODO_STATUS_CANCELLED = "cancelled";
+var TODO_PRIORITY_HIGH = "high";
+var TODO_PRIORITY_MEDIUM = "medium";
+var TODO_PRIORITY_LOW = "low";
+var TODO_STATUSES = [
+  TODO_STATUS_PENDING,
+  TODO_STATUS_IN_PROGRESS,
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+];
+var TODO_PRIORITIES = [
+  TODO_PRIORITY_HIGH,
+  TODO_PRIORITY_MEDIUM,
+  TODO_PRIORITY_LOW
+];
+var TODO_STATUS_SET = new Set(TODO_STATUSES);
+var TODO_PRIORITY_SET = new Set(TODO_PRIORITIES);
+var TERMINAL_STATUSES = new Set([
+  TODO_STATUS_COMPLETED,
+  TODO_STATUS_CANCELLED
+]);
+var TITLE_DONE_STATUSES = new Set([TODO_STATUS_COMPLETED]);
 var SYNTHETIC_CALL_ID_PREFIX = "mc_synthetic_todo_";
 function normalizeTodoStateJson(todos) {
   if (!Array.isArray(todos))
@@ -156846,7 +156996,7 @@ function normalizeTodoStateJson(todos) {
     normalized.push({
       content: todo.content,
       status: todo.status,
-      priority: todo.priority ?? "medium"
+      priority: todo.priority ?? TODO_PRIORITY_MEDIUM
     });
   }
   return JSON.stringify(normalized);
@@ -156890,11 +157040,11 @@ function parseTodoState(stateJson) {
     const result = [];
     for (const item of parsed) {
       if (!isTodoItem(item))
-        continue;
+        return null;
       result.push({
         content: item.content,
         status: item.status,
-        priority: item.priority ?? "medium"
+        priority: item.priority ?? TODO_PRIORITY_MEDIUM
       });
     }
     return result;
@@ -156902,11 +157052,17 @@ function parseTodoState(stateJson) {
     return null;
   }
 }
+function isTodoStatus(value) {
+  return typeof value === "string" && TODO_STATUS_SET.has(value);
+}
+function isTodoPriority(value) {
+  return typeof value === "string" && TODO_PRIORITY_SET.has(value);
+}
 function isTodoItem(value) {
   if (value === null || typeof value !== "object")
     return false;
   const todo = value;
-  return typeof todo.content === "string" && typeof todo.status === "string" && (todo.priority === undefined || typeof todo.priority === "string");
+  return typeof todo.content === "string" && isTodoStatus(todo.status) && (todo.priority === undefined || isTodoPriority(todo.priority));
 }
 
 // ../plugin/src/hooks/magic-context/upgrade-reminder.ts
@@ -157432,18 +157588,48 @@ function inferAccountingSubagent(agent) {
     return "recomp";
   return "historian";
 }
+var ALREADY_PROCESSING_PREFIX = "Agent is already processing";
+var ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE = "model unavailable in isolated retry: it is provided by a disabled extension; configure it through ~/.omp/agent/models.yml or add a built-in/provider-configured fallback";
+var MODEL_RESOLUTION_ERROR_PATTERNS = [
+  /unknown model/i,
+  /unknown provider/i,
+  /model.+not found/i,
+  /provider.+not found/i,
+  /could not resolve model/i,
+  /no models? (matched|available|configured)/i,
+  /model.+not configured/i
+];
 
 class PiSubagentRunner {
   harness = "omp";
   invocation;
   spawnImpl;
   platform;
+  extraArgs;
   constructor(options = {}) {
     this.invocation = options.piBinary ? { command: options.piBinary, prefixArgs: [] } : resolvePiInvocation();
     this.spawnImpl = options.spawnImpl ?? childProcess.spawn;
     this.platform = options.platform ?? process.platform;
+    this.extraArgs = options.extraArgs ?? [];
   }
   async run(options) {
+    const primaryRunMode = { disableDiscoveredExtensions: false };
+    const primaryResult = await this.runModelChain(options, primaryRunMode);
+    if (this.spawnUsesNoExtensions(primaryRunMode) || !isOmpExtensionCollisionFailure(primaryResult)) {
+      return primaryResult;
+    }
+    const sessionId = options.accountingSessionId ?? "omp-subagent";
+    sessionLog(sessionId, "OMP subagent: a loaded extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)");
+    const isolatedResult = await this.runModelChain(options, {
+      disableDiscoveredExtensions: true
+    });
+    if (!isolatedResult.ok && isIsolatedRetryModelUnavailable(isolatedResult)) {
+      sessionLog(sessionId, ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE);
+      return annotateIsolatedRetryModelUnavailable(isolatedResult);
+    }
+    return isolatedResult;
+  }
+  async runModelChain(options, runMode) {
     const models = [options.model, ...options.fallbackModels ?? []].filter((model) => typeof model === "string" && model.length > 0);
     const attempts = models.length > 0 ? models : [undefined];
     let lastResult = null;
@@ -157454,17 +157640,23 @@ class PiSubagentRunner {
         model,
         fallbackModels: undefined
       };
-      const result = await this.runOnce(attemptOptions);
+      const result = await this.runOnce(attemptOptions, runMode);
       if (result.ok)
         return result;
       lastResult = result;
+      if (!this.spawnUsesNoExtensions(runMode) && isOmpExtensionCollisionFailure(result)) {
+        return result;
+      }
       if (index >= attempts.length - 1 || !isFallbackEligible(result.reason)) {
         return result;
       }
     }
-    return lastResult ?? this.runOnce({ ...options, fallbackModels: undefined });
+    return lastResult ?? this.runOnce({ ...options, fallbackModels: undefined }, runMode);
   }
-  async runOnce(options) {
+  spawnUsesNoExtensions(runMode) {
+    return runMode.disableDiscoveredExtensions || hasNoExtensionsArg([...this.invocation.prefixArgs, ...this.extraArgs]);
+  }
+  async runOnce(options, runMode) {
     const startTime = Date.now();
     let recordedAccounting = false;
     const recordAccounting = (result, messages = []) => {
@@ -157539,6 +157731,7 @@ class PiSubagentRunner {
       }
     }
     const args = buildArgs(options, {
+      disableDiscoveredExtensions: runMode.disableDiscoveredExtensions,
       omitPositionalMessage: deliverViaStdin,
       systemPromptPath
     });
@@ -157566,7 +157759,7 @@ class PiSubagentRunner {
       };
       let child;
       try {
-        child = this.spawnImpl(this.invocation.command, [...this.invocation.prefixArgs, ...args], {
+        child = this.spawnImpl(this.invocation.command, [...this.invocation.prefixArgs, ...this.extraArgs, ...args], {
           cwd: options.cwd,
           env: {
             ...process.env,
@@ -157860,6 +158053,32 @@ class PiSubagentRunner {
     });
   }
 }
+function getResultStderr(result) {
+  const stderr = result.meta?.stderr;
+  return typeof stderr === "string" ? stderr : "";
+}
+function hasNoExtensionsArg(args) {
+  return args.includes("--no-extensions");
+}
+function isOmpExtensionCollisionFailure(result) {
+  return !result.ok && result.reason === "non_zero_exit" && getResultStderr(result).includes(ALREADY_PROCESSING_PREFIX);
+}
+function isIsolatedRetryModelUnavailable(result) {
+  if (result.ok)
+    return false;
+  const diagnosticText = `${result.error}
+${getResultStderr(result)}`;
+  return MODEL_RESOLUTION_ERROR_PATTERNS.some((pattern) => pattern.test(diagnosticText));
+}
+function annotateIsolatedRetryModelUnavailable(result) {
+  if (result.error.startsWith(ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE)) {
+    return result;
+  }
+  return {
+    ...result,
+    error: `${ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE}. Original failure: ${result.error}`
+  };
+}
 function isFallbackEligible(reason) {
   return reason === "model_failed" || reason === "truncated" || reason === "non_zero_exit" || reason === "no_assistant";
 }
@@ -157872,9 +158091,13 @@ function buildArgs(options, opts) {
     "--no-session",
     "--no-skills"
   ];
-  const shouldLoadSubagentExtension = SUBAGENT_ENTRY_PATH && (SEARCH_ONLY_SUBAGENT_TOOL_AGENTS.has(options.agent) || DREAMER_ACTION_AGENTS.has(options.agent));
+  if (opts?.disableDiscoveredExtensions) {
+    args.push("--no-extensions");
+  }
+  const subagentEntryPath = opts?.subagentEntryPath ?? SUBAGENT_ENTRY_PATH;
+  const shouldLoadSubagentExtension = subagentEntryPath && (SEARCH_ONLY_SUBAGENT_TOOL_AGENTS.has(options.agent) || DREAMER_ACTION_AGENTS.has(options.agent));
   if (shouldLoadSubagentExtension) {
-    args.push("--extension", SUBAGENT_ENTRY_PATH);
+    args.push("--extension", subagentEntryPath);
     if (DREAMER_ACTION_AGENTS.has(options.agent)) {
       args.push("--magic-context-dreamer-actions");
     }
@@ -158582,6 +158805,22 @@ function extractLatestAssistantText(messages) {
     return null;
   return getTextParts(latest).map((part) => part.text).join(`
 `) || null;
+}
+function hasLengthCappedOutput(value) {
+  if (Array.isArray(value))
+    return value.some((item) => hasLengthCappedOutput(item));
+  if (!isRecord(value))
+    return false;
+  if (value.length_capped === true || value.lengthCapped === true)
+    return true;
+  const finishReason = value.finish_reason ?? value.finishReason;
+  if (typeof finishReason === "string") {
+    const normalized = finishReason.toLowerCase();
+    if (normalized === "length" || normalized === "max_tokens" || normalized === "max_output_tokens") {
+      return true;
+    }
+  }
+  return Object.values(value).some((item) => hasLengthCappedOutput(item));
 }
 
 // ../plugin/src/features/magic-context/dreamer/task-executor.ts
@@ -174635,6 +174874,7 @@ class OpenAICompatibleEmbeddingProvider {
 
 // ../plugin/src/features/magic-context/memory/storage-memory-embeddings.ts
 var saveEmbeddingStatements = new WeakMap;
+var saveEmbeddingIfHashMatchesStatements = new WeakMap;
 var loadAllEmbeddingsStatements = new WeakMap;
 var deleteEmbeddingStatements = new WeakMap;
 var getStoredModelIdStatements = new WeakMap;
@@ -174665,6 +174905,14 @@ function getSaveEmbeddingStatement(db) {
   }
   return stmt;
 }
+function getSaveEmbeddingIfHashMatchesStatement(db) {
+  let stmt = saveEmbeddingIfHashMatchesStatements.get(db);
+  if (!stmt) {
+    stmt = db.prepare("INSERT INTO memory_embeddings (memory_id, embedding, model_id) SELECT ?, ?, ? FROM memories WHERE id = ? AND normalized_hash = ? ON CONFLICT(memory_id, model_id) DO UPDATE SET embedding = excluded.embedding");
+    saveEmbeddingIfHashMatchesStatements.set(db, stmt);
+  }
+  return stmt;
+}
 function getLoadAllEmbeddingsStatement(db) {
   let stmt = loadAllEmbeddingsStatements.get(db);
   if (!stmt) {
@@ -174692,6 +174940,10 @@ function getClearModelEmbeddingsStatement(db) {
 function saveEmbedding(db, memoryId, embedding, modelId) {
   const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
   getSaveEmbeddingStatement(db).run(memoryId, blob, modelId);
+}
+function saveEmbeddingIfHashMatches(db, memoryId, embedding, modelId, normalizedHash) {
+  const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+  return getSaveEmbeddingIfHashMatchesStatement(db).run(memoryId, blob, modelId, memoryId, normalizedHash).changes > 0;
 }
 function loadAllEmbeddings(db, projectPath, modelId) {
   const rows = getLoadAllEmbeddingsStatement(db).all(projectPath, modelId).filter(isEmbeddingRow);
@@ -175553,12 +175805,12 @@ function isUnembeddedMemoryRow(row) {
   if (row === null || typeof row !== "object")
     return false;
   const candidate = row;
-  return typeof candidate.id === "number" && typeof candidate.content === "string";
+  return typeof candidate.id === "number" && typeof candidate.content === "string" && typeof candidate.normalized_hash === "string";
 }
 function getLoadUnembeddedMemoriesStatement(db) {
   let stmt = loadUnembeddedMemoriesStatements.get(db);
   if (!stmt) {
-    stmt = db.prepare("SELECT m.id AS id, m.content AS content FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL LIMIT ?");
+    stmt = db.prepare("SELECT m.id AS id, m.content AS content, m.normalized_hash AS normalized_hash FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL LIMIT ?");
     loadUnembeddedMemoriesStatements.set(db, stmt);
   }
   return stmt;
@@ -175581,8 +175833,9 @@ async function embedUnembeddedMemoriesForProject(db, projectIdentity, batchSize 
         const embedding = result.vectors[index];
         if (!embedding)
           continue;
-        saveEmbedding(db, memory.id, embedding, result.modelId);
-        embeddedCount += 1;
+        if (saveEmbeddingIfHashMatches(db, memory.id, embedding, result.modelId, memory.normalized_hash)) {
+          embeddedCount += 1;
+        }
       }
     })();
     return embeddedCount;
@@ -176284,25 +176537,33 @@ function getMemoryCountsByStatusStatement(db) {
   }
   return stmt;
 }
-function insertMemory(db, input) {
-  const now = Date.now();
-  const normalizedHash = computeNormalizedHash(input.content);
+function buildInsertMemoryValues(input, normalizedHash, now, includeImportance) {
   const insertValues = [
     input.projectPath,
     input.category,
     input.content,
     normalizedHash
   ];
-  if (hasMemoryImportanceColumn(db)) {
+  if (includeImportance) {
     insertValues.push(input.importance ?? 50);
   }
   insertValues.push(input.sourceSessionId ?? null, input.sourceType ?? "historian", 1, 0, now, now, now, now, null, "active", input.expiresAt ?? null, "unverified", null, null, null, input.metadataJson ?? null);
-  const result = getInsertMemoryStatement(db).run(...insertValues);
-  const insertedResult = result;
-  const inserted = getMemoryById(db, Number(insertedResult.lastInsertRowid));
+  return insertValues;
+}
+function loadInsertedMemory(db, rowid) {
+  const inserted = getMemoryById(db, Number(rowid));
   if (!inserted) {
     throw new Error("Failed to load inserted memory row");
   }
+  return inserted;
+}
+function insertMemory(db, input) {
+  const now = Date.now();
+  const normalizedHash = computeNormalizedHash(input.content);
+  const insertValues = buildInsertMemoryValues(input, normalizedHash, now, hasMemoryImportanceColumn(db));
+  const result = getInsertMemoryStatement(db).run(...insertValues);
+  const insertedResult = result;
+  const inserted = loadInsertedMemory(db, insertedResult.lastInsertRowid);
   invalidateProject(input.projectPath);
   return inserted;
 }
@@ -177094,6 +177355,14 @@ function renewLease(db, holderId, leaseKey = DREAMING_LEASE_KEY) {
     setDreamState(db, keys.heartbeat, String(now));
     setDreamState(db, keys.expiry, String(now + LEASE_DURATION_MS2));
     return true;
+  });
+}
+function runLeaseGuardedWrite(db, holderId, leaseKey, fn) {
+  return runImmediate2(db, () => {
+    if (!peekLeaseHolderAndExpiry(db, holderId, leaseKey)) {
+      throw new Error("Dream lease lost before guarded write");
+    }
+    return fn();
   });
 }
 var LEASE_HEARTBEAT_INTERVAL_MS = 60 * 1000;
@@ -177890,6 +178159,39 @@ function hasShareabilitySensitiveText(text) {
   }
 }
 
+// ../plugin/src/features/magic-context/dreamer/manifest-parser.ts
+function extractCompleteManifestBody(text, rootName) {
+  const escapedRoot = rootName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rootMatch = new RegExp(`<${escapedRoot}\\b[^>]*>([\\s\\S]*?)<\\/${escapedRoot}>`, "i").exec(text);
+  if (rootMatch)
+    return rootMatch[1];
+  const hasOpenRoot = new RegExp(`<${escapedRoot}\\b`, "i").test(text);
+  const hasCloseRoot = new RegExp(`<\\/${escapedRoot}>`, "i").test(text);
+  if (hasOpenRoot && !hasCloseRoot) {
+    throw new Error(`${rootName} manifest missing closing root tag`);
+  }
+  throw new Error(`${rootName} manifest missing complete root element`);
+}
+function assertNoDuplicateManifestIds(ids, rootName) {
+  const seen = new Set;
+  for (const id of ids) {
+    if (seen.has(id))
+      throw new Error(`${rootName} manifest contains duplicate id ${id}`);
+    seen.add(id);
+  }
+}
+function assertManifestCoversExactly(ids, expectedIds, rootName) {
+  assertNoDuplicateManifestIds(ids, rootName);
+  for (const id of ids) {
+    if (!expectedIds.has(id))
+      throw new Error(`${rootName} manifest contains unknown id ${id}`);
+  }
+  for (const id of expectedIds) {
+    if (!ids.includes(id))
+      throw new Error(`${rootName} manifest missing id ${id}`);
+  }
+}
+
 // ../plugin/src/features/magic-context/dreamer/classify-prompt.ts
 var SCORING_GUIDANCE = `### How to score importance (1-100)
 Importance decides which memories survive when the injected memory block is over budget: high scores stay in context, low scores drop first. So the score is only useful if it **discriminates** — if most memories land in the same band, you have not classified them, you have just labelled them.
@@ -177956,14 +178258,15 @@ ${renderPool(args.memories)}`;
 var SCOPES = new Set(["project", "ecosystem", "universe"]);
 function parseClassifyManifest(text) {
   const out = [];
-  for (const m of text.matchAll(/<memory\b([^>]*)\/?>/g)) {
+  const body = extractCompleteManifestBody(text, "classify");
+  for (const m of body.matchAll(/<memory\b([^>]*)\/?>/g)) {
     const attrs = m[1];
     const idMatch = attrs.match(/\bid\s*=\s*"(\d+)"/);
     if (!idMatch)
-      continue;
+      throw new Error("classify manifest entry missing numeric id");
     const id = Number.parseInt(idMatch[1], 10);
     if (!Number.isInteger(id))
-      continue;
+      throw new Error("classify manifest entry missing numeric id");
     const entry = { id };
     const impMatch = attrs.match(/\bimportance\s*=\s*"(\d+)"/);
     if (impMatch) {
@@ -177972,18 +178275,23 @@ function parseClassifyManifest(text) {
         entry.importance = Math.max(1, Math.min(100, imp));
     }
     const scopeMatch = attrs.match(/\bscope\s*=\s*"([a-z]+)"/i);
-    if (scopeMatch && SCOPES.has(scopeMatch[1].toLowerCase())) {
-      entry.scope = scopeMatch[1].toLowerCase();
+    if (scopeMatch) {
+      const scope = scopeMatch[1].toLowerCase();
+      if (!SCOPES.has(scope))
+        throw new Error(`classify manifest invalid scope ${scope}`);
+      entry.scope = scope;
     }
     const shareMatch = attrs.match(/\bshareable\s*=\s*"(true|false|1|0)"/i);
     if (shareMatch) {
       const v = shareMatch[1].toLowerCase();
       entry.shareable = v === "true" || v === "1";
     }
-    if (entry.importance !== undefined || entry.scope || entry.shareable !== undefined) {
-      out.push(entry);
+    if (entry.importance === undefined && !entry.scope && entry.shareable === undefined) {
+      throw new Error(`classify manifest entry ${id} missing classification fields`);
     }
+    out.push(entry);
   }
+  assertNoDuplicateManifestIds(out.map((entry) => entry.id), "classify");
   return out;
 }
 
@@ -178118,9 +178426,13 @@ async function classifyOneChunk(args, chunk, anchors, sliceMs, signal) {
         });
       },
       validateOutput: (messages) => {
+        if (hasLengthCappedOutput(messages)) {
+          throw new Error("classify returned length-capped output");
+        }
         const text = extractLatestAssistantText(messages);
         if (!text)
           throw new Error("classify returned no output");
+        parseClassifyManifest(text);
         return text;
       }
     });
@@ -178146,17 +178458,13 @@ async function classifyOneChunk(args, chunk, anchors, sliceMs, signal) {
 }
 function applyClassifications(args, chunk, manifestText) {
   const byId = new Map(chunk.map((m) => [m.id, m]));
-  const parsed = parseClassifyManifest(manifestText).filter((p) => byId.has(p.id));
+  const parsed = parseClassifyManifest(manifestText);
+  assertManifestCoversExactly(parsed.map((entry) => entry.id), new Set(byId.keys()), "classify");
   if (parsed.length === 0)
     return { classified: 0, changed: 0 };
   let classified = 0;
   let changed = 0;
-  let leaseLost = false;
-  args.db.transaction(() => {
-    if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-      leaseLost = true;
-      return;
-    }
+  runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
     for (const p of parsed) {
       const memory = byId.get(p.id);
       if (!memory)
@@ -178171,9 +178479,7 @@ function applyClassifications(args, chunk, manifestText) {
       if (didChange)
         changed += 1;
     }
-  })();
-  if (leaseLost)
-    throw new Error("Dream lease lost during classify commit");
+  });
   return { classified, changed };
 }
 function recordInvocation(args, startedAt, params) {
@@ -178221,9 +178527,11 @@ var SMART_NOTE_CHECK_LIVENESS_RECHECK_MS = 24 * 60 * 60 * 1000;
 
 class SmartNoteNetworkError extends Error {
   isSmartNoteNetworkError = true;
-  constructor(message) {
+  terminal;
+  constructor(message, options = {}) {
     super(message);
     this.name = "SmartNoteNetworkError";
+    this.terminal = options.terminal ?? false;
   }
 }
 
@@ -178236,6 +178544,9 @@ class SmartNoteSecurityError extends Error {
 }
 function isSmartNoteNetworkError(error51) {
   return error51 instanceof SmartNoteNetworkError || error51 instanceof Error && (error51.name === "SmartNoteNetworkError" || error51.message.includes("SmartNoteNetworkError") || error51.message.includes("SMART_NOTE_NETWORK"));
+}
+function isTerminalSmartNoteNetworkError(error51) {
+  return error51 instanceof SmartNoteNetworkError && error51.terminal;
 }
 function parseSmartNoteManifest(json2) {
   if (!json2)
@@ -178266,6 +178577,7 @@ function stringArray(value) {
 var DNS_TIMEOUT_MS = 3000;
 var DEFAULT_HTTP_TIMEOUT_MS = 5000;
 var DEFAULT_HTTP_BODY_LIMIT_BYTES = 64 * 1024;
+var MAX_HTTP_ADDRESS_CANDIDATES = 4;
 var defaultResolver = {
   async lookup(hostname3, signal) {
     return await withAbortAndTimeout(dnsLookup(hostname3, { all: true, verbatim: true }), signal, DNS_TIMEOUT_MS, "DNS lookup timed out").then((rows) => rows.filter((row) => row.family === 4 || row.family === 6).map((row) => ({ address: row.address, family: row.family })));
@@ -178302,18 +178614,21 @@ async function guardedSmartNoteHttpGet(input, options) {
   });
   const timeoutMs = options.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
   const bodyLimitBytes = options.bodyLimitBytes ?? DEFAULT_HTTP_BODY_LIMIT_BYTES;
+  const requestAddress = options.requestAddress ?? requestValidatedAddress;
+  const candidates = validation.addresses.slice(0, MAX_HTTP_ADDRESS_CANDIDATES);
   let lastError;
-  for (const candidate of validation.addresses) {
+  for (const candidate of candidates) {
     try {
-      return await requestValidatedAddress(validation, candidate, {
+      return await requestAddress(validation, candidate, {
         signal: options.signal,
         timeoutMs,
         bodyLimitBytes
       });
     } catch (error51) {
       lastError = error51;
-      if (error51 instanceof SmartNoteSecurityError || options.signal.aborted)
+      if (error51 instanceof SmartNoteSecurityError || options.signal.aborted || isTerminalSmartNoteNetworkError(error51)) {
         throw error51;
+      }
     }
   }
   throw toNetworkError(lastError, "all validated addresses failed");
@@ -178383,7 +178698,7 @@ function requestValidatedAddress(validation, candidate, options) {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         bytes += buf.byteLength;
         if (bytes > options.bodyLimitBytes) {
-          reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: response body too large"));
+          reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: response body too large", { terminal: true }));
           response.destroy();
           request2.destroy();
           return;
@@ -178408,7 +178723,9 @@ function requestValidatedAddress(validation, candidate, options) {
     };
     options.signal.addEventListener("abort", onAbort, { once: true });
     request2.on("timeout", () => {
-      reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out"));
+      reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out", {
+        terminal: true
+      }));
       request2.destroy();
     });
     request2.on("error", (error51) => {
@@ -178757,6 +179074,20 @@ function withSandboxLock(fn) {
 var DEFAULT_TIMEOUT_MS = 2000;
 var DEFAULT_HEAP_LIMIT_BYTES = 8 * 1024 * 1024;
 var DEFAULT_STACK_LIMIT_BYTES = 512 * 1024;
+function resolveCapabilitiesForRun(options, signal) {
+  if (options.capabilityFactory) {
+    return options.capabilityFactory(signal);
+  }
+  if (options.capabilities) {
+    return options.capabilities;
+  }
+  throw new Error("smart-note check requires capabilities");
+}
+function throwIfRunAborted(signal) {
+  if (signal.aborted) {
+    throw signal.reason ?? new Error("smart-note check aborted");
+  }
+}
 async function runCompiledSmartNoteCheck(options) {
   return withSandboxLock(() => runCompiledSmartNoteCheckLocked(options));
 }
@@ -178764,17 +179095,24 @@ async function runCompiledSmartNoteCheckLocked(options) {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const controller = new AbortController;
   const externalAbort = () => controller.abort(options.signal?.reason);
-  options.signal?.addEventListener("abort", externalAbort, { once: true });
+  if (options.signal?.aborted) {
+    externalAbort();
+  } else {
+    options.signal?.addEventListener("abort", externalAbort, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(new Error("smart-note check timed out")), timeoutMs);
   try {
+    throwIfRunAborted(controller.signal);
+    const capabilities = resolveCapabilitiesForRun(options, controller.signal);
     const deadline = Date.now() + timeoutMs;
     const quickjs = await getAsyncModule();
+    throwIfRunAborted(controller.signal);
     const context = quickjs.newContext();
     try {
       context.runtime.setMemoryLimit(options.heapLimitBytes ?? DEFAULT_HEAP_LIMIT_BYTES);
       context.runtime.setMaxStackSize(options.stackLimitBytes ?? DEFAULT_STACK_LIMIT_BYTES);
       context.runtime.setInterruptHandler(() => controller.signal.aborted || Date.now() > deadline);
-      installCapabilityObject(context, options.capabilities);
+      installCapabilityObject(context, capabilities);
       disableAmbientDynamicCode(context);
       const result = await evalCheck(context, options.compiledCheck);
       const checkResult = result;
@@ -178927,6 +179265,7 @@ Remember: output only the JSON object described by the system prompt.`;
       }
     }, {
       timeoutMs: remainingMs,
+      signal: args.signal,
       fallbackModels: args.fallbackModels,
       callContext: "dreamer:smart-note-compiler",
       fetchOutput: async () => {
@@ -178951,7 +179290,8 @@ Remember: output only the JSON object described by the system prompt.`;
     }
     const dryRun = await runCompiledSmartNoteCheck({
       compiledCheck,
-      capabilities: args.capabilities,
+      capabilityFactory: args.capabilityFactory,
+      signal: args.signal,
       timeoutMs: 2000
     });
     if (!dryRun.ok) {
@@ -179099,7 +179439,9 @@ function nextSmartNoteCheckDueAt(cron, options = {}) {
   const rawNext = cron?.trim() ? nextDueAtMs(cron, now) : null;
   const rawDelta = rawNext ? rawNext - now : SMART_NOTE_CHECK_DEFAULT_INTERVAL_MS;
   const clamped = Math.min(ceilingMs, Math.max(floorMs, rawDelta));
-  return now + clamped + deterministicJitterMs(clamped, options.noteId, options.hash);
+  const jittered = clamped + deterministicJitterMs(clamped, options.noteId, options.hash);
+  const bounded = Math.min(ceilingMs, Math.max(floorMs, jittered));
+  return now + bounded;
 }
 function deterministicJitterMs(intervalMs, noteId, hash2) {
   const max = Math.min(60000, Math.floor(intervalMs * 0.1));
@@ -179268,9 +179610,9 @@ async function runDueCompiledSmartNoteChecks(args) {
     try {
       const result = await runCompiledSmartNoteCheck({
         compiledCheck: note.compiledCheck,
-        capabilities: createSmartNoteCapabilities({
+        capabilityFactory: (signal) => createSmartNoteCapabilities({
           projectRoot: args.projectRoot,
-          signal: controller.signal
+          signal
         }),
         signal: controller.signal,
         timeoutMs: Math.min(2000, remaining)
@@ -179333,6 +179675,24 @@ var MAX_COMPILE_PER_RUN = 5;
 var MAX_FALLBACK_PER_RUN = 3;
 var MAX_COMPILATION_FAILURES = 3;
 var SMART_NOTE_CONFIRMATION_SYSTEM_PROMPT = 'You are a no-tool smart-note confirmation evaluator. Output only JSON shaped as {"met": boolean}. Return true only when the supplied text alone proves the condition is satisfied.';
+function createPromptAbortSignal(parent, timeoutMs, timeoutMessage) {
+  const controller = new AbortController;
+  const abortFromParent = () => {
+    controller.abort(parent.reason ?? new Error("smart-note prompt aborted by lease loss"));
+  };
+  if (parent.aborted)
+    abortFromParent();
+  else
+    parent.addEventListener("abort", abortFromParent, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error(timeoutMessage)), timeoutMs);
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      parent.removeEventListener("abort", abortFromParent);
+    }
+  };
+}
 async function evaluateSmartNotes(args) {
   const projectRoot = args.sessionDirectory ?? args.projectIdentity;
   const pendingAtStart = getPendingSmartNotes(args.db, args.projectIdentity).length;
@@ -179341,6 +179701,7 @@ async function evaluateSmartNotes(args) {
     return { surfaced: 0, pending: 0, ran: false };
   }
   let leaseLost = false;
+  const leaseAbortController = new AbortController;
   const leaseHeld = () => !leaseLost && peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey);
   const assertLeaseHeld = (phase) => {
     if (!leaseHeld()) {
@@ -179350,6 +179711,7 @@ async function evaluateSmartNotes(args) {
   };
   const heartbeat = startLeaseHeartbeat(args.db, args.holderId, args.leaseKey, () => {
     leaseLost = true;
+    leaseAbortController.abort(new Error("Dream lease lost during smart notes"));
     log("[dreamer] smart notes: lease lost — aborting");
     args.onLeaseLost?.("smart notes");
   });
@@ -179372,7 +179734,7 @@ async function evaluateSmartNotes(args) {
         break;
       assertLeaseHeld("compile start");
       didWork = true;
-      const compiled = await compileNote(args, note, projectRoot, assertLeaseHeld, leaseHeld);
+      const compiled = await compileNote(args, note, projectRoot, assertLeaseHeld, leaseHeld, leaseAbortController.signal);
       if (compiled)
         surfaced += 1;
     }
@@ -179392,7 +179754,7 @@ async function evaluateSmartNotes(args) {
         break;
       assertLeaseHeld("fallback start");
       didWork = true;
-      const met = await confirmReadOnly(args, note.id, note.content, note.surfaceCondition);
+      const met = await confirmReadOnly(args, note.id, note.content, note.surfaceCondition, leaseAbortController.signal);
       const now = Date.now();
       assertLeaseHeld("fallback commit");
       commitSmartNoteState(args.db, {
@@ -179418,9 +179780,8 @@ async function evaluateSmartNotes(args) {
     heartbeat.stop();
   }
 }
-async function compileNote(args, note, projectRoot, assertLeaseHeld, leaseHeld) {
-  const controller = new AbortController;
-  const timer = setTimeout(() => controller.abort(new Error("smart-note compile deadline")), Math.max(1000, args.deadline - Date.now()));
+async function compileNote(args, note, projectRoot, assertLeaseHeld, leaseHeld, leaseSignal) {
+  const promptSignal = createPromptAbortSignal(leaseSignal, Math.max(1000, args.deadline - Date.now()), "smart-note compile deadline");
   try {
     const result = await compileSmartNoteCheck({
       client: args.client,
@@ -179429,7 +179790,8 @@ async function compileNote(args, note, projectRoot, assertLeaseHeld, leaseHeld) 
       sessionDirectory: args.sessionDirectory,
       projectIdentity: args.projectIdentity,
       note,
-      capabilities: createSmartNoteCapabilities({ projectRoot, signal: controller.signal }),
+      capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
+      signal: promptSignal.signal,
       deadline: args.deadline,
       model: args.model,
       fallbackModels: args.fallbackModels
@@ -179474,7 +179836,7 @@ async function compileNote(args, note, projectRoot, assertLeaseHeld, leaseHeld) 
     });
     return result.dryRun.met;
   } finally {
-    clearTimeout(timer);
+    promptSignal.cleanup();
   }
 }
 async function runLivenessCheck(args, note, projectRoot, assertLeaseHeld, leaseHeld) {
@@ -179485,7 +179847,7 @@ async function runLivenessCheck(args, note, projectRoot, assertLeaseHeld, leaseH
   try {
     const result = await runCompiledSmartNoteCheck({
       compiledCheck: note.compiledCheck,
-      capabilities: createSmartNoteCapabilities({ projectRoot, signal: controller.signal }),
+      capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
       signal: controller.signal,
       timeoutMs: 2000
     });
@@ -179514,7 +179876,7 @@ async function runLivenessCheck(args, note, projectRoot, assertLeaseHeld, leaseH
     clearTimeout(timer);
   }
 }
-async function confirmReadOnly(args, noteId, content, surfaceCondition) {
+async function confirmReadOnly(args, noteId, content, surfaceCondition, leaseSignal) {
   let childSessionId = null;
   const startedAt = Date.now();
   let invocationRecorded = false;
@@ -179557,42 +179919,49 @@ Note content: ${JSON.stringify(content)}
 Surface condition: ${JSON.stringify(surfaceCondition ?? "")}
 
 Output exactly JSON: {"met": false}`;
-    const run = await promptSyncWithValidatedOutputRetry(args.client, {
-      path: { id: childSessionId },
-      query: { directory: args.sessionDirectory ?? args.projectIdentity },
-      body: {
-        agent: SMART_NOTE_COMPILER_AGENT,
-        system: SMART_NOTE_CONFIRMATION_SYSTEM_PROMPT,
-        ...modelBodyField(args.model),
-        parts: [{ type: "text", text: prompt, synthetic: true }]
-      }
-    }, {
-      timeoutMs: Math.max(1000, args.deadline - Date.now()),
-      fallbackModels: args.fallbackModels,
-      callContext: "dreamer:smart-note-read-only-confirm",
-      fetchOutput: async () => {
-        const messagesResponse = await args.client.session.messages({
-          path: { id: childSessionId },
-          query: {
-            directory: args.sessionDirectory ?? args.projectIdentity,
-            limit: 20
-          }
-        });
-        return normalizeSDKResponse(messagesResponse, [], {
-          preferResponseOnMissingData: true
-        });
-      },
-      validateOutput: (messages) => {
-        const text = extractLatestAssistantText(messages) ?? "";
-        const match = text.match(/\{[\s\S]*\}/);
-        if (!match)
-          throw new Error("confirmation evaluator returned no JSON");
-        const parsed = JSON.parse(match[0]);
-        if (typeof parsed.met !== "boolean")
-          throw new Error("confirmation met missing");
-        return parsed.met;
-      }
-    });
+    const promptSignal = createPromptAbortSignal(leaseSignal, Math.max(1000, args.deadline - Date.now()), "smart-note confirmation deadline");
+    let run;
+    try {
+      run = await promptSyncWithValidatedOutputRetry(args.client, {
+        path: { id: childSessionId },
+        query: { directory: args.sessionDirectory ?? args.projectIdentity },
+        body: {
+          agent: SMART_NOTE_COMPILER_AGENT,
+          system: SMART_NOTE_CONFIRMATION_SYSTEM_PROMPT,
+          ...modelBodyField(args.model),
+          parts: [{ type: "text", text: prompt, synthetic: true }]
+        }
+      }, {
+        timeoutMs: Math.max(1000, args.deadline - Date.now()),
+        signal: promptSignal.signal,
+        fallbackModels: args.fallbackModels,
+        callContext: "dreamer:smart-note-read-only-confirm",
+        fetchOutput: async () => {
+          const messagesResponse = await args.client.session.messages({
+            path: { id: childSessionId },
+            query: {
+              directory: args.sessionDirectory ?? args.projectIdentity,
+              limit: 20
+            }
+          });
+          return normalizeSDKResponse(messagesResponse, [], {
+            preferResponseOnMissingData: true
+          });
+        },
+        validateOutput: (messages) => {
+          const text = extractLatestAssistantText(messages) ?? "";
+          const match = text.match(/\{[\s\S]*\}/);
+          if (!match)
+            throw new Error("confirmation evaluator returned no JSON");
+          const parsed = JSON.parse(match[0]);
+          if (typeof parsed.met !== "boolean")
+            throw new Error("confirmation met missing");
+          return parsed.met;
+        }
+      });
+    } finally {
+      promptSignal.cleanup();
+    }
     recordInvocation2({ status: "completed", messages: run.output });
     return run.validated;
   } catch (error51) {
@@ -179807,19 +180176,21 @@ ${list}
 }
 function parseMapMemoriesManifest(text) {
   const out = [];
-  for (const m of text.matchAll(/<memory\b([^>]*)\/?>/g)) {
+  const body = extractCompleteManifestBody(text, "mappings");
+  for (const m of body.matchAll(/<memory\b([^>]*)\/?>/g)) {
     const attrs = m[1];
     const idMatch = attrs.match(/\bid\s*=\s*"(\d+)"/);
     if (!idMatch)
-      continue;
+      throw new Error("mappings manifest entry missing numeric id");
     const id = Number.parseInt(idMatch[1], 10);
     if (!Number.isInteger(id))
-      continue;
+      throw new Error("mappings manifest entry missing numeric id");
     const independent = /\bindependent\s*=\s*"(?:true|1)"/i.test(attrs);
     const filesMatch = attrs.match(/\bfiles\s*=\s*"([^"]*)"/);
     const files = filesMatch ? filesMatch[1].split(",").map((f) => f.trim()).filter(Boolean) : [];
     out.push({ id, files, independent: independent || files.length === 0 });
   }
+  assertNoDuplicateManifestIds(out.map((entry) => entry.id), "mappings");
   return out;
 }
 
@@ -179908,9 +180279,13 @@ async function mapOneBatch(args, batch, sliceMs, signal) {
         });
       },
       validateOutput: (messages) => {
+        if (hasLengthCappedOutput(messages)) {
+          throw new Error("map-memories returned length-capped output");
+        }
         const text = extractLatestAssistantText(messages);
         if (!text)
           throw new Error("map-memories returned no output");
+        parseMapMemoriesManifest(text);
         return text;
       }
     });
@@ -179936,7 +180311,8 @@ async function mapOneBatch(args, batch, sliceMs, signal) {
 }
 async function applyBatchMappings(args, batch, manifestText) {
   const batchIds = new Set(batch.map((m) => m.id));
-  const parsed = parseMapMemoriesManifest(manifestText).filter((p) => batchIds.has(p.id));
+  const parsed = parseMapMemoriesManifest(manifestText);
+  assertManifestCoversExactly(parsed.map((entry) => entry.id), batchIds, "mappings");
   if (parsed.length === 0)
     return { mapped: 0, independent: 0 };
   const planned = [];
@@ -179958,12 +180334,7 @@ async function applyBatchMappings(args, batch, manifestText) {
   const now = Date.now();
   let mapped = 0;
   let independent = 0;
-  let leaseLost = false;
-  args.db.transaction(() => {
-    if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-      leaseLost = true;
-      return;
-    }
+  runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
     for (const item of planned) {
       recordMemoryMapping(args.db, item.id, item.files, now);
       if (item.independent)
@@ -179971,9 +180342,7 @@ async function applyBatchMappings(args, batch, manifestText) {
       else
         mapped += 1;
     }
-  })();
-  if (leaseLost)
-    throw new Error("Dream lease lost during map-memories commit");
+  });
   return { mapped, independent };
 }
 function recordInvocation2(args, startedAt, params) {
@@ -180201,11 +180570,7 @@ async function promotePrimers(args) {
       activePrimers: primers,
       threshold: PRIMER_CLUSTER_THRESHOLD
     });
-    args.db.transaction(() => {
-      if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-        leaseLost = true;
-        return;
-      }
+    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
       for (const cluster of clusters) {
         if (cluster.candidates.length === 0)
           continue;
@@ -180236,7 +180601,7 @@ async function promotePrimers(args) {
         });
         result.promoted += 1;
       }
-    })();
+    });
     if (leaseLost)
       throw new Error("Dream lease lost during promote-primers commit");
     log(`[dreamer] primers: candidates=${result.candidates} promoted=${result.promoted} updated=${result.updated}`);
@@ -180504,16 +180869,9 @@ async function refreshOnePrimer(args, primer, sliceMs, signal) {
       log(`[dreamer] refresh-primers: primer #${primer.id} answer not committed (no investigation tool calls)`);
       return false;
     }
-    let leaseLost = false;
-    args.db.transaction(() => {
-      if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-        leaseLost = true;
-        return;
-      }
+    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
       updatePrimerAnswer(args.db, primer.id, answer);
-    })();
-    if (leaseLost)
-      throw new Error("Dream lease lost during refresh-primers commit");
+    });
     return true;
   } catch (error51) {
     const desc = describeError(error51);
@@ -180710,8 +181068,7 @@ class OpenCodeRetrospectiveRawProvider {
                    LEFT JOIN session_meta m ON m.session_id = sp.session_id
                   WHERE sp.project_path = ? AND sp.harness = 'opencode'
                     AND COALESCE(m.is_subagent, 0) = 0
-                  ORDER BY sp.updated_at DESC, sp.session_id DESC
-                  LIMIT ?`).all(projectIdentity, RETROSPECTIVE_MAX_SESSIONS_PER_RUN);
+                  ORDER BY sp.updated_at ASC, sp.session_id ASC`).all(projectIdentity);
     return rows.map((row) => ({
       sessionId: row.session_id,
       updatedAt: typeof row.updated_at === "number" ? row.updated_at : undefined
@@ -180736,6 +181093,12 @@ class OpenCodeRetrospectiveRawProvider {
       return { messages: [], truncated: false };
     }
   }
+  readOldestMessageTimesSince(sessionIds, sinceMs) {
+    const db = this.resolveDb();
+    if (!db || sessionIds.length === 0)
+      return new Map;
+    return readOpenCodeOldestMessageTimesSince(db, sessionIds, sinceMs);
+  }
   readUserMessagesBefore(sessionId, beforeMs, count) {
     const db = this.resolveDb();
     if (!db)
@@ -180757,13 +181120,28 @@ class OpenCodeRetrospectiveRawProvider {
 async function readRetrospectiveScanWindow(provider2, projectIdentity, watermarkMs, overlapUserCount, options) {
   const maxMessages = options?.maxMessagesPerRun ?? RETROSPECTIVE_MAX_MESSAGES_PER_RUN;
   const capPerSession = options?.capPerSession ?? RETROSPECTIVE_MAX_MESSAGES_PER_SESSION;
-  const sessionReadPageSize = Math.max(1, Math.floor(options?.maxSessionsPerRun ?? RETROSPECTIVE_MAX_SESSIONS_PER_RUN));
+  const sessionLimit = Math.max(1, Math.floor(options?.maxSessionsPerRun ?? RETROSPECTIVE_MAX_SESSIONS_PER_RUN));
   try {
-    const sessions = await provider2.listProjectSessions(projectIdentity);
+    const allSessions = await provider2.listProjectSessions(projectIdentity);
+    const eligibleSessions = allSessions.map((session, index) => ({ session, index })).filter(({ session }) => (session.updatedAt ?? Number.POSITIVE_INFINITY) > watermarkMs);
+    const oldestBySession = provider2.readOldestMessageTimesSince ? await provider2.readOldestMessageTimesSince(eligibleSessions.map(({ session }) => session.sessionId), watermarkMs) : null;
+    const sessions = (oldestBySession ? eligibleSessions.filter(({ session }) => oldestBySession.has(session.sessionId)) : eligibleSessions).sort((a, b) => {
+      const aFrontier = oldestBySession?.get(a.session.sessionId);
+      const bFrontier = oldestBySession?.get(b.session.sessionId);
+      if (aFrontier !== undefined || bFrontier !== undefined) {
+        return (aFrontier ?? Number.POSITIVE_INFINITY) - (bFrontier ?? Number.POSITIVE_INFINITY) || a.index - b.index;
+      }
+      const aUpdated = a.session.updatedAt ?? Number.POSITIVE_INFINITY;
+      const bUpdated = b.session.updatedAt ?? Number.POSITIVE_INFINITY;
+      const byUpdated = aUpdated - bUpdated;
+      return byUpdated || a.index - b.index;
+    });
+    const sessionsToRead = sessions.slice(0, sessionLimit).map(({ session }) => session);
+    const firstExcludedSession = sessions[sessionLimit]?.session;
+    const firstExcludedPendingTs = firstExcludedSession ? oldestBySession?.get(firstExcludedSession.sessionId) : undefined;
     const sinceReads = [];
-    for (let i = 0;i < sessions.length; i += sessionReadPageSize) {
-      const page = sessions.slice(i, i + sessionReadPageSize);
-      sinceReads.push(...await Promise.all(page.map((session) => provider2.readUserMessagesSince(session.sessionId, watermarkMs, capPerSession))));
+    if (sessionsToRead.length > 0) {
+      sinceReads.push(...await Promise.all(sessionsToRead.map((session) => provider2.readUserMessagesSince(session.sessionId, watermarkMs, capPerSession))));
     }
     let saturatedFrontier = Number.POSITIVE_INFINITY;
     for (const read of sinceReads) {
@@ -180785,9 +181163,14 @@ async function readRetrospectiveScanWindow(provider2, projectIdentity, watermark
     if (firstDropped) {
       frontier = Math.min(frontier, firstDropped.ts - 1);
     }
+    if (typeof firstExcludedPendingTs === "number") {
+      frontier = Math.min(frontier, firstExcludedPendingTs - 1);
+    } else if (typeof firstExcludedSession?.updatedAt === "number") {
+      frontier = Math.min(frontier, firstExcludedSession.updatedAt - 1);
+    }
     maxScannedTs = Math.max(watermarkMs, Math.min(maxScannedTs, frontier));
     const keptSessionIds = new Set(keptSince.map((message) => message.sessionId));
-    const overlapSessions = sessions.filter((session) => keptSessionIds.has(session.sessionId));
+    const overlapSessions = sessionsToRead.filter((session) => keptSessionIds.has(session.sessionId));
     const overlapBatches = overlapUserCount > 0 && watermarkMs > 0 ? await Promise.all(overlapSessions.map((session) => provider2.readUserMessagesBefore(session.sessionId, watermarkMs, overlapUserCount))) : [];
     const seen = new Set;
     const merged = [];
@@ -180814,6 +181197,24 @@ function readOpenCodeMessagesSince(db, sessionId, sinceMs, capPerSession) {
   const truncated = rows.length > limit;
   const kept = truncated ? rows.slice(0, limit) : rows;
   return { messages: normalizeOpenCodeRows(db, sessionId, kept), truncated };
+}
+function readOpenCodeOldestMessageTimesSince(db, sessionIds, sinceMs) {
+  const result = new Map;
+  const uniqueIds = Array.from(new Set(sessionIds.filter((id) => id.length > 0)));
+  const chunkSize = 500;
+  for (let i = 0;i < uniqueIds.length; i += chunkSize) {
+    const chunk = uniqueIds.slice(i, i + chunkSize);
+    const placeholders4 = chunk.map(() => "?").join(", ");
+    const rows = db.prepare(`SELECT session_id, MIN(time_created) AS oldest_ts
+                   FROM message
+                  WHERE time_created > ? AND session_id IN (${placeholders4})
+                  GROUP BY session_id`).all(sinceMs, ...chunk);
+    for (const row of rows) {
+      if (typeof row.oldest_ts === "number")
+        result.set(row.session_id, row.oldest_ts);
+    }
+  }
+  return result;
 }
 function readOpenCodeUserMessagesBefore(db, sessionId, beforeMs, count) {
   const want = Math.max(1, Math.floor(count));
@@ -181107,7 +181508,7 @@ async function partitionVerifyScope(args) {
       continue;
     }
     const files = v?.files ?? [];
-    const needs = files.some((file2) => !verificationFileExists(gitRoot, file2) || uncommitted.has(file2) || (changeTimes.get(file2) ?? 0) > verifiedAt);
+    const needs = files.some((file2) => !verificationFileExists(gitRoot, file2) || uncommitted.has(file2) || (changeTimes.get(file2) ?? 0) >= verifiedAt - 1000);
     if (needs)
       inScope.push(toPrompt(m));
     else
@@ -181173,22 +181574,26 @@ function filesOf(s) {
 }
 function parseVerifyManifest(text) {
   const out = { verified: [], updated: [], archived: [] };
-  for (const m of text.matchAll(/<verified\b([^>]*)\/?>/g)) {
+  const body = extractCompleteManifestBody(text, "verify");
+  for (const m of body.matchAll(/<verified\b([^>]*)\/?>/g)) {
     const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
-    if (Number.isInteger(id))
-      out.verified.push({ id, files: filesOf(m[1]) });
+    if (!Number.isInteger(id))
+      throw new Error("verify manifest entry missing numeric id");
+    out.verified.push({ id, files: filesOf(m[1]) });
   }
-  for (const m of text.matchAll(/<update\b([^>]*?)(?:\/>|>([\s\S]*?)<\/update>)/g)) {
+  for (const m of body.matchAll(/<update\b([^>]*?)(?:\/>|>([\s\S]*?)<\/update>)/g)) {
     const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
-    if (Number.isInteger(id)) {
-      out.updated.push({ id, files: filesOf(m[1]), content: (m[2] ?? "").trim() });
-    }
+    if (!Number.isInteger(id))
+      throw new Error("verify manifest entry missing numeric id");
+    out.updated.push({ id, files: filesOf(m[1]), content: (m[2] ?? "").trim() });
   }
-  for (const m of text.matchAll(/<archive\b([^>]*)\/?>/g)) {
+  for (const m of body.matchAll(/<archive\b([^>]*)\/?>/g)) {
     const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
-    if (Number.isInteger(id))
-      out.archived.push({ id, reason: attrOf(m[1], "reason") ?? "" });
+    if (!Number.isInteger(id))
+      throw new Error("verify manifest entry missing numeric id");
+    out.archived.push({ id, reason: attrOf(m[1], "reason") ?? "" });
   }
+  assertNoDuplicateManifestIds([...out.verified, ...out.updated, ...out.archived].map((entry) => entry.id), "verify");
   return out;
 }
 
@@ -181281,9 +181686,13 @@ async function verifyOneBatch(args, batch, sliceMs, signal) {
         });
       },
       validateOutput: (messages) => {
+        if (hasLengthCappedOutput(messages)) {
+          throw new Error("verify returned length-capped output");
+        }
         const text = extractLatestAssistantText(messages);
         if (!text)
           throw new Error("verify returned no output");
+        parseVerifyManifest(text);
         return text;
       }
     });
@@ -181310,24 +181719,14 @@ async function verifyOneBatch(args, batch, sliceMs, signal) {
 async function applyVerifyManifest(args, batch, manifestText) {
   const batchIds = new Set(batch.map((m) => m.id));
   const parsed = parseVerifyManifest(manifestText);
+  assertManifestCoversExactly([...parsed.verified, ...parsed.updated, ...parsed.archived].map((entry) => entry.id), batchIds, "verify");
   const now = Date.now();
   const writes = [];
-  const verdictCounts = new Map;
-  for (const verdict of [...parsed.verified, ...parsed.updated, ...parsed.archived]) {
-    if (!batchIds.has(verdict.id))
-      continue;
-    verdictCounts.set(verdict.id, (verdictCounts.get(verdict.id) ?? 0) + 1);
-  }
-  const conflictingIds = new Set(Array.from(verdictCounts.entries()).filter(([, count]) => count !== 1).map(([id]) => id));
   for (const v of parsed.verified) {
-    if (!batchIds.has(v.id) || conflictingIds.has(v.id))
-      continue;
     const files = await normalizeFiles(args, v.files);
     writes.push({ kind: "verify", id: v.id, files });
   }
   for (const u of parsed.updated) {
-    if (!batchIds.has(u.id) || conflictingIds.has(u.id))
-      continue;
     const content = u.content.trim();
     if (!content || content.length > 20000) {
       const files2 = await normalizeFiles(args, u.files);
@@ -181344,8 +181743,6 @@ async function applyVerifyManifest(args, batch, manifestText) {
     });
   }
   for (const a of parsed.archived) {
-    if (!batchIds.has(a.id) || conflictingIds.has(a.id))
-      continue;
     writes.push({ kind: "archive", id: a.id, reason: a.reason });
   }
   if (writes.length === 0)
@@ -181353,12 +181750,7 @@ async function applyVerifyManifest(args, batch, manifestText) {
   let verified = 0;
   let updated = 0;
   let archived = 0;
-  let leaseLost = false;
-  args.db.transaction(() => {
-    if (!peekLeaseHolderAndExpiry(args.db, args.holderId, args.leaseKey)) {
-      leaseLost = true;
-      return;
-    }
+  runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
     for (const w of writes) {
       const memory = getMemoryById(args.db, w.id);
       if (!isPrimaryMutable(memory))
@@ -181386,9 +181778,7 @@ async function applyVerifyManifest(args, batch, manifestText) {
         archived += 1;
       }
     }
-  })();
-  if (leaseLost)
-    throw new Error("Dream lease lost during verify commit");
+  });
   return { verified, updated, archived };
 }
 async function normalizeFiles(args, rawFiles) {
@@ -181882,11 +182272,7 @@ async function runRetrospectiveTask(config2, ctx, helpers) {
       throw new Error("Dream lease lost during retrospective");
     const sourceSessionId = flagged[0]?.sessionId ?? userMessages[0]?.sessionId ?? "retrospective";
     const learnings = parseRetrospectiveLearnings(deepenRun.validated);
-    const applied = db.transaction(() => {
-      if (!peekLeaseHolderAndExpiry(db, holderId, leaseKey)) {
-        leaseLost = true;
-        return null;
-      }
+    const applied = runLeaseGuardedWrite(db, holderId, leaseKey, () => {
       const result = applyRetrospectiveLearnings({
         db,
         projectIdentity,
@@ -181897,7 +182283,7 @@ async function runRetrospectiveTask(config2, ctx, helpers) {
       });
       recordRetrospectiveWindowProcessed(db, projectIdentity, windowKey);
       return result;
-    })();
+    });
     if (leaseLost || !applied)
       throw new Error("Dream lease lost during retrospective commit");
     log(`[dreamer] retrospective: flagged=${flagged.length} learnings=${learnings.length} memory=${applied.memoryWritten} observations=${applied.observationsInserted} dropped=${applied.observationsDropped} rejected=${applied.rejected.length}`);
@@ -183432,10 +183818,105 @@ function migrateLegacyExperimental(rawConfig, warnings) {
 
 // ../plugin/src/config/project-security.ts
 var HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"];
+var HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"];
 var AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"];
 var EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider"];
+var PERCENTAGE_THRESHOLD_REASON = "security: a repository may only raise compaction thresholds above the user's effective value; it cannot force earlier historian work or cloned-repo cost escalation.";
+var TOKEN_THRESHOLD_REASON = "security: a repository may only raise execute_threshold_tokens above the user's trusted token threshold; it cannot force earlier historian work or cloned-repo cost escalation.";
+var TOKEN_THRESHOLD_INTRODUCTION_REASON = "security: a repository cannot introduce a new execute_threshold_tokens override when the user has no trusted token threshold for that key; that could force earlier historian work or cloned-repo cost escalation.";
 function isPlainObject3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isValidPercentageThreshold(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 20 && value <= 80;
+}
+function isValidTokenThreshold(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 5000 && value <= 2000000;
+}
+function normalizeTrustedPercentageThresholds(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return { defaultValue: value, overrides: new Map };
+  }
+  if (isPlainObject3(value) && typeof value.default === "number" && Number.isFinite(value.default)) {
+    const overrides = new Map;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "default")
+        continue;
+      if (typeof child === "number" && Number.isFinite(child)) {
+        overrides.set(key, child);
+      }
+    }
+    return { defaultValue: value.default, overrides };
+  }
+  return { defaultValue: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE, overrides: new Map };
+}
+function normalizeTrustedTokenThresholds(value) {
+  if (!isPlainObject3(value)) {
+    return { defaultValue: undefined, overrides: new Map };
+  }
+  const overrides = new Map;
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "default")
+      continue;
+    if (typeof child === "number" && Number.isFinite(child)) {
+      overrides.set(key, child);
+    }
+  }
+  return {
+    defaultValue: typeof value.default === "number" && Number.isFinite(value.default) ? value.default : undefined,
+    overrides
+  };
+}
+function clonePercentageThresholds(value) {
+  return {
+    defaultValue: value.defaultValue,
+    overrides: new Map(value.overrides)
+  };
+}
+function cloneTokenThresholds(value) {
+  return {
+    defaultValue: value.defaultValue,
+    overrides: new Map(value.overrides)
+  };
+}
+function percentageThresholdsEqual(left, right) {
+  if (left.defaultValue !== right.defaultValue)
+    return false;
+  if (left.overrides.size !== right.overrides.size)
+    return false;
+  for (const [key, value] of left.overrides) {
+    if (right.overrides.get(key) !== value)
+      return false;
+  }
+  return true;
+}
+function setMergedPercentageThreshold(mergedRaw, value) {
+  if (value.overrides.size === 0) {
+    mergedRaw.execute_threshold_percentage = value.defaultValue;
+    return;
+  }
+  const serialized = { default: value.defaultValue };
+  for (const [key, threshold] of value.overrides) {
+    serialized[key] = threshold;
+  }
+  mergedRaw.execute_threshold_percentage = serialized;
+}
+function setMergedTokenThreshold(mergedRaw, value) {
+  if (value.defaultValue === undefined && value.overrides.size === 0) {
+    delete mergedRaw.execute_threshold_tokens;
+    return;
+  }
+  const serialized = {};
+  if (value.defaultValue !== undefined) {
+    serialized.default = value.defaultValue;
+  }
+  for (const [key, threshold] of value.overrides) {
+    serialized[key] = threshold;
+  }
+  mergedRaw.execute_threshold_tokens = serialized;
+}
+function makeProjectThresholdWarning(field, reason) {
+  return `Ignoring ${field} from project config (${reason})`;
 }
 function stripUnsafeProjectConfigFields(projectRaw) {
   const warnings = [];
@@ -183464,6 +183945,19 @@ function stripUnsafeProjectConfigFields(projectRaw) {
       warnings.push(`Ignoring embedding.${removed.join("/")} from project config ` + "(security: a repository cannot choose where private text is embedded).");
     }
   }
+  const historian = projectRaw.historian;
+  if (isPlainObject3(historian)) {
+    const removed = [];
+    for (const field of HISTORIAN_USER_ONLY_FIELDS) {
+      if (field in historian) {
+        delete historian[field];
+        removed.push(field);
+      }
+    }
+    if (removed.length > 0) {
+      warnings.push(`Ignoring historian.${removed.join("/")} from project config ` + "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).");
+    }
+  }
   for (const agentKey of HIDDEN_AGENT_KEYS) {
     const block = projectRaw[agentKey];
     if (!isPlainObject3(block))
@@ -183477,6 +183971,101 @@ function stripUnsafeProjectConfigFields(projectRaw) {
     }
     if (removed.length > 0) {
       warnings.push(`Ignoring ${agentKey}.${removed.join("/")} from project config ` + "(security: a repository cannot reprogram or re-permission hidden agents).");
+    }
+  }
+  return warnings;
+}
+function constrainProjectThresholdOverrides(args) {
+  const warnings = [];
+  const basePercentage = normalizeTrustedPercentageThresholds(args.trustedBaseConfig.execute_threshold_percentage);
+  const baseTokens = normalizeTrustedTokenThresholds(args.trustedBaseConfig.execute_threshold_tokens);
+  if ("execute_threshold_percentage" in args.projectRaw) {
+    const projectValue = args.projectRaw.execute_threshold_percentage;
+    if (isValidPercentageThreshold(projectValue)) {
+      const constrained = clonePercentageThresholds(basePercentage);
+      constrained.defaultValue = Math.max(basePercentage.defaultValue, projectValue);
+      for (const [modelKey, threshold] of basePercentage.overrides) {
+        const raisedThreshold = Math.max(threshold, projectValue);
+        if (raisedThreshold === constrained.defaultValue) {
+          constrained.overrides.delete(modelKey);
+        } else {
+          constrained.overrides.set(modelKey, raisedThreshold);
+        }
+      }
+      setMergedPercentageThreshold(args.mergedRaw, constrained);
+      if (percentageThresholdsEqual(constrained, basePercentage)) {
+        warnings.push(makeProjectThresholdWarning("execute_threshold_percentage", PERCENTAGE_THRESHOLD_REASON));
+      }
+    } else if (isPlainObject3(projectValue)) {
+      const constrained = clonePercentageThresholds(basePercentage);
+      let touchedValidEntry = false;
+      if (isValidPercentageThreshold(projectValue.default)) {
+        touchedValidEntry = true;
+        if (projectValue.default > basePercentage.defaultValue) {
+          constrained.defaultValue = projectValue.default;
+        } else {
+          warnings.push(makeProjectThresholdWarning("execute_threshold_percentage.default", PERCENTAGE_THRESHOLD_REASON));
+        }
+      }
+      for (const [modelKey, rawValue] of Object.entries(projectValue)) {
+        if (modelKey === "default")
+          continue;
+        if (!isValidPercentageThreshold(rawValue))
+          continue;
+        touchedValidEntry = true;
+        const baseValue = basePercentage.overrides.get(modelKey) ?? basePercentage.defaultValue;
+        if (rawValue > baseValue) {
+          if (rawValue === constrained.defaultValue) {
+            constrained.overrides.delete(modelKey);
+          } else {
+            constrained.overrides.set(modelKey, rawValue);
+          }
+        } else {
+          warnings.push(makeProjectThresholdWarning(`execute_threshold_percentage.${modelKey}`, PERCENTAGE_THRESHOLD_REASON));
+        }
+      }
+      if (touchedValidEntry) {
+        setMergedPercentageThreshold(args.mergedRaw, constrained);
+      }
+    }
+  }
+  if ("execute_threshold_tokens" in args.projectRaw && isPlainObject3(args.projectRaw.execute_threshold_tokens)) {
+    const projectValue = args.projectRaw.execute_threshold_tokens;
+    const constrained = cloneTokenThresholds(baseTokens);
+    let touchedValidEntry = false;
+    if (isValidTokenThreshold(projectValue.default)) {
+      touchedValidEntry = true;
+      if (baseTokens.defaultValue === undefined) {
+        warnings.push(makeProjectThresholdWarning("execute_threshold_tokens.default", TOKEN_THRESHOLD_INTRODUCTION_REASON));
+      } else if (projectValue.default > baseTokens.defaultValue) {
+        constrained.defaultValue = projectValue.default;
+      } else {
+        warnings.push(makeProjectThresholdWarning("execute_threshold_tokens.default", TOKEN_THRESHOLD_REASON));
+      }
+    }
+    for (const [modelKey, rawValue] of Object.entries(projectValue)) {
+      if (modelKey === "default")
+        continue;
+      if (!isValidTokenThreshold(rawValue))
+        continue;
+      touchedValidEntry = true;
+      const baseValue = baseTokens.overrides.get(modelKey) ?? baseTokens.defaultValue;
+      if (baseValue === undefined) {
+        warnings.push(makeProjectThresholdWarning(`execute_threshold_tokens.${modelKey}`, TOKEN_THRESHOLD_INTRODUCTION_REASON));
+        continue;
+      }
+      if (rawValue > baseValue) {
+        if (rawValue === constrained.defaultValue) {
+          constrained.overrides.delete(modelKey);
+        } else {
+          constrained.overrides.set(modelKey, rawValue);
+        }
+      } else {
+        warnings.push(makeProjectThresholdWarning(`execute_threshold_tokens.${modelKey}`, TOKEN_THRESHOLD_REASON));
+      }
+    }
+    if (touchedValidEntry) {
+      setMergedTokenThreshold(args.mergedRaw, constrained);
     }
   }
   return warnings;
@@ -183848,6 +184437,7 @@ function loadPiConfig(opts = {}) {
     return a.scope === "user" ? -1 : 1;
   });
   const userRaw = mergeFiles.find((f) => f.scope === "user")?.config;
+  const trustedBaseConfig = parsePiConfig(userRaw ?? {}).config;
   for (const loaded of mergeFiles) {
     const prefix = loaded.scope === "user" ? "[user config]" : "[project config]";
     warnings.push(...loaded.warnings.map((warning) => `${prefix} ${warning}`));
@@ -183858,6 +184448,13 @@ function loadPiConfig(opts = {}) {
       }
       rawConfig = mergeRawConfigs(rawConfig, projectRaw);
       for (const warning of dropInheritedEmbeddingKeyOnRedirect(projectRaw, rawConfig, userRaw)) {
+        warnings.push(`${prefix} ${warning}`);
+      }
+      for (const warning of constrainProjectThresholdOverrides({
+        mergedRaw: rawConfig,
+        projectRaw,
+        trustedBaseConfig
+      })) {
         warnings.push(`${prefix} ${warning}`);
       }
     } else {
@@ -183958,6 +184555,7 @@ function loadPiConfigDetailed(opts = {}) {
     return a.scope === "user" ? -1 : 1;
   });
   const userRaw = mergeFiles.find((f) => f.scope === "user")?.config;
+  const trustedBaseConfig = parsePiConfig(userRaw ?? {}).config;
   for (const loaded of mergeFiles) {
     const prefix = loaded.scope === "user" ? "[user config]" : "[project config]";
     warnings.push(...loaded.warnings.map((warning) => `${prefix} ${warning}`));
@@ -183968,6 +184566,13 @@ function loadPiConfigDetailed(opts = {}) {
       }
       rawConfig = mergeRawConfigs(rawConfig, projectRaw);
       for (const warning of dropInheritedEmbeddingKeyOnRedirect(projectRaw, rawConfig, userRaw)) {
+        warnings.push(`${prefix} ${warning}`);
+      }
+      for (const warning of constrainProjectThresholdOverrides({
+        mergedRaw: rawConfig,
+        projectRaw,
+        trustedBaseConfig
+      })) {
         warnings.push(`${prefix} ${warning}`);
       }
     } else {
@@ -184048,6 +184653,8 @@ function isMidTurnPi(event, _sessionId) {
   }
   if (latestAssistant === null)
     return false;
+  if (hasRealUserAfter(messages, latestAssistantIndex))
+    return false;
   if (latestAssistant.stopReason === "toolUse")
     return true;
   const toolCallIds = getToolCallIds(latestAssistant.content);
@@ -184066,6 +184673,15 @@ function isMidTurnPi(event, _sessionId) {
   }
   for (const id of toolCallIds) {
     if (!pairedToolResultIds.has(id))
+      return true;
+  }
+  return false;
+}
+function hasRealUserAfter(messages, latestAssistantIndex) {
+  for (const msg of messages.slice(latestAssistantIndex + 1)) {
+    if (msg === null || typeof msg !== "object")
+      continue;
+    if (msg.role === "user")
       return true;
   }
   return false;
@@ -186162,6 +186778,8 @@ init_logger();
 // ../plugin/src/hooks/magic-context/read-session-true-raw-tokens.ts
 var MAX_MESSAGE_CACHE_ENTRIES = 1e5;
 var MAX_MESSAGE_CACHE_KEY_BYTES = 64 * 1024 * 1024;
+var FNV1A_32_OFFSET = 2166136261;
+var FNV1A_32_PRIME = 16777619;
 var messageEstimateCache = new Map;
 var messageEstimateCacheBytes = 0;
 var EMPTY_BREAKDOWN = {
@@ -186263,6 +186881,23 @@ function recursiveByteLength(value) {
     return total;
   }
   return String(value).length;
+}
+function updateFnv1a32(hash2, text) {
+  let next = hash2;
+  for (let index = 0;index < text.length; index += 1) {
+    next ^= text.charCodeAt(index);
+    next = Math.imul(next, FNV1A_32_PRIME) >>> 0;
+  }
+  return next;
+}
+function contentStringsHash(fields) {
+  let hash2 = FNV1A_32_OFFSET;
+  for (const field of fields) {
+    hash2 = updateFnv1a32(hash2, `${field.length}:`);
+    hash2 = updateFnv1a32(hash2, field);
+    hash2 = updateFnv1a32(hash2, "\x00");
+  }
+  return hash2.toString(16).padStart(8, "0");
 }
 function rawPartVersion(part) {
   return part.__magicContextPartUpdatedAt ?? part.updated_at ?? part.updatedAt ?? part.version ?? part.revision ?? "";
@@ -186611,13 +187246,12 @@ function buildTrueRawTokenIndex(sessionId, messages, options) {
 function partContentFingerprint(part) {
   if (!isRecord(part))
     return `${typeof part}:${recursiveByteLength(part)}`;
-  const type = partType(part);
   const tool = toolSignalFromPart(part);
   if (tool) {
-    return `${type}:${tool.callId}:${tool.inputText.length}:${tool.outputText.length}`;
+    return contentStringsHash([tool.inputText, tool.outputText]);
   }
   const text = firstStringField(part, ["text", "thinking", "reasoning", "content", "url"]) ?? "";
-  return `${type}:${text.length}`;
+  return contentStringsHash([text]);
 }
 function computeRawRangeFingerprint(messages, startInclusive, endExclusive) {
   const pieces = [];
@@ -188874,24 +189508,46 @@ function getMessageSearchStatementWithCutoff(db) {
   return stmt;
 }
 var ftsRowCountStatements = new WeakMap;
+var ftsRowCountStatementsWithCutoff = new WeakMap;
 var ftsMatchCountStatements = new WeakMap;
-function getSessionFtsRowCount(db, sessionId) {
-  let stmt = ftsRowCountStatements.get(db);
-  if (!stmt) {
-    stmt = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ?");
-    ftsRowCountStatements.set(db, stmt);
-  }
-  const row = stmt.get(sessionId);
+var ftsMatchCountStatementsWithCutoff = new WeakMap;
+function getSessionFtsRowCount(db, sessionId, cutoff) {
+  const stmt = cutoff === null ? (() => {
+    let cached2 = ftsRowCountStatements.get(db);
+    if (!cached2) {
+      cached2 = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ?");
+      ftsRowCountStatements.set(db, cached2);
+    }
+    return cached2;
+  })() : (() => {
+    let cached2 = ftsRowCountStatementsWithCutoff.get(db);
+    if (!cached2) {
+      cached2 = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) <= ?");
+      ftsRowCountStatementsWithCutoff.set(db, cached2);
+    }
+    return cached2;
+  })();
+  const row = cutoff === null ? stmt.get(sessionId) : stmt.get(sessionId, cutoff);
   return typeof row?.n === "number" ? row.n : 0;
 }
-function countSessionFtsMatches(db, sessionId, ftsQuery) {
-  let stmt = ftsMatchCountStatements.get(db);
-  if (!stmt) {
-    stmt = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?");
-    ftsMatchCountStatements.set(db, stmt);
-  }
+function countSessionFtsMatches(db, sessionId, ftsQuery, cutoff) {
+  const stmt = cutoff === null ? (() => {
+    let cached2 = ftsMatchCountStatements.get(db);
+    if (!cached2) {
+      cached2 = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?");
+      ftsMatchCountStatements.set(db, cached2);
+    }
+    return cached2;
+  })() : (() => {
+    let cached2 = ftsMatchCountStatementsWithCutoff.get(db);
+    if (!cached2) {
+      cached2 = db.prepare("SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? AND CAST(message_ordinal AS INTEGER) <= ?");
+      ftsMatchCountStatementsWithCutoff.set(db, cached2);
+    }
+    return cached2;
+  })();
   try {
-    const row = stmt.get(sessionId, ftsQuery);
+    const row = cutoff === null ? stmt.get(sessionId, ftsQuery) : stmt.get(sessionId, ftsQuery, cutoff);
     return typeof row?.n === "number" ? row.n : 0;
   } catch {
     return 0;
@@ -189141,7 +189797,7 @@ function searchMessages(args) {
       role: row.role
     }));
   }
-  const corpusSize = getSessionFtsRowCount(args.db, args.sessionId);
+  const corpusSize = getSessionFtsRowCount(args.db, args.sessionId, cutoff);
   const queryLists = [];
   if (baseQuery.length > 0) {
     queryLists.push({
@@ -189154,7 +189810,7 @@ function searchMessages(args) {
     const probeQuery = sanitizeFtsQuery(probe);
     if (probeQuery.length === 0)
       continue;
-    const df = countSessionFtsMatches(args.db, args.sessionId, probeQuery);
+    const df = countSessionFtsMatches(args.db, args.sessionId, probeQuery, cutoff);
     const weight = probeDiscriminationWeight(df, corpusSize);
     probeWeights.set(probe, weight);
     queryLists.push({
@@ -196220,21 +196876,6 @@ Prefer many small targeted operations over one large blanket operation, and keep
 }
 
 // src/acm/prompt.ts
-var FOREWORD_SECTION = `# Magic-Acm-Context
-
-## Foreword
-
-Two systems manage your context in parallel — one owns **structure**, the other owns **hygiene**. They run concurrently, never conflict, and together keep your working set lean without losing recoverability.
-
-**Structure** (ACM) — coarse-grain, tree-level decisions. Checkpoints mark recoverable positions; travel folds entire phases, tasks, or failed directions out of the working set into an archived branch. Structure sets the ceiling: without it, no amount of fine-grain cleanup prevents context from growing unbounded.
-
-**Hygiene** (Magic Context) — fine-grain, content-level maintenance. Tagging marks individual tool outputs as spent; the runtime compresses or removes them when space is needed. Hygiene optimizes below the ceiling: between structural folds, it keeps the surviving content lightweight and current.
-
-ACM is primary. A session that only does hygiene accumulates finished work indefinitely — the working set bloats with completed phases that no tag-level cleanup can remove. A session that only does structure still benefits because each fold naturally discards the noise inside. Both together compound: structure removes large done blocks, hygiene thins what remains.
-
-Unbounded context does not mean unmanaged context. You will not be truncated — but your working set should contain only material the next action needs. Structure decides what stays in the set; hygiene decides how clean it is.
-
-Follow both systems' guidance as written. They are parallel by design: ACM folds at boundaries, Magic Context reduces between them. No coordination is required — doing each correctly is sufficient.`;
 var ACM_SECTION = `## Context Management (ACM)
 
 A context window is a **working set**: the live material needed for the next action.
@@ -196435,20 +197076,7 @@ Batch work accumulates hidden context debt because each item feels small.
 #### None of these fit
 
 Use the fold gate: Boundary named. NEXT executable. Raw recoverable. If any gate fails, keep the context live and checkpoint the next stable point.`;
-var CLOSING_SECTION = `## Closing
-
-Structure and hygiene are parallel, not sequential. You do not finish one before starting the other — checkpoint and fold at boundaries (structure), tag and reduce between them (hygiene). Both run continuously throughout every task.
-
-When in doubt: if the completed work is a phase or larger, it is a structural fold. If it is a single tool output you already used, it is hygiene. Act on whichever applies; both is often correct.`;
-function buildUnifiedPromptSection(mcSection) {
-  return `${FOREWORD_SECTION}
-
-${ACM_SECTION}
-
-${mcSection}
-
-${CLOSING_SECTION}`;
-}
+var ACM_PROMPT_SECTION = ACM_SECTION;
 
 // src/system-prompt.ts
 init_logger();
@@ -196460,7 +197088,9 @@ function buildMagicContextBlock(opts) {
   if (!includeGuidance)
     return null;
   const mcBlock = buildMagicContextSection(null, opts.protectedTags ?? 20, opts.ctxReduceCallable ?? true, opts.dreamerEnabled ?? false, opts.temporalAwarenessEnabled ?? false, opts.cavemanTextCompressionEnabled ?? false, false, opts.language, opts.memoryEnabled !== false);
-  return buildUnifiedPromptSection(mcBlock ?? "");
+  return mcBlock ? `${mcBlock}
+
+${ACM_PROMPT_SECTION}` : ACM_PROMPT_SECTION;
 }
 var DATE_PATTERN = /Today's date: .+/;
 function processSystemPromptForCache(args) {
@@ -200421,6 +201051,15 @@ async function executeContextRecompWithResult(deps, options = {}) {
       published: false
     };
   }
+  options.onLeaseAcquired?.();
+  if (isWrapupInProgress(deps.db, sessionId)) {
+    sessionLog(sessionId, "recomp skipped: /ctx-wrapup became active");
+    releaseCompartmentLease(deps.db, sessionId, holderId);
+    return {
+      message: "## Magic Recomp — Skipped\n\n/ctx-wrapup is already compacting this session. Wait for it to finish, then try `/ctx-recomp` again.",
+      published: false
+    };
+  }
   const renewal = startLeaseRenewal(deps, holderId);
   const runnerDeps = withPublishedCallback({ ...deps, compartmentLeaseHolderId: holderId });
   const promise2 = options.range ? executePartialRecompInternal(runnerDeps, options.range) : executeContextRecompInternal(runnerDeps);
@@ -201546,7 +202185,7 @@ function formatThresholdPercent(value) {
 // package.json
 var package_default = {
   name: "@cortexkit/omp-magic-context",
-  version: "0.30.7",
+  version: "0.31.5",
   type: "module",
   description: "OMP (Oh My Pi) coding agent extension for Magic Context — cross-session memory and context management",
   main: "dist/index.js",
@@ -202086,6 +202725,11 @@ function readHistorianState(db, sessionId, meta3) {
 import * as crypto4 from "node:crypto";
 var DEFAULT_MESSAGES_TO_KEEP = 20;
 var LEASE_WAIT_MS = 1000;
+var MAX_WRAPUP_LEASE_WAIT_MS = 10 * 60 * 1000;
+function resolveWrapupLeaseWaitTimeout(deps) {
+  const configured = deps.wrapupLeaseWaitTimeoutMs ?? MAX_WRAPUP_LEASE_WAIT_MS;
+  return Number.isFinite(configured) && configured >= 0 ? configured : MAX_WRAPUP_LEASE_WAIT_MS;
+}
 function parseWrapupArgs(raw) {
   const trimmed = raw.trim();
   if (trimmed === "")
@@ -202303,11 +202947,12 @@ Eligible history is about ${initialPlan.snapshot.trueRawEligibleTokens.toLocaleS
 Chunk ${chunkIndex}: wrapping messages ${plan.snapshot.offset}-${plan.snapshot.eligibleEndOrdinal - 1} (~${plan.snapshot.trueRawEligibleTokens.toLocaleString()} eligible tokens remain).`,
           level: "info"
         });
-        const leaseHolder = await acquireCompartmentLeaseEventually(deps.db, sessionId, renewWrapupMarker);
-        if (!leaseHolder) {
-          failure = ownershipLost ? `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.` : "Another Magic Context rebuild started while wrapup was waiting. Run /ctx-wrapup again to continue.";
+        const leaseResult = await acquireCompartmentLeaseEventually(deps.db, sessionId, renewWrapupMarker, resolveWrapupLeaseWaitTimeout(deps));
+        if (!leaseResult.ok) {
+          failure = ownershipLost ? `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.` : leaseResult.reason === "timeout" ? `Timed out waiting for another process to release the compartment-state lease; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.` : "Another Magic Context rebuild started while wrapup was waiting. Run /ctx-wrapup again to continue.";
           break;
         }
+        const leaseHolder = leaseResult.holderId;
         const leaseRenewal = setInterval(() => {
           try {
             renewCompartmentLease(deps.db, sessionId, leaseHolder);
@@ -202411,15 +203056,19 @@ function resolvePiContextLimit(ctx) {
   }
   return 128000;
 }
-async function acquireCompartmentLeaseEventually(db, sessionId, renewWrapupMarker) {
+async function acquireCompartmentLeaseEventually(db, sessionId, renewWrapupMarker, maxWaitMs) {
+  const waitStartedAt = Date.now();
+  const remainingMs = () => Math.max(0, waitStartedAt + maxWaitMs - Date.now());
   for (;; ) {
+    if (remainingMs() <= 0)
+      return { ok: false, reason: "timeout" };
     const holderId = crypto4.randomUUID();
     const lease = acquireCompartmentLease(db, sessionId, holderId);
     if (lease)
-      return holderId;
+      return { ok: true, holderId };
     if (!renewWrapupMarker({}))
-      return null;
-    await new Promise((resolve3) => setTimeout(resolve3, LEASE_WAIT_MS));
+      return { ok: false, reason: "ownership_lost" };
+    await new Promise((resolve3) => setTimeout(resolve3, Math.min(LEASE_WAIT_MS, remainingMs())));
   }
 }
 function estimateChunks(tokens, chunkTokens) {
@@ -207181,8 +207830,9 @@ function createCtxMemoryTool(deps) {
         const isOwn = targetIdentityForStoredPath(memory2.projectPath) === projectIdentity;
         if (isOwn)
           return true;
-        return toolShareCategories === null || toolShareCategories.includes(memory2.category);
+        return toolShareCategories?.includes(memory2.category) ?? false;
       };
+      const memoryOwnedByTool = (memory2) => workspaceIdentitySet.identities.length > 1 ? targetIdentityForStoredPath(memory2.projectPath) === projectIdentity : storedPathBelongsToIdentity(memory2.projectPath, projectIdentity);
       const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
       if (snapshot ? !snapshot.features.memoryEnabled : deps.memoryEnabled === false) {
         return err2("Cross-session memory is disabled for this project.");
@@ -207229,7 +207879,8 @@ function createCtxMemoryTool(deps) {
           return err2("Error: 'content' is required when action is 'update'.");
         }
         const memory2 = getMemoryById(deps.db, updateId);
-        if (!memory2 || !memoryVisibleToTool(memory2)) {
+        const updateAllowed = memory2 ? dreamerAllowed ? memoryVisibleToTool(memory2) : memoryOwnedByTool(memory2) : false;
+        if (!memory2 || !updateAllowed) {
           return err2(`Error: Memory with ID ${updateId} was not found.`);
         }
         if (!dreamerAllowed && !isPrimaryMutableMemory(memory2)) {
@@ -207276,7 +207927,7 @@ function createCtxMemoryTool(deps) {
           return err2("Error: One or more source memories were not found.");
         }
         if (!dreamerAllowed) {
-          const foreign = sourceMemories.find((memory2) => !memoryVisibleToTool(memory2));
+          const foreign = sourceMemories.find((memory2) => !memoryOwnedByTool(memory2));
           if (foreign) {
             return err2(`Error: Memory with ID ${foreign.id} was not found.`);
           }
@@ -207378,7 +208029,8 @@ function createCtxMemoryTool(deps) {
         const archiveIds = [...new Set(rawArchiveIds)];
         for (const memoryId of archiveIds) {
           const memory2 = getMemoryById(deps.db, memoryId);
-          if (!memory2 || !memoryVisibleToTool(memory2)) {
+          const archiveAllowed = memory2 ? dreamerAllowed ? memoryVisibleToTool(memory2) : memoryOwnedByTool(memory2) : false;
+          if (!memory2 || !archiveAllowed) {
             return err2(`Error: Memory with ID ${memoryId} was not found.`);
           }
           if (!dreamerAllowed && !isPrimaryMutableMemory(memory2)) {
@@ -208039,14 +208691,7 @@ import {
 var TODO_TOOL_NAME = "todowrite";
 var TODOS_COMMAND_NAME = "todos";
 var WIDGET_KEY = "magic-context-todos";
-var MAX_OVERLAY_CONTENT_ROWS = 12;
-var TODO_STATUSES = [
-  "pending",
-  "in_progress",
-  "completed",
-  "cancelled"
-];
-var TODO_PRIORITIES = ["high", "medium", "low"];
+var MAX_TODO_CONTENT_ROWS = 12;
 var STATUS_GLYPH = {
   pending: "○",
   in_progress: "◐",
@@ -208060,10 +208705,10 @@ var STATUS_COLOR = {
   cancelled: "error"
 };
 var snapshotsBySession = new Map;
-function isTodoStatus(value) {
+function isTodoStatus2(value) {
   return TODO_STATUSES.includes(value);
 }
-function isTodoPriority(value) {
+function isTodoPriority2(value) {
   return TODO_PRIORITIES.includes(value);
 }
 function cloneTodos(todos) {
@@ -208077,14 +208722,14 @@ function parseTodos(input) {
     if (item === null || typeof item !== "object")
       return null;
     const raw = item;
-    if (typeof raw.content !== "string" || !isTodoStatus(raw.status)) {
+    if (typeof raw.content !== "string" || !isTodoStatus2(raw.status)) {
       return null;
     }
     const todo = {
       content: raw.content,
       status: raw.status
     };
-    if (isTodoPriority(raw.priority))
+    if (isTodoPriority2(raw.priority))
       todo.priority = raw.priority;
     if (typeof raw.id === "string" && raw.id.length > 0)
       todo.id = raw.id;
@@ -208161,7 +208806,7 @@ function countTodos(todos) {
   return counts;
 }
 function activeTitleCount(todos) {
-  return todos.filter((todo) => todo.status !== "completed").length;
+  return todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
 }
 function formatCounts(counts) {
   if (counts.total === 0)
@@ -208195,6 +208840,16 @@ function lineComponent(renderLines) {
     invalidate() {}
   };
 }
+function capTodoRows(rows) {
+  if (rows.length <= MAX_TODO_CONTENT_ROWS) {
+    return { visible: [...rows], hiddenCount: 0 };
+  }
+  const visibleCount = Math.max(0, MAX_TODO_CONTENT_ROWS - 1);
+  return {
+    visible: rows.slice(0, visibleCount),
+    hiddenCount: rows.length - visibleCount
+  };
+}
 function renderTodowriteCall(args, theme) {
   const todos = parseTodos(args.todos) ?? [];
   const active = activeTitleCount(todos);
@@ -208217,7 +208872,12 @@ function renderTodowriteResult(result, theme) {
   return lineComponent((width) => {
     if (renderedTodos.length === 0)
       return [theme.fg("dim", "No todos")];
-    return renderedTodos.map((todo) => truncateToWidth2(formatTodoLine(todo, theme, { showId: true }), width, "…"));
+    const { visible, hiddenCount } = capTodoRows(renderedTodos);
+    const lines = visible.map((todo) => truncateToWidth2(formatTodoLine(todo, theme, { showId: true }), width, "…"));
+    if (hiddenCount > 0) {
+      lines.push(truncateToWidth2(theme.fg("dim", `+${hiddenCount} more`), width, "…"));
+    }
+    return lines;
   });
 }
 function registerTodosCommand(pi) {
@@ -208247,8 +208907,11 @@ function registerTodosCommand(pi) {
         if (group.length === 0)
           continue;
         lines.push(heading);
-        for (const todo of group)
+        const { visible, hiddenCount } = capTodoRows(group);
+        for (const todo of visible)
           lines.push(formatCommandLine(todo));
+        if (hiddenCount > 0)
+          lines.push(`  +${hiddenCount} more`);
       }
       ctx.ui.notify(lines.join(`
 `), "info");
@@ -208376,19 +209039,16 @@ class TodoOverlay {
     const heading = `${theme.fg(headingColor, headingIcon)} ${theme.fg(headingColor, "Todos")} ${theme.fg("muted", "—")} ${theme.fg("dim", formatCounts(counts))}`;
     const truncate3 = (line) => truncateToWidth2(line, width, "…");
     const lines = [truncate3(heading)];
-    const hasTruncatedTail = overlayTodos.length > MAX_OVERLAY_CONTENT_ROWS;
-    const visibleRows = hasTruncatedTail ? MAX_OVERLAY_CONTENT_ROWS - 1 : MAX_OVERLAY_CONTENT_ROWS;
-    const truncatedTail = Math.max(0, overlayTodos.length - visibleRows);
-    const visible = overlayTodos.slice(0, visibleRows);
+    const { visible, hiddenCount } = capTodoRows(overlayTodos);
     for (const [index, { todo, key }] of visible.entries()) {
-      const isLast = index === visible.length - 1 && truncatedTail === 0;
+      const isLast = index === visible.length - 1 && hiddenCount === 0;
       const branch = theme.fg("dim", isLast ? "└─" : "├─");
       lines.push(truncate3(`${branch} ${formatTodoLine(todo, theme, { showId: true })}`));
       if (todo.status === "completed")
         this.completedTaskIdsPendingHide.add(key);
     }
-    if (truncatedTail > 0) {
-      lines.push(truncate3(`${theme.fg("dim", "└─")} ${theme.fg("dim", `+${truncatedTail} more`)}`));
+    if (hiddenCount > 0) {
+      lines.push(truncate3(`${theme.fg("dim", "└─")} ${theme.fg("dim", `+${hiddenCount} more`)}`));
     }
     return lines;
   }
@@ -208444,17 +209104,10 @@ function registerTodoStateLifecycle(pi, deps) {
 }
 
 // src/tools/todowrite.ts
-var STATUS_VALUES = [
-  "pending",
-  "in_progress",
-  "completed",
-  "cancelled"
-];
-var PRIORITY_VALUES = ["high", "medium", "low"];
 var TodoItem = exports_typebox.Object({
   content: exports_typebox.String({ description: "Brief description of the task" }),
-  status: exports_typebox.Union(STATUS_VALUES.map((v) => exports_typebox.Literal(v))),
-  priority: exports_typebox.Optional(exports_typebox.Union(PRIORITY_VALUES.map((v) => exports_typebox.Literal(v)))),
+  status: exports_typebox.Union(TODO_STATUSES.map((v) => exports_typebox.Literal(v))),
+  priority: exports_typebox.Optional(exports_typebox.Union(TODO_PRIORITIES.map((v) => exports_typebox.Literal(v)))),
   id: exports_typebox.Optional(exports_typebox.String({ description: "Optional stable id for the todo" }))
 });
 var TodowriteParams = exports_typebox.Object({
@@ -208479,8 +209132,7 @@ function createTodowriteTool() {
     parameters: TodowriteParams,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const todos = params.todos ?? [];
-      const completed = todos.filter((t) => t.status === "completed").length;
-      const active = todos.length - completed;
+      const active = todos.filter((todo) => !TITLE_DONE_STATUSES.has(todo.status)).length;
       return {
         content: [
           {
@@ -210057,6 +210709,58 @@ function persistPiMessageEndModelMeta(args) {
     updateSessionMeta(args.db, args.sessionId, { cacheTtl });
   }
 }
+function getCompatiblePiTodoCapture(todos) {
+  if (!Array.isArray(todos))
+    return null;
+  const normalized = normalizeTodoStateJson(todos);
+  if (normalized === null)
+    return null;
+  const parsed = parseTodos(todos);
+  if (parsed === null)
+    return null;
+  return { normalized, todos: parsed };
+}
+function applyCompatiblePiTodoCapture(args) {
+  if (args.todowriteEnabled) {
+    setTodoSnapshot(args.sessionId, args.capture.todos);
+    args.todoOverlay?.update(args.sessionId);
+  }
+  if (args.persist) {
+    updateSessionMeta(args.db, args.sessionId, {
+      lastTodoState: args.capture.normalized
+    });
+  }
+}
+function capturePiTodowriteArgsIfCompatible(args) {
+  const capture = getCompatiblePiTodoCapture(args.todos);
+  if (capture === null)
+    return false;
+  applyCompatiblePiTodoCapture({ ...args, capture });
+  return true;
+}
+function capturePiTodowriteMessageIfCompatible(args) {
+  const msg = args.message;
+  if (msg?.role !== "assistant" || !Array.isArray(msg.content)) {
+    return false;
+  }
+  for (const block of msg.content) {
+    if (!block || typeof block !== "object")
+      continue;
+    const b = block;
+    if (b.type !== "toolCall")
+      continue;
+    if (typeof b.name !== "string")
+      continue;
+    if (b.name !== "todowrite")
+      continue;
+    const capture = getCompatiblePiTodoCapture(b.arguments?.todos);
+    if (capture === null)
+      continue;
+    applyCompatiblePiTodoCapture({ ...args, capture });
+    return true;
+  }
+  return false;
+}
 function info(message, data) {
   log(`${PREFIX} ${message}`, data);
 }
@@ -210064,6 +210768,7 @@ function warn(message, data) {
   log(`${PREFIX} WARN ${message}`, data);
 }
 var migratedConfigDirs = new Set;
+var loggedPiConfigDirs = new Set;
 function ensureConfigLocationsMigrated(dir) {
   if (migratedConfigDirs.has(dir))
     return;
@@ -210073,6 +210778,28 @@ function ensureConfigLocationsMigrated(dir) {
     info: (m) => info(m)
   });
 }
+function logPiConfigLoad(args) {
+  const key = resolve3(args.dir);
+  if (args.dedupe && loggedPiConfigDirs.has(key))
+    return;
+  if (args.dedupe) {
+    loggedPiConfigDirs.add(key);
+  }
+  if (args.loadedFromPaths.length > 0) {
+    info(`config loaded from: ${args.loadedFromPaths.join(", ")}`);
+  } else {
+    info("config: no magic-context.jsonc found, using schema defaults");
+  }
+  for (const warning of args.warnings) {
+    warn(`config: ${warning}`);
+  }
+}
+var __test = {
+  logPiConfigLoad,
+  resetLoggedPiConfigDirs() {
+    loggedPiConfigDirs.clear();
+  }
+};
 function formatTokens2(value) {
   return value.toLocaleString();
 }
@@ -210259,14 +210986,12 @@ async function src_default2(pi) {
   const { config: config2, warnings, loadedFromPaths } = loadPiConfig({
     cwd: projectDir
   });
-  if (loadedFromPaths.length > 0) {
-    info(`config loaded from: ${loadedFromPaths.join(", ")}`);
-  } else {
-    info("config: no magic-context.jsonc found, using schema defaults");
-  }
-  for (const w of warnings) {
-    warn(`config: ${w}`);
-  }
+  logPiConfigLoad({
+    dir: projectDir,
+    loadedFromPaths,
+    warnings,
+    dedupe: true
+  });
   setSqlitePragmaConfig({
     cacheSizeMb: config2.sqlite.cache_size_mb,
     mmapSizeMb: config2.sqlite.mmap_size_mb
@@ -210348,7 +211073,14 @@ async function src_default2(pi) {
     if (cached2)
       return cached2;
     ensureConfigLocationsMigrated(dir);
-    const switchedConfig = loadPiConfig({ cwd: dir }).config;
+    const switchedLoad = loadPiConfig({ cwd: dir });
+    logPiConfigLoad({
+      dir,
+      loadedFromPaths: switchedLoad.loadedFromPaths,
+      warnings: switchedLoad.warnings,
+      dedupe: true
+    });
+    const switchedConfig = switchedLoad.config;
     const switchedIdentity = identityOverride ?? resolveProjectIdentityOrFallback(dir);
     const built = buildProjectDeps(dir, switchedIdentity, switchedConfig);
     projectDepsByDir.set(dir, built);
@@ -210722,18 +211454,14 @@ ${block}` : systemPromptText;
         const todoArgs = event.args;
         const todos = todoArgs?.todos;
         const sessionMeta = Array.isArray(todos) ? getOrCreateSessionMeta(db, sessionId) : null;
-        if (todowriteEnabled && Array.isArray(todos)) {
-          setTodoSnapshot(sessionId, todos);
-          todoOverlay?.update(sessionId);
-        }
-        if (sessionMeta && !sessionMeta.isSubagent) {
-          const normalizedTodos = normalizeTodoStateJson(todos);
-          if (normalizedTodos !== null) {
-            updateSessionMeta(db, sessionId, {
-              lastTodoState: normalizedTodos
-            });
-          }
-        }
+        capturePiTodowriteArgsIfCompatible({
+          db,
+          sessionId,
+          todos,
+          todowriteEnabled,
+          todoOverlay,
+          persist: Boolean(sessionMeta && !sessionMeta.isSubagent)
+        });
         if (Array.isArray(todos) && todos.length > 0 && todos.every((t) => t.status === "completed" || t.status === "cancelled")) {
           if (sessionMeta && !sessionMeta.isSubagent) {
             onNoteTrigger(db, sessionId, "todos_complete");
@@ -210836,36 +211564,14 @@ ${block}` : systemPromptText;
       try {
         const sessionMetaForTodo = getOrCreateSessionMeta(db, sessionId);
         if (!sessionMetaForTodo.isSubagent) {
-          const msg = event.message;
-          if (msg && msg.role === "assistant" && Array.isArray(msg.content)) {
-            for (const block of msg.content) {
-              if (!block || typeof block !== "object")
-                continue;
-              const b = block;
-              if (b.type !== "toolCall")
-                continue;
-              if (typeof b.name !== "string")
-                continue;
-              if (b.name !== "todowrite") {
-                continue;
-              }
-              const args = b.arguments;
-              const todos = args?.todos;
-              if (!Array.isArray(todos))
-                continue;
-              const normalized = normalizeTodoStateJson(todos);
-              if (normalized === null)
-                continue;
-              if (todowriteEnabled) {
-                setTodoSnapshot(sessionId, todos);
-                todoOverlay?.update(sessionId);
-              }
-              updateSessionMeta(db, sessionId, {
-                lastTodoState: normalized
-              });
-              break;
-            }
-          }
+          capturePiTodowriteMessageIfCompatible({
+            db,
+            sessionId,
+            message: event.message,
+            todowriteEnabled,
+            todoOverlay,
+            persist: true
+          });
         }
       } catch (err5) {
         warn("message_end: synthetic todowrite capture failed:", err5);
@@ -210957,5 +211663,8 @@ export {
   resolveDreamerFromConfig,
   persistPiPressureFromMessageEnd,
   persistPiMessageEndModelMeta,
-  src_default2 as default
+  src_default2 as default,
+  capturePiTodowriteMessageIfCompatible,
+  capturePiTodowriteArgsIfCompatible,
+  __test
 };

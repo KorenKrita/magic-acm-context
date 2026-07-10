@@ -10,7 +10,7 @@
 
 import { createHash } from "node:crypto";
 import { buildMagicContextSection } from "@magic-context/core/agents/magic-context-prompt";
-import { buildUnifiedPromptSection } from "./acm/prompt";
+import { ACM_PROMPT_SECTION } from "./acm/prompt";
 import {
 	type ContextDatabase,
 	getOrCreateSessionMeta,
@@ -79,8 +79,8 @@ export function buildMagicContextBlock(
 		opts.memoryEnabled !== false,
 	);
 
-	// Assemble unified prompt: Foreword → ACM → MC → Closing
-	return buildUnifiedPromptSection(mcBlock ?? "");
+	// Append ACM discipline section after MC guidance
+	return mcBlock ? `${mcBlock}\n\n${ACM_PROMPT_SECTION}` : ACM_PROMPT_SECTION;
 }
 
 export interface SystemPromptHashResult {

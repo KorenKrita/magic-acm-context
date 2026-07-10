@@ -1,29 +1,38 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
 import {
+    computeNormalizedHash,
     getMemoriesByProject,
     getMemoryById,
     getMemoryMutationsForRender,
     getProjectState,
     getUnclassifiedMemoryIds,
     insertMemory,
+    insertMemoryIdempotent,
     normalizeStoredProjectPath,
     setMemoryClassification,
 } from "../../features/magic-context";
+import {
+    _resetProjectEmbeddingRegistryForTests,
+    _setTestProviderFactoryForProject,
+    type ProjectEmbeddingRegistrationSnapshot,
+    registerProjectEmbedding,
+} from "../../features/magic-context/memory/embedding";
+import type {
+    EmbeddingProvider,
+    EmbeddingPurpose,
+} from "../../features/magic-context/memory/embedding-provider";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 
-mock.module("../../features/magic-context/memory/embedding", () => ({
-    embedText: async (_text: string) => null,
-    isEmbeddingEnabled: () => true,
-    getEmbeddingModelId: () => "mock:model",
-}));
-
 const { createCtxMemoryTools } = await import("./tools");
 
-function createTestDb(): Database {
-    const db = new Database(":memory:");
+function createTestDb(dbPath = ":memory:"): Database {
+    const db = new Database(dbPath);
     db.exec(`
         CREATE TABLE IF NOT EXISTS memories
         (
@@ -57,9 +66,42 @@ function createTestDb(): Database {
 
         CREATE TABLE IF NOT EXISTS memory_embeddings
         (
-            memory_id INTEGER PRIMARY KEY REFERENCES memories (id) ON DELETE CASCADE,
+            memory_id INTEGER NOT NULL REFERENCES memories (id) ON DELETE CASCADE,
             embedding BLOB NOT NULL,
-            model_id  TEXT
+            model_id  TEXT NOT NULL,
+            PRIMARY KEY (memory_id, model_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS embedding_identity_active (
+            project_path   TEXT NOT NULL,
+            scope          TEXT NOT NULL,
+            model_id       TEXT NOT NULL,
+            last_active_at INTEGER NOT NULL,
+            PRIMARY KEY (project_path, scope, model_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS session_projects (
+            session_id   TEXT NOT NULL,
+            harness      TEXT NOT NULL DEFAULT 'opencode',
+            project_path TEXT NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            PRIMARY KEY (session_id, harness)
+        );
+
+        CREATE TABLE IF NOT EXISTS compartment_chunk_embeddings (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            compartment_id INTEGER NOT NULL,
+            session_id     TEXT NOT NULL,
+            project_path   TEXT NOT NULL,
+            harness        TEXT NOT NULL DEFAULT 'opencode',
+            window_index   INTEGER NOT NULL DEFAULT 0,
+            start_ordinal  INTEGER NOT NULL DEFAULT 0,
+            end_ordinal    INTEGER NOT NULL DEFAULT 0,
+            chunk_hash     TEXT NOT NULL DEFAULT '',
+            model_id       TEXT NOT NULL DEFAULT '',
+            dims           INTEGER NOT NULL DEFAULT 0,
+            vector         BLOB NOT NULL DEFAULT X'',
+            created_at     INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS memory_verifications (
@@ -170,6 +212,10 @@ const toolContext = (sessionID = "ses-memory", agent = "general") =>
 const dreamerToolContext = (directory: string) =>
     ({ sessionID: "ses-dream", agent: DREAMER_AGENT, directory }) as never;
 
+function wait(ms = 0): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function getProjectMemoryEpoch(db: Database, projectPath: string): number {
     return getProjectState(db, normalizeStoredProjectPath(projectPath))?.projectMemoryEpoch ?? 0;
 }
@@ -183,15 +229,66 @@ function getMutationRows(db: Database, projectPath: string, renderedMemoryIds: n
     );
 }
 
-afterAll(() => {
-    mock.restore();
-});
+function installTestEmbeddingProvider(
+    embedImpl: (text: string) => Promise<Float32Array | null>,
+): void {
+    _setTestProviderFactoryForProject(
+        () =>
+            ({
+                modelId: "test-provider-model",
+                initialize: async () => true,
+                embed: async (text: string, _signal?: AbortSignal, _purpose?: EmbeddingPurpose) => {
+                    const vector = await embedImpl(text);
+                    return vector ?? new Float32Array();
+                },
+                embedBatch: async (
+                    texts: string[],
+                    _signal?: AbortSignal,
+                    _purpose?: EmbeddingPurpose,
+                ) => {
+                    const vectors: Float32Array[] = [];
+                    for (const text of texts) {
+                        vectors.push((await embedImpl(text)) ?? new Float32Array());
+                    }
+                    return vectors;
+                },
+                dispose: async () => {},
+                isLoaded: () => true,
+            }) satisfies EmbeddingProvider,
+    );
+}
+
+function registerMemoryEmbeddingsForProject(
+    db: Database,
+    projectPath = "/repo/project",
+): ProjectEmbeddingRegistrationSnapshot {
+    const snapshot = registerProjectEmbedding(
+        db,
+        projectPath,
+        { provider: "local", model: "mock-model" },
+        { memoryEnabled: true, gitCommitEnabled: false },
+        projectPath,
+    );
+    const normalizedProjectPath = normalizeStoredProjectPath(projectPath);
+    if (normalizedProjectPath !== projectPath) {
+        registerProjectEmbedding(
+            db,
+            normalizedProjectPath,
+            { provider: "local", model: "mock-model" },
+            { memoryEnabled: true, gitCommitEnabled: false },
+            projectPath,
+        );
+    }
+    return snapshot;
+}
 
 describe("createCtxMemoryTools", () => {
     let db: Database;
     let tools: ReturnType<typeof createCtxMemoryTools>;
 
     beforeEach(() => {
+        _resetProjectEmbeddingRegistryForTests();
+        _setTestProviderFactoryForProject(null);
         db = createTestDb();
         tools = createCtxMemoryTools({
             db,
@@ -203,6 +300,8 @@ describe("createCtxMemoryTools", () => {
 
     afterEach(() => {
         closeQuietly(db);
+        _setTestProviderFactoryForProject(null);
+        _resetProjectEmbeddingRegistryForTests();
     });
 
     describe("#given write action", () => {
@@ -295,6 +394,101 @@ describe("createCtxMemoryTools", () => {
 
             expect(memories).toHaveLength(1);
             expect(memories[0]?.projectPath).toBe("/repo/project");
+        });
+
+        it("stores a fresh embedding when the memory content stays unchanged", async () => {
+            const snapshot = registerMemoryEmbeddingsForProject(db);
+            let release: (() => void) | undefined;
+            const started = new Promise<void>((resolve) => {
+                installTestEmbeddingProvider(async () => {
+                    resolve();
+                    await new Promise<void>((resume) => {
+                        release = resume;
+                    });
+                    return new Float32Array([1, 2]);
+                });
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "write",
+                    category: "USER_DIRECTIVES",
+                    content: "Keep the fresh embedding.",
+                },
+                toolContext(),
+            );
+            const memory = getMemoriesByProject(db, "/repo/project")[0];
+
+            expect(result).toContain("Saved memory [ID:");
+            expect(memory).toBeDefined();
+            await started;
+            release?.();
+            await wait();
+
+            const row = db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM memory_embeddings WHERE memory_id = ? AND model_id = ?",
+                )
+                .get(memory?.id, snapshot.modelId) as { count?: number } | null;
+            expect(row?.count).toBe(1);
+        });
+
+        it("returns an exact-dedup response when another writer wins after the pre-check", async () => {
+            const tempDir = mkdtempSync(join(tmpdir(), "ctx-memory-race-"));
+            const dbPath = join(tempDir, "context.db");
+            const db1 = createTestDb(dbPath);
+            const db2 = createTestDb(dbPath);
+            const tools1 = createCtxMemoryTools({
+                db: db1,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+            });
+            const originalPrepare = db1.prepare.bind(db1);
+            let injected = false;
+            let winnerInsert: ReturnType<typeof insertMemoryIdempotent> | null = null;
+            (db1 as unknown as { prepare: typeof db1.prepare }).prepare = ((sql: string) => {
+                const stmt = originalPrepare(sql);
+                if (sql.startsWith("INSERT INTO memories")) {
+                    const run = stmt.run.bind(stmt);
+                    (stmt as unknown as { run: typeof stmt.run }).run = ((...args: unknown[]) => {
+                        if (!injected) {
+                            injected = true;
+                            winnerInsert = insertMemoryIdempotent(db2, {
+                                projectPath: "/repo/project",
+                                category: "USER_DIRECTIVES",
+                                content: "Race-safe exact dedup",
+                                sourceSessionId: "ses-memory-2",
+                                sourceType: "agent",
+                            });
+                        }
+                        return run(...(args as Parameters<typeof stmt.run>));
+                    }) as typeof stmt.run;
+                }
+                return stmt;
+            }) as typeof db1.prepare;
+
+            try {
+                const loserResult = await tools1.ctx_memory.execute(
+                    {
+                        action: "write",
+                        category: "USER_DIRECTIVES",
+                        content: "Race-safe exact dedup",
+                    },
+                    toolContext("ses-memory-1"),
+                );
+                expect(winnerInsert).not.toBeNull();
+                const memories = getMemoriesByProject(db1, "/repo/project");
+
+                expect(winnerInsert?.inserted).toBe(true);
+                expect(loserResult).toContain("Memory already exists");
+                expect(memories).toHaveLength(1);
+                expect(memories[0]?.seenCount).toBe(2);
+            } finally {
+                closeQuietly(db1);
+                closeQuietly(db2);
+                rmSync(tempDir, { recursive: true, force: true });
+            }
         });
     });
 
@@ -450,7 +644,7 @@ describe("createCtxMemoryTools", () => {
         });
     });
 
-    it("archives a foreign workspace memory under the target identity", async () => {
+    it("rejects archiving a foreign workspace memory even when the category is shared", async () => {
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at) VALUES (1, 'ws', 1, 1);
                 INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
@@ -459,8 +653,8 @@ describe("createCtxMemoryTools", () => {
             `);
         const memory = insertMemory(db, {
             projectPath: "/repo/foreign",
-            category: "KNOWN_ISSUES",
-            content: "Foreign issue is visible through workspace.",
+            category: "CONSTRAINTS",
+            content: "Foreign shared constraint is readable but not mutable.",
         });
 
         const result = await tools.ctx_memory.execute(
@@ -468,9 +662,9 @@ describe("createCtxMemoryTools", () => {
             toolContext(),
         );
 
-        expect(result).toContain("Archived memory");
-        expect(getMemoryById(db, memory.id)?.status).toBe("archived");
-        expect(getMemoryMutationsForRender(db, "/repo/foreign", 0, [memory.id])).toHaveLength(1);
+        expect(result).toBe(`Error: Memory with ID ${memory.id} was not found.`);
+        expect(getMemoryById(db, memory.id)?.status).toBe("active");
+        expect(getMemoryMutationsForRender(db, "/repo/foreign", 0, [memory.id])).toHaveLength(0);
     });
 
     it("REFUSES to archive a foreign memory in a NON-shared category", async () => {
@@ -498,7 +692,7 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, foreignHidden.id)?.status).toBe("active");
     });
 
-    it("still archives a foreign memory in a SHARED category", async () => {
+    it("rejects archiving a foreign memory in a SHARED category", async () => {
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
                 VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
@@ -517,8 +711,8 @@ describe("createCtxMemoryTools", () => {
             toolContext(),
         );
 
-        expect(result).toContain("Archived memory");
-        expect(getMemoryById(db, foreignShared.id)?.status).toBe("archived");
+        expect(result).toBe(`Error: Memory with ID ${foreignShared.id} was not found.`);
+        expect(getMemoryById(db, foreignShared.id)?.status).toBe("active");
     });
 
     it("always allows mutating OWN-project memory regardless of share categories", async () => {
@@ -545,9 +739,9 @@ describe("createCtxMemoryTools", () => {
     });
 
     it("REFUSES a PRIMARY merge that pulls in a foreign memory in a NON-shared category", async () => {
-        // merge MUST gate on the same own/foreign-by-category visibility as
-        // update/archive: a primary agent cannot consolidate a foreign member's
-        // memory it can't even see in its rendered context.
+        // Primary mutations require ownership, not workspace visibility. A shared
+        // workspace may make foreign memories readable, but the caller may only
+        // update, archive, or merge memories from its own project identity set.
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
                 VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
@@ -581,7 +775,7 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, foreignHidden.id)?.status).toBe("active");
     });
 
-    it("allows a PRIMARY merge of a foreign memory in a SHARED category", async () => {
+    it("rejects a PRIMARY merge of a foreign memory in a SHARED category", async () => {
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
                 VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
@@ -610,9 +804,9 @@ describe("createCtxMemoryTools", () => {
             toolContext(),
         );
 
-        expect(result).not.toContain("was not found");
-        expect(getMemoryById(db, own.id)?.status).toBe("archived");
-        expect(getMemoryById(db, foreignShared.id)?.status).toBe("archived");
+        expect(result).toBe(`Error: Memory with ID ${foreignShared.id} was not found.`);
+        expect(getMemoryById(db, own.id)?.status).toBe("active");
+        expect(getMemoryById(db, foreignShared.id)?.status).toBe("active");
     });
 
     it("REJECTS merging memories from DIFFERENT categories (structural guard)", async () => {
@@ -680,6 +874,40 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, foreignHidden.id)?.status).toBe("active");
     });
 
+    it("REFUSES a DREAMER merge when workspace share_categories is malformed", async () => {
+        db.exec(`
+                INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+                VALUES (1, 'ws', 1, 1, 'not-json');
+                INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
+                       (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
+            `);
+        const own = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "CONSTRAINTS",
+            content: "Own constraint malformed policy.",
+        });
+        const foreign = insertMemory(db, {
+            projectPath: "/repo/foreign",
+            category: "CONSTRAINTS",
+            content: "Foreign constraint hidden by malformed policy.",
+        });
+
+        const result = await tools.ctx_memory.execute(
+            {
+                action: "merge",
+                ids: [own.id, foreign.id],
+                content: "Merged constraint under malformed policy.",
+                category: "CONSTRAINTS",
+            },
+            toolContext("ses-dreamer", DREAMER_AGENT),
+        );
+
+        expect(result).toContain("not shared with this workspace member");
+        expect(getMemoryById(db, own.id)?.status).toBe("active");
+        expect(getMemoryById(db, foreign.id)?.status).toBe("active");
+    });
+
     it("ALLOWS a DREAMER merge of a foreign SHARED-category memory INSIDE a workspace (D1)", async () => {
         db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
@@ -715,42 +943,33 @@ describe("createCtxMemoryTools", () => {
     });
 
     describe("#given update action", () => {
-        it("updates a foreign workspace memory with duplicate checks and mutations under the target identity", async () => {
+        it("rejects updating a foreign workspace memory even when the category is shared", async () => {
             db.exec(`
                 INSERT INTO workspaces (id, name, created_at, updated_at) VALUES (1, 'ws', 1, 1);
                 INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
                 VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
                        (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
             `);
-            insertMemory(db, {
-                projectPath: "/repo/project",
-                category: "USER_DIRECTIVES",
-                content: "Use the shared formatter.",
-            });
             const foreign = insertMemory(db, {
                 projectPath: "/repo/foreign",
-                category: "USER_DIRECTIVES",
-                content: "Old foreign directive.",
+                category: "CONSTRAINTS",
+                content: "Old foreign shared constraint.",
             });
 
             const result = await tools.ctx_memory.execute(
                 {
                     action: "update",
                     ids: [foreign.id],
-                    content: "Use the shared formatter.",
+                    content: "Updated foreign shared constraint.",
                 },
                 toolContext(),
             );
 
-            expect(result).toContain(`Updated memory [ID: ${foreign.id}]`);
-            expect(getMemoryById(db, foreign.id)?.content).toBe("Use the shared formatter.");
-            const ownMutations = getMemoryMutationsForRender(db, "/repo/project", 0, [foreign.id]);
-            const foreignMutations = getMemoryMutationsForRender(db, "/repo/foreign", 0, [
-                foreign.id,
-            ]);
-            expect(ownMutations).toHaveLength(0);
-            expect(foreignMutations).toHaveLength(1);
-            expect(foreignMutations[0]?.projectPath).toBe("/repo/foreign");
+            expect(result).toBe(`Error: Memory with ID ${foreign.id} was not found.`);
+            expect(getMemoryById(db, foreign.id)?.content).toBe("Old foreign shared constraint.");
+            expect(getMemoryMutationsForRender(db, "/repo/foreign", 0, [foreign.id])).toHaveLength(
+                0,
+            );
         });
 
         it("updates memory content and invalidates stale embeddings", async () => {
@@ -780,6 +999,47 @@ describe("createCtxMemoryTools", () => {
                     newContent: "cache_ttl=10m",
                 },
             ]);
+        });
+
+        it("skips saving an embedding when the memory content changes before the provider returns", async () => {
+            registerMemoryEmbeddingsForProject(db);
+            let release: (() => void) | undefined;
+            const started = new Promise<void>((resolve) => {
+                installTestEmbeddingProvider(async () => {
+                    resolve();
+                    await new Promise<void>((resume) => {
+                        release = resume;
+                    });
+                    return new Float32Array([3, 4]);
+                });
+            });
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONFIG_DEFAULTS",
+                content: "cache_ttl=5m",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [memory.id],
+                    content: "cache_ttl=10m",
+                },
+                toolContext("ses-dreamer", DREAMER_AGENT),
+            );
+
+            expect(result).toContain(`Updated memory [ID: ${memory.id}]`);
+            await started;
+            db.prepare(
+                "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+            ).run("cache_ttl=30m", computeNormalizedHash("cache_ttl=30m"), Date.now(), memory.id);
+            release?.();
+            await wait();
+
+            const row = db
+                .prepare("SELECT COUNT(*) AS count FROM memory_embeddings WHERE memory_id = ?")
+                .get(memory.id) as { count?: number } | null;
+            expect(row?.count).toBe(0);
         });
 
         it("normalizes legacy raw project paths before queueing the mutation", async () => {

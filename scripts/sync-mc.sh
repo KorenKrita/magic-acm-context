@@ -2,8 +2,10 @@
 # sync-mc.sh — Sync magic-context upstream into magic-acm-context.
 #
 # Copies packages/plugin, packages/pi-plugin, packages/omp-plugin from
-# magic-context, preserving ACM-only files (src/acm/), then injects
-# the minimal ACM glue into index.ts and system-prompt.ts.
+# magic-context, preserving ACM-only files (src/acm/) and local package
+# manifest customizations, then injects the minimal ACM glue into index.ts
+# and system-prompt.ts. Required generated schema/docs and test-isolation
+# support files are synchronized too so the sliced repository remains testable.
 #
 # Usage: ./scripts/sync-mc.sh <path-to-magic-context>
 # In CI:  ./scripts/sync-mc.sh /tmp/magic-context
@@ -42,7 +44,42 @@ rsync -a --delete \
   --exclude='package.json' \
   "$MC_ROOT/packages/omp-plugin/" "$ACM_ROOT/packages/omp-plugin/"
 
-# --- 4. Inject ACM glue ---
+# --- 4. Sync upstream versions while preserving local manifest customizations ---
+echo "→ Syncing package versions..."
+MC_ROOT="$MC_ROOT" ACM_ROOT="$ACM_ROOT" node <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+for (const packageName of ["plugin", "pi-plugin", "omp-plugin"]) {
+  const sourcePath = path.join(process.env.MC_ROOT, "packages", packageName, "package.json");
+  const targetPath = path.join(process.env.ACM_ROOT, "packages", packageName, "package.json");
+  const version = JSON.parse(fs.readFileSync(sourcePath, "utf8")).version;
+  const target = fs.readFileSync(targetPath, "utf8");
+  const updated = target.replace(
+    /(\"version\"\s*:\s*\")[^\"]+(\")/,
+    `$1${version}$2`,
+  );
+  if (updated === target && !target.includes(`\"version\": \"${version}\"`)) {
+    throw new Error(`Could not update version in ${targetPath}`);
+  }
+  fs.writeFileSync(targetPath, updated);
+}
+NODE
+
+# --- 5. Sync files required by upstream generators and test isolation ---
+echo "→ Syncing schema, configuration reference, and CLI test preload config..."
+mkdir -p \
+  "$ACM_ROOT/assets" \
+  "$ACM_ROOT/packages/docs/src/content/docs/reference" \
+  "$ACM_ROOT/packages/cli"
+cp "$MC_ROOT/assets/magic-context.schema.json" \
+  "$ACM_ROOT/assets/magic-context.schema.json"
+cp "$MC_ROOT/packages/docs/src/content/docs/reference/configuration.md" \
+  "$ACM_ROOT/packages/docs/src/content/docs/reference/configuration.md"
+cp "$MC_ROOT/packages/cli/bunfig.toml" \
+  "$ACM_ROOT/packages/cli/bunfig.toml"
+
+# --- 6. Inject ACM glue ---
 echo "→ Injecting ACM glue into pi-plugin..."
 node "$SCRIPT_DIR/inject-acm.mjs" \
   "$ACM_ROOT/packages/pi-plugin/src/index.ts" \
