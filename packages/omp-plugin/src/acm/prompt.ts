@@ -339,7 +339,7 @@ When in doubt: if the completed work is a phase or larger, it is a structural fo
  * @returns The full unified prompt string.
  */
 export function buildUnifiedPromptSection(mcSection: string): string {
-	return `${FOREWORD_SECTION}\n\n${ACM_SECTION}\n\n${mcSection}\n\n${CLOSING_SECTION}`;
+    return `${FOREWORD_SECTION}\n\n${ACM_SECTION}\n\n${mcSection}\n\n${CLOSING_SECTION}`;
 }
 
 /**
