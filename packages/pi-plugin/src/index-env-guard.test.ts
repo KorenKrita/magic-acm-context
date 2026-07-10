@@ -81,5 +81,6 @@ describe("Pi full extension subagent env guard", () => {
 		expect(registrations.events).toContain("before_agent_start");
 		expect(registrations.tools).toContain("ctx_search");
 		expect(registrations.commands).toContain("ctx-status");
+		expect(registrations.commands).toContain("context");
 	});
 });
