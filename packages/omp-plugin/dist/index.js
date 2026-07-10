@@ -196876,6 +196876,21 @@ Prefer many small targeted operations over one large blanket operation, and keep
 }
 
 // src/acm/prompt.ts
+var FOREWORD_SECTION = `# Magic-Acm-Context
+
+## Foreword
+
+Two systems manage your context in parallel — one owns **structure**, the other owns **hygiene**. They run concurrently, never conflict, and together keep your working set lean without losing recoverability.
+
+**Structure** (ACM) — coarse-grain, tree-level decisions. Checkpoints mark recoverable positions; travel folds entire phases, tasks, or failed directions out of the working set into an archived branch. Structure sets the ceiling: without it, no amount of fine-grain cleanup prevents context from growing unbounded.
+
+**Hygiene** (Magic Context) — fine-grain, content-level maintenance. Tagging marks individual tool outputs as spent; the runtime compresses or removes them when space is needed. Hygiene optimizes below the ceiling: between structural folds, it keeps the surviving content lightweight and current.
+
+ACM is primary. A session that only does hygiene accumulates finished work indefinitely — the working set bloats with completed phases that no tag-level cleanup can remove. A session that only does structure still benefits because each fold naturally discards the noise inside. Both together compound: structure removes large done blocks, hygiene thins what remains.
+
+Unbounded context does not mean unmanaged context. You will not be truncated — but your working set should contain only material the next action needs. Structure decides what stays in the set; hygiene decides how clean it is.
+
+Follow both systems' guidance as written. They are parallel by design: ACM folds at boundaries, Magic Context reduces between them. No coordination is required — doing each correctly is sufficient.`;
 var ACM_SECTION = `## Context Management (ACM)
 
 A context window is a **working set**: the live material needed for the next action.
@@ -197189,9 +197204,7 @@ function buildMagicContextBlock(opts) {
   if (!includeGuidance)
     return null;
   const mcBlock = buildMagicContextSection(null, opts.protectedTags ?? 20, opts.ctxReduceCallable ?? true, opts.dreamerEnabled ?? false, opts.temporalAwarenessEnabled ?? false, opts.cavemanTextCompressionEnabled ?? false, false, opts.language, opts.memoryEnabled !== false);
-  return mcBlock ? `${mcBlock}
-
-${ACM_PROMPT_SECTION}` : ACM_PROMPT_SECTION;
+  return buildUnifiedPromptSection(mcBlock ?? "");
 }
 var DATE_PATTERN = /Today's date: .+/;
 function processSystemPromptForCache(args) {
