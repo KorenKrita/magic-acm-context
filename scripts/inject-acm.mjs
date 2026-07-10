@@ -86,8 +86,9 @@ let prompt = readFileSync(promptPath, "utf-8");
 
 // 1. Add import (anchor: after `import { buildMagicContextSection }`)
 const MC_SECTION_IMPORT = 'import { buildMagicContextSection }';
-const ACM_PROMPT_IMPORT = 'import { ACM_PROMPT_SECTION } from "./acm/prompt";';
-if (!prompt.includes(ACM_PROMPT_IMPORT)) {
+const UNIFIED_PROMPT_IMPORT =
+  'import { buildUnifiedPromptSection } from "./acm/prompt";';
+if (!prompt.includes(UNIFIED_PROMPT_IMPORT)) {
   const pos = prompt.indexOf(MC_SECTION_IMPORT);
   if (pos === -1) {
     console.error(`ERROR: anchor not found in ${promptPath}: ${MC_SECTION_IMPORT}`);
@@ -100,46 +101,48 @@ if (!prompt.includes(ACM_PROMPT_IMPORT)) {
     process.exit(1);
   }
   prompt = prompt.slice(0, importEnd + 1) +
-    "\n" + ACM_PROMPT_IMPORT +
+    "\n" + UNIFIED_PROMPT_IMPORT +
     prompt.slice(importEnd + 1);
 }
 
 // 2. Wrap the return in buildMagicContextBlock
-// Anchor: `return buildMagicContextSection(`  →  store in variable + append ACM
+// Anchor: `return buildMagicContextSection(` → store in variable and assemble
+// the unified Foreword → ACM → MC → Closing prompt.
 const RETURN_ANCHOR = "\treturn buildMagicContextSection(";
-if (!prompt.includes("ACM_PROMPT_SECTION") || !prompt.includes("mcBlock")) {
+const UNIFIED_RETURN = '\treturn buildUnifiedPromptSection(mcBlock ?? "");';
+if (!prompt.includes(UNIFIED_RETURN)) {
   const returnPos = prompt.indexOf(RETURN_ANCHOR);
   if (returnPos === -1) {
-    // Maybe already wrapped — check if mcBlock exists
+    // Maybe already wrapped — fail unless the expected unified return is present.
     if (prompt.includes("const mcBlock = buildMagicContextSection(")) {
-      console.log(`✓ ${promptPath}: ACM return wrapper already present`);
+      console.error(`ERROR: unified return not found in ${promptPath}`);
     } else {
       console.error(`ERROR: anchor not found in ${promptPath}: ${RETURN_ANCHOR}`);
-      process.exit(1);
     }
-  } else {
-    // Find the matching closing `);\n` for this return statement
-    // Count parens from the opening `buildMagicContextSection(`
-    const searchStart = returnPos + RETURN_ANCHOR.length;
-    let depth = 1;
-    let i = searchStart;
-    while (i < prompt.length && depth > 0) {
-      if (prompt[i] === "(") depth++;
-      else if (prompt[i] === ")") depth--;
-      i++;
-    }
-    // i now points just after the closing `)` — expect `;` next
-    const closingEnd = prompt.indexOf(";", i - 1) + 1;
-
-    const originalReturn = prompt.slice(returnPos, closingEnd);
-    const mcCall = originalReturn.replace(/^\treturn /, "\tconst mcBlock = ");
-
-    const replacement = mcCall + "\n\n" +
-      "\t// Append ACM discipline section after MC guidance\n" +
-      "\treturn mcBlock ? `${mcBlock}\\n\\n${ACM_PROMPT_SECTION}` : ACM_PROMPT_SECTION;";
-
-    prompt = prompt.slice(0, returnPos) + replacement + prompt.slice(closingEnd);
+    process.exit(1);
   }
+
+  // Find the matching closing `);` for this return statement.
+  // Count parens from the opening `buildMagicContextSection(`.
+  const searchStart = returnPos + RETURN_ANCHOR.length;
+  let depth = 1;
+  let i = searchStart;
+  while (i < prompt.length && depth > 0) {
+    if (prompt[i] === "(") depth++;
+    else if (prompt[i] === ")") depth--;
+    i++;
+  }
+  // i now points just after the closing `)` — expect `;` next.
+  const closingEnd = prompt.indexOf(";", i - 1) + 1;
+
+  const originalReturn = prompt.slice(returnPos, closingEnd);
+  const mcCall = originalReturn.replace(/^\treturn /, "\tconst mcBlock = ");
+
+  const replacement = mcCall + "\n\n" +
+    "\t// Assemble unified prompt: Foreword → ACM → MC → Closing\n" +
+    UNIFIED_RETURN;
+
+  prompt = prompt.slice(0, returnPos) + replacement + prompt.slice(closingEnd);
 }
 
 writeFileSync(promptPath, prompt);
