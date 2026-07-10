@@ -12,16 +12,37 @@
 # Usage:
 #   ./scripts/sync-acm.sh <path-to-pi-context>
 #   ./scripts/sync-acm.sh <path-to-pi-context> <path-to-omp-context>
+#   ./scripts/sync-acm.sh --omp-only <path-to-omp-context>
 # In CI:  ./scripts/sync-acm.sh /tmp/pi-context /tmp/omp-context
 
 set -euo pipefail
 
-PI_CTX="${1:?Usage: sync-acm.sh <path-to-pi-context> [path-to-omp-context]}"
-OMP_CTX="${2:-}"
+usage() {
+  echo "Usage: sync-acm.sh <path-to-pi-context> [path-to-omp-context]" >&2
+  echo "       sync-acm.sh --omp-only <path-to-omp-context>" >&2
+  exit 2
+}
+
+PI_CTX=""
+OMP_CTX=""
+if [[ "${1:-}" == "--omp-only" ]]; then
+  [[ $# -eq 2 ]] || usage
+  OMP_CTX="$2"
+elif [[ $# -ge 1 && $# -le 2 ]]; then
+  PI_CTX="$1"
+  OMP_CTX="${2:-}"
+else
+  usage
+fi
+
 ACM_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "Syncing ACM from:"
-echo "  pi-context:  $PI_CTX"
+if [[ -n "$PI_CTX" ]]; then
+  echo "  pi-context:  $PI_CTX"
+else
+  echo "  pi-context:  skipped"
+fi
 if [[ -n "$OMP_CTX" ]]; then
   echo "  omp-context: $OMP_CTX"
 else
@@ -29,10 +50,12 @@ else
 fi
 echo "Into: $ACM_ROOT"
 
-# --- pi-plugin ACM ---
-echo "→ Syncing pi-context → packages/pi-plugin/src/acm/"
-cp "$PI_CTX/src/index.ts" "$ACM_ROOT/packages/pi-plugin/src/acm/tools.ts"
-cp "$PI_CTX/src/lib.ts" "$ACM_ROOT/packages/pi-plugin/src/acm/lib.ts"
+# --- pi-plugin ACM (optional in OMP-only mode) ---
+if [[ -n "$PI_CTX" ]]; then
+  echo "→ Syncing pi-context → packages/pi-plugin/src/acm/"
+  cp "$PI_CTX/src/index.ts" "$ACM_ROOT/packages/pi-plugin/src/acm/tools.ts"
+  cp "$PI_CTX/src/lib.ts" "$ACM_ROOT/packages/pi-plugin/src/acm/lib.ts"
+fi
 
 # --- omp-plugin ACM (optional) ---
 if [[ -n "$OMP_CTX" ]]; then
