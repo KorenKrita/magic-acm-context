@@ -38,7 +38,6 @@
 		"prepublishOnly": "bun run build"
 	},
 	"dependencies": {
-		"@huggingface/transformers": "^4.1.0",
 		"@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
 		"ai-tokenizer": "^1.0.6",
 		"comment-json": "^5.0.0",
@@ -61,14 +60,22 @@
 		"@oh-my-pi/pi-coding-agent": "^16.0.0",
 		"@oh-my-pi/pi-tui": "^16.0.0"
 	},
+	"peerDependenciesMeta": {
+		"@oh-my-pi/pi-coding-agent": {
+			"optional": true
+		},
+		"@oh-my-pi/pi-tui": {
+			"optional": true
+		}
+	},
 	"exports": {
 		".": {
-			"import": "./src/index.ts"
+			"import": "./dist/index.js"
 		}
 	},
 	"omp": {
 		"extensions": [
-			"./src/index.ts"
+			"./dist/index.js"
 		]
 	}
 }
