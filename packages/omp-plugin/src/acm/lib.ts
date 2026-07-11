@@ -6,14 +6,57 @@ import type { TextContent, ToolCall, ThinkingContent, RedactedThinkingContent, A
 
 export const ACM_INTERNAL_TOOLS = new Set(["acm_checkpoint", "acm_timeline", "acm_travel"]);
 
-/** Minimum absolute token delta treated as a meaningful travel effect. */
-const TRAVEL_EFFECT_MIN_TOKEN_DELTA = 500;
-/** Relative fraction of before.tokens used as travel effect threshold floor. */
-const TRAVEL_EFFECT_RELATIVE_THRESHOLD = 0.02;
 /** Fixed token overhead for a branch_summary entry in travel usage estimates. */
 const BRANCH_SUMMARY_ENTRY_OVERHEAD_TOKENS = 100;
 
 export const HANDOFF_SLOT_HINT = "Goal/State/Evidence/External/Exclusions/Recover/NEXT";
+
+export const HANDOFF_SLOTS = ["Goal", "State", "Evidence", "External", "Exclusions", "Recover", "NEXT"] as const;
+
+export type HandoffSlot = typeof HANDOFF_SLOTS[number];
+
+export type HandoffValidationResult =
+ | { ok: true }
+ | {
+   ok: false;
+   missing: HandoffSlot[];
+   empty: HandoffSlot[];
+   duplicate: HandoffSlot[];
+   outOfOrder: boolean;
+  };
+
+/** Validate only the observable seven-slot handoff shape, never semantic sufficiency. */
+export function validateHandoffStructure(summary: string): HandoffValidationResult {
+ const occurrences: Record<HandoffSlot, Array<{ index: number; value: string }>> = {
+  Goal: [],
+  State: [],
+  Evidence: [],
+  External: [],
+  Exclusions: [],
+  Recover: [],
+  NEXT: [],
+ };
+
+ const lines = summary.split(/\r?\n/);
+ for (const [index, line] of lines.entries()) {
+  for (const slot of HANDOFF_SLOTS) {
+   const prefix = `${slot}:`;
+   if (!line.startsWith(prefix)) continue;
+   occurrences[slot].push({ index, value: line.slice(prefix.length).trim() });
+  }
+ }
+
+ const missing = HANDOFF_SLOTS.filter((slot) => occurrences[slot].length === 0);
+ const empty = HANDOFF_SLOTS.filter((slot) => occurrences[slot].some(({ value }) => value.length === 0));
+ const duplicate = HANDOFF_SLOTS.filter((slot) => occurrences[slot].length > 1);
+ const firstIndexes = HANDOFF_SLOTS
+  .map((slot) => occurrences[slot][0]?.index)
+  .filter((index): index is number => index !== undefined);
+ const outOfOrder = firstIndexes.some((index, position) => position > 0 && index <= firstIndexes[position - 1]!);
+
+ if (missing.length === 0 && empty.length === 0 && duplicate.length === 0 && !outOfOrder) return { ok: true };
+ return { ok: false, missing, empty, duplicate, outOfOrder };
+}
 
 export const BOUNDARY_SELECTION_GUIDANCE = "Choose by boundary, not proximity. A candidate is correct only when it sits before the boundary being compressed; use an earliest on-path -start only when it begins the semantic chain being compressed.";
 
@@ -25,12 +68,12 @@ export function formatBoundaryTravelCue(nearestCheckpointName: string | null): s
  if (nearestCheckpointName === null) {
   return "name the boundary first; no anchor is on this path, so checkpoint now or fold directly to the last clean node ID before the boundary";
  }
- return `name the boundary first. '${nearestCheckpointName}' is only a candidate target. Choose the target that sits before the boundary: phase start, pre-burst node, attempt start, method anchor, or semantic chain start. See the Boundary Playbook if unclear`;
+ return `name the boundary first. '${nearestCheckpointName}' is only a candidate target. Choose the target that sits before the boundary: phase start, pre-burst node, attempt start, method anchor, or semantic chain start. Load Advanced Target Selection if the target remains ambiguous`;
 }
 
 type AssistantContentPart = TextContent | ThinkingContent | RedactedThinkingContent | ToolCall | AnthropicFallbackContent;
 
-export type TravelEffect = "shrunk" | "restored" | "unchanged" | "unknown";
+export type StructuralMessageDirection = "decreased" | "increased" | "equal" | "unknown";
 
 export interface UsageLike {
  tokens: number;
@@ -58,19 +101,6 @@ export type MeaningfulSkipReason =
  | "empty_assistant"
  | "empty_user";
 
-export type TimelineMode = "list_checkpoints" | "search" | "full_tree" | "active_path";
-
-/** When multiple timeline params are set, only the highest-priority mode runs. */
-export function resolveTimelineMode(params: {
- list_checkpoints?: boolean;
- search?: string;
- full_tree?: boolean;
-}): TimelineMode {
- if (params.list_checkpoints) return "list_checkpoints";
- if (params.search?.trim()) return "search";
- if (params.full_tree) return "full_tree";
- return "active_path";
-}
 
 /** Persistent post-travel context rebuild state keyed by session manager instance. */
 export class ContextRefreshRegistry {
@@ -300,22 +330,29 @@ export function formatContextUsage(usage: UsageLike | undefined, includeTokens =
  return `${pct} (${formatTokens(usage.tokens)}/${formatTokens(usage.contextWindow)})`;
 }
 
-export function classifyTravelEffect(before: UsageLike | undefined, after: UsageLike | undefined): TravelEffect {
- if (!before || !after) return "unknown";
- const delta = after.tokens - before.tokens;
- const threshold = Math.max(
-  TRAVEL_EFFECT_MIN_TOKEN_DELTA,
-  before.tokens * TRAVEL_EFFECT_RELATIVE_THRESHOLD,
- );
- if (Math.abs(delta) <= threshold) return "unchanged";
- return delta < 0 ? "shrunk" : "restored";
+export interface UsageDelta {
+ tokenDelta: number | null;
+ percentagePointDelta: number | null;
 }
 
-export function classifyStructuralMessageEffect(before: number | undefined, after: number | undefined): TravelEffect {
+export function calculateUsageDelta(
+ before: UsageLike | undefined,
+ after: UsageLike | undefined,
+): UsageDelta {
+ if (!before || !after) return { tokenDelta: null, percentagePointDelta: null };
+ return {
+  tokenDelta: after.tokens - before.tokens,
+  percentagePointDelta: after.percent - before.percent,
+ };
+}
+
+export function classifyStructuralMessageDirection(
+ before: number | undefined,
+ after: number | undefined,
+): StructuralMessageDirection {
  if (before === undefined || after === undefined) return "unknown";
- const delta = after - before;
- if (Math.abs(delta) <= 1) return "unchanged";
- return delta < 0 ? "shrunk" : "restored";
+ if (after === before) return "equal";
+ return after < before ? "decreased" : "increased";
 }
 
 export function compareEntriesByTimestamp(a: SessionEntry, b: SessionEntry): number {

@@ -10,8 +10,8 @@ import type { TextContent, ImageContent, ToolCall, TSchema, ThinkingContent, Red
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core/types";
 import {
  ACM_INTERNAL_TOOLS as INTERNAL_TOOLS,
- classifyStructuralMessageEffect,
- classifyTravelEffect,
+ calculateUsageDelta,
+ classifyStructuralMessageDirection,
  compareEntriesByTimestamp,
  entryMatchesLabelSearch,
  estimateUsageAfterMessageChange,
@@ -22,21 +22,25 @@ import {
  formatBoundaryTravelCue,
  formatContextUsage,
  formatEntryLabels,
- formatFoldCandidatePreview,
  getEntryLabels,
  getMeaningfulSkipReason,
  ContextRefreshRegistry,
  isValidEntryId,
  pushTreeChildrenPreOrder,
  resolveTargetId,
- resolveTimelineMode,
+ validateHandoffStructure,
  type MeaningfulResolveResult,
  type LabelMaps,
  HANDOFF_SLOT_HINT,
  type UsageLike,
 } from "./lib.js";
-import { getHostBridge, type CheckpointLabelConflict } from "./host-bridge.js";
-import { ACM_CORE, ACM_CORE_MARKER, TOOL_DESCRIPTIONS } from "./generated-guidance.js";
+import {
+ getHostBridge,
+ type BranchWithSummaryFailureDetails,
+ type CheckpointLabelConflict,
+ type CheckpointLabelPrevalidation,
+} from "./host-bridge.js";
+import { ACM_CORE, ACM_CORE_MARKER, GUIDANCE_CUES, RECOVERY_GUIDANCE, TOOL_DESCRIPTIONS } from "./generated-guidance.js";
 
 /** Content part types that can appear in assistant message arrays. */
 type AssistantContentPart = TextContent | ThinkingContent | RedactedThinkingContent | ToolCall | AnthropicFallbackContent;
@@ -51,6 +55,17 @@ function formatBackupText(
   return `${name}@${entryId} (resolved from HEAD ${resolvedFromHead})`;
  }
  return `${name}@${entryId}`;
+}
+
+function formatNumericValue(value: number | null, fractionDigits = 0): string {
+ if (value === null || !Number.isFinite(value)) return "unknown";
+ return value.toFixed(fractionDigits);
+}
+
+function formatSignedDelta(value: number | null, fractionDigits = 0, suffix = ""): string {
+ if (value === null || !Number.isFinite(value)) return "unknown";
+ const sign = value > 0 ? "+" : "";
+ return `${sign}${value.toFixed(fractionDigits)}${suffix}`;
 }
 
 function getMessageRoleLabel(entry: SessionEntry): string | undefined {
@@ -77,19 +92,6 @@ function describeEntrySnippet(entry: SessionEntry, maxLen = 60): string {
  return content.length > maxLen ? `${content.slice(0, maxLen)}...` : content;
 }
 
-function describeSkipReason(reason: ReturnType<typeof getMeaningfulSkipReason>, role?: string): string {
- switch (reason) {
-  case "non_message": return "non-message node";
-  case "tool_result": return role ?? "tool result";
-  case "bash_execution": return "bash execution";
-  case "custom_message": return "custom message";
-  case "system_message": return "system message";
-  case "internal_tool_only_assistant": return "internal-tool-only AI turn";
-  case "empty_assistant": return "empty AI turn";
-  case "empty_user": return "empty user turn";
-  default: return "skipped";
- }
-}
 
 function findLastMeaningfulEntry(
  branch: SessionEntry[],
@@ -104,15 +106,6 @@ function findLastMeaningfulEntry(
  );
 }
 
-function formatMeaningfulResolveSummary(result: MeaningfulResolveResult): string {
- if (!result.entryId) return "";
- const role = result.role ?? "NODE";
- const anchor = result.snippet ? `${role}: "${result.snippet}"` : role;
- if (result.skipped.length === 0) return anchor;
- const skipParts = result.skipped.slice(0, 3).map((s) => describeSkipReason(s.reason, s.role));
- const more = result.skipped.length > 3 ? ` +${result.skipped.length - 3} more` : "";
- return `${anchor}; skipped ${result.skipped.length} nearer HEAD (${skipParts.join(", ")}${more})`;
-}
 
 function findEntryInTree(tree: SessionTreeNode[], id: string): SessionEntry | undefined {
  return findInTree(tree, (n) => n.entry.id === id)?.entry;
@@ -139,6 +132,24 @@ function isTravelSummaryDetails(details: unknown): details is TravelSummaryDetai
   typeof d.backupCurrentHeadAs !== "string"
  ) return false;
  return true;
+}
+
+function parseBranchFailureDetails(details: unknown): BranchWithSummaryFailureDetails | undefined {
+ if (typeof details !== "object" || details === null) return undefined;
+ const record = details as Record<string, unknown>;
+ if (typeof record.branchFromId !== "string") return undefined;
+ if (record.leafBefore !== null && typeof record.leafBefore !== "string") return undefined;
+ if (record.leafAfter !== null && typeof record.leafAfter !== "string") return undefined;
+ if (typeof record.mutationApplied !== "boolean") return undefined;
+ if (record.actualSummaryEntryId !== undefined && typeof record.actualSummaryEntryId !== "string") return undefined;
+ return {
+  branchFromId: record.branchFromId,
+  leafBefore: record.leafBefore,
+  leafAfter: record.leafAfter,
+  mutationApplied: record.mutationApplied,
+  returnedSummaryEntryId: record.returnedSummaryEntryId,
+  actualSummaryEntryId: record.actualSummaryEntryId,
+ };
 }
 
 function getBranchSummaryMetaParts(entry: SessionEntry): string[] {
@@ -319,7 +330,7 @@ function formatOffPathFootnotes(
   );
  }
  if (offPath.length > maxShow) {
-  footnotes.push(`  :  [off-path] +${offPath.length - maxShow} more — use search or full_tree`);
+  footnotes.push(`  :  [off-path] +${offPath.length - maxShow} more — use view search or tree`);
  }
  return footnotes;
 }
@@ -484,11 +495,12 @@ function searchFullSessionTree(
  signal?: AbortSignal,
 ): { matches: TreeSearchMatch[]; visited: number; truncated: boolean } {
  const matched: TreeSearchMatch[] = [];
- const searchStack: SessionTreeNode[] = [...tree];
+ const searchStack: SessionTreeNode[] = [];
+ pushTreeChildrenPreOrder(searchStack, tree);
  const contentPattern = createLiteralSearchPattern(searchTerm);
  let visited = 0;
  const maxVisited = 10000;
- while (searchStack.length > 0 && matched.length < searchLimit * 2 && visited < maxVisited) {
+ while (searchStack.length > 0 && visited < maxVisited) {
   if (signal?.aborted) break;
   visited++;
   const n = searchStack.pop()!;
@@ -506,14 +518,16 @@ function searchFullSessionTree(
    });
   }
  }
- matched.sort((a, b) => compareEntriesByTimestamp(a.node.entry, b.node.entry));
+ matched.sort((a, b) => {
+  const timestampOrder = compareEntriesByTimestamp(a.node.entry, b.node.entry);
+  return timestampOrder !== 0 ? timestampOrder : a.node.entry.id.localeCompare(b.node.entry.id);
+ });
  return {
   matches: matched,
   visited,
-  truncated: matched.length >= searchLimit * 2 || visited >= maxVisited,
+  truncated: matched.length > searchLimit || searchStack.length > 0 || signal?.aborted === true,
  };
 }
-
 function formatTreeSearchResults(
  matches: TreeSearchMatch[],
  currentLeafId: string | null,
@@ -522,9 +536,9 @@ function formatTreeSearchResults(
  truncated: boolean,
 ): string[] {
  const lines: string[] = [];
- const totalCount = truncated ? `${Math.min(matches.length, searchLimit * 2)}+` : String(matches.length);
+ const displayedCount = Math.min(matches.length, searchLimit);
  lines.push(
-  `Found ${totalCount} node(s) matching '${searchQuery}' across full tree (showing first ${Math.min(matches.length, searchLimit)}):${truncated ? " Results may be incomplete — narrow your search." : ""}`,
+  `Search '${searchQuery}': ${displayedCount} displayed${truncated ? "; additional matches truncated" : ` of ${matches.length} matching node(s)`}.`,
  );
  for (const m of matches.slice(0, searchLimit)) {
   const isHead = m.node.entry.id === currentLeafId;
@@ -749,122 +763,65 @@ export default function(pi: ExtensionAPI): void {
      const conflict = appendResult.details as CheckpointLabelConflict | undefined;
      const onPath = conflict?.onActivePath ? "on-path" : "off-path";
      return {
-      content: [{ type: "text" as const, text: `Error: Checkpoint '${params.name}' already exists at ${conflict?.entryId ?? "unknown"} (${onPath}). Use a different name.` }],
-      details: { error: "duplicate_name", name: params.name, entryId: conflict?.entryId ?? "" },
+      content: [{
+       type: "text" as const,
+       text: `Checkpoint '${params.name}' already belongs to ${conflict?.entryId ?? "unknown"} (${onPath}). ${RECOVERY_GUIDANCE.nameCollision}`,
+      }],
+      details: {
+       error: "duplicate_name",
+       label: params.name,
+       name: params.name,
+       entryId: conflict?.entryId ?? "",
+       existingEntryId: conflict?.entryId ?? null,
+       existingEntryOnActivePath: conflict?.onActivePath ?? null,
+      },
      };
     }
     return {
-     content: [{ type: "text" as const, text: `Error: checkpoint label '${params.name}' could not be set: ${appendResult.message}.` }],
-     details: { error: appendResult.error, name: params.name, entryId: id, message: appendResult.message },
+     content: [{ type: "text" as const, text: `${appendResult.message}. ${RECOVERY_GUIDANCE.hostCapability}` }],
+     details: {
+      error: appendResult.error,
+      label: params.name,
+      name: params.name,
+      entryId: id,
+      message: appendResult.message,
+      resolvedEntryId: id,
+      hostBridgeMessage: appendResult.message,
+     },
     };
    }
 
-   const { status, aliases } = appendResult.value;
-   if (status === "already_present") {
-    const priorLabels = aliases;
-    const aliasText = priorLabels.length > 1 ? ` Aliases on this node: ${priorLabels.join(", ")}.` : "";
-    return {
-     content: [{ type: "text" as const, text: `Checkpoint '${params.name}' already exists at ${id}.${aliasText}` }],
-     details: { entryId: id, label: params.name, aliases: priorLabels, alreadyPresent: true },
-    };
-   }
-
-   const priorLabels = aliases.slice(0, -1);
-   const aliasSuffix = priorLabels.length > 0 ? ` Added alias alongside: ${priorLabels.join(", ")}.` : "";
-   const explicitRole = targetEntry ? getMessageRoleLabel(targetEntry) : "NODE";
-   // Push context usage plus a fold preview into every checkpoint result,
-   // so the agent sees its fill level and the concrete benefit of folding
-   // to the previous anchor during normal work, without calling acm_timeline.
+   const { status, aliases, labelEntryId } = appendResult.value;
+   const resolvedEntry = targetEntry ?? findEntryInTree(tree, id);
+   const role = autoResolved?.role ?? (resolvedEntry ? getMessageRoleLabel(resolvedEntry) : undefined) ?? resolvedEntry?.type.toUpperCase() ?? "NODE";
    const usage = ctx.getContextUsage();
-   const usageText = formatContextUsage(usage, true);
-   // Nearest previous anchor behind HEAD — the phase-fold target.
-   let prevAnchorLabel: string | null = null;
-   let prevAnchorEntryId: string | null = null;
-   for (let i = branch.length - 1; i >= 0; i--) {
-    const eid = branch[i].id;
-    if (eid === id) continue;
-    const labels = getEntryLabels(labelMaps, eid);
-    if (labels.length > 0) {
-     prevAnchorLabel = labels[labels.length - 1];
-     prevAnchorEntryId = eid;
-     break;
-    }
-   }
-   // Earliest on-path '-start' anchor — the task-chain fold target.
-   let earliestStartLabel: string | null = null;
-   let earliestStartEntryId: string | null = null;
-   for (let i = 0; i < branch.length; i++) {
-    const eid = branch[i].id;
-    if (eid === id) continue;
-    const startLabel = getEntryLabels(labelMaps, eid).find((l) => l.endsWith("-start"));
-    if (startLabel) {
-     earliestStartLabel = startLabel;
-     earliestStartEntryId = eid;
-     break;
-    }
-   }
-   let foldPreview = "";
-   let estimatedAtPrevAnchor: UsageLike | undefined;
-   let estimatedAtEarliestStart: UsageLike | undefined;
-   if (usage && (prevAnchorEntryId || earliestStartEntryId)) {
-    const currentMessagesResult = bridge.buildSessionMessages();
-    if (!currentMessagesResult.ok) {
-     return {
-      content: [{ type: "text" as const, text: `Created checkpoint '${params.name}' at ${id}.${aliasSuffix} Context usage: ${usageText}. (Could not build fold preview: ${currentMessagesResult.message})` }],
-      details: { entryId: id, label: params.name, aliases, previewError: currentMessagesResult.error },
-     };
-    }
-    const currentMessages = currentMessagesResult.value;
-    const previewParts: string[] = [];
-    if (prevAnchorEntryId && prevAnchorLabel) {
-     const targetMessagesResult = bridge.buildSessionMessages(prevAnchorEntryId);
-     if (targetMessagesResult.ok) {
-      estimatedAtPrevAnchor = estimateUsageAfterMessageChange(usage, currentMessages, targetMessagesResult.value);
-      if (estimatedAtPrevAnchor) {
-       previewParts.push(`nearest anchor '${prevAnchorLabel}' → phase/burst candidate ~${formatContextUsage(estimatedAtPrevAnchor, true)} est.`);
-      }
-     }
-    }
-    if (earliestStartEntryId && earliestStartLabel && earliestStartEntryId !== prevAnchorEntryId) {
-     const targetMessagesResult = bridge.buildSessionMessages(earliestStartEntryId);
-     if (targetMessagesResult.ok) {
-      estimatedAtEarliestStart = estimateUsageAfterMessageChange(usage, currentMessages, targetMessagesResult.value);
-      if (estimatedAtEarliestStart) {
-       previewParts.push(`earliest on-path -start '${earliestStartLabel}' → possible task-chain candidate ~${formatContextUsage(estimatedAtEarliestStart, true)} est.`);
-      }
-     }
-    }
-    if (previewParts.length > 0) {
-     foldPreview = formatFoldCandidatePreview(previewParts);
-    }
-   }
-   // Name-triggered guidance: a '-done' checkpoint marks finished work and
-   // task-end handling follows the preview rather than forcing a no-op fold.
-   let doneDirective = "";
-   if (params.name.endsWith("-done")) {
-    const base = params.name.slice(0, -"-done".length);
-    const siblingStart = `${base}-start`;
-    const startRef = labelMaps.labelToEntryId.has(siblingStart) ? siblingStart : "<task>-start";
-    doneDirective = ` '${params.name}' is a milestone/archive pointer. If later work moves past it, this is a recovery target. If this closes the task, use the preview to choose the close: when travel would produce meaningful structural saving, fold before the final answer and answer from the handoff with acm_travel({ target: "${startRef}", summary: <${HANDOFF_SLOT_HINT} handoff> }); when the preview shows almost no saving, keep this unique '-done' checkpoint and answer directly. Boundary decides whether folding is semantically appropriate; preview only measures savings.`;
-   }
-   const usageSuffix = ` Context usage: ${usageText}.${foldPreview}${doneDirective}`;
+   const usageText = usage ? formatContextUsage(usage, true) : "unknown";
+   const cue = params.name.endsWith("-done") ? GUIDANCE_CUES.checkpointDone : GUIDANCE_CUES.checkpointStart;
+   const skippedCount = autoResolved?.skipped.length;
+   const placement = autoResolved
+    ? `${role}${skippedCount ? `; skipped ${skippedCount} nearer transient/non-meaningful entr${skippedCount === 1 ? "y" : "ies"}` : ""}`
+    : `${role}; explicit target '${params.target}'`;
+   const action = status === "already_present" ? "Reused" : "Created";
+   const aliasesText = aliases.join(", ");
    return {
     content: [{
      type: "text" as const,
-     text: autoResolved
-      ? `Created checkpoint '${params.name}' at ${id} (${formatMeaningfulResolveSummary(autoResolved)}).${aliasSuffix}${usageSuffix}`
-      : `Created checkpoint '${params.name}' at ${id} (${explicitRole}${params.target ? `, target='${params.target}'` : ""}).${aliasSuffix}${usageSuffix}`,
+     text: `${action} checkpoint '${params.name}' at ${id} via label entry ${labelEntryId} (${placement}). Aliases: ${aliasesText}. Context usage: ${usageText}. ${cue}`,
     }],
     details: {
-     entryId: id,
+     status,
+     alreadyPresent: status === "already_present",
      label: params.name,
-     aliases: [...priorLabels, params.name],
+     labelEntryId,
+     entryId: id,
+     resolvedEntryId: id,
+     role,
+     aliases,
      target: params.target ?? "auto",
+     targetResolution: params.target ? "explicit" : "automatic",
      contextUsage: usage ? { percent: usage.percent, tokens: usage.tokens, contextWindow: usage.contextWindow } : null,
-     previousAnchor: prevAnchorLabel,
-     estimatedUsageAtPreviousAnchor: estimatedAtPrevAnchor ? formatContextUsage(estimatedAtPrevAnchor, true) : null,
-     earliestStartAnchor: earliestStartLabel,
-     estimatedUsageAtEarliestStart: estimatedAtEarliestStart ? formatContextUsage(estimatedAtEarliestStart, true) : null,
+     contextUsageAvailable: usage !== undefined,
+     skippedTransientCount: skippedCount ?? null,
      autoResolved: autoResolved
       ? {
          role: autoResolved.role,
@@ -873,34 +830,48 @@ export default function(pi: ExtensionAPI): void {
          skipped: autoResolved.skipped,
         }
       : undefined,
+     cue,
     },
    };
   },
  });
 
  // ── Tool: acm_timeline ─────────────────────────────────────
- const timelineSchema = zod.object({
-  limit: zod.number().int().min(1).max(50).optional().describe("In default active-path mode: maximum visible entries (default 50). In full_tree mode: maximum tree depth to render. With search: maximum results returned. Range 1..50."),
-  verbose: zod.boolean().optional().describe(
-   "Show all messages including internal tool traffic, system/custom meta messages, and ACM tool calls. Applies only in default active-path mode; ignored when list_checkpoints, search, or full_tree is active.",
-  ),
-  full_tree: zod.boolean().optional().describe(
-   "Show all branches including off-path nodes with IDs. Default false (active path only). Prefer list_checkpoints or search on large trees. Ignored when list_checkpoints or search is set.",
-  ),
-  list_checkpoints: zod.boolean().optional().describe(
-   "List checkpoint labels across the full tree with node IDs and on-path/off-path tags. Display is capped at 50 — use search to narrow. Ignores verbose and full_tree when set.",
-  ),
-  search: zod.string().max(500).optional().describe(
-   "Search the full session tree (active + off-path) for matching checkpoint labels, node IDs, or content. When set without list_checkpoints, returns matching nodes. With list_checkpoints, filters the checkpoint catalog. Mode precedence when multiple params are set: list_checkpoints > search > full_tree > default active path.",
-  ),
- });
+ const timelineLimitSchema = zod.number().int().min(1).max(50).default(50).describe(
+  "Maximum recent visible entries (active), sorted aliases (checkpoints), matches (search), or traversal depth per root (tree). Range 1..50; default 50.",
+ );
+ const timelineViewSchema = zod.discriminatedUnion("view", [
+  zod.object({
+   view: zod.literal("active"),
+   limit: timelineLimitSchema,
+   verbose: zod.boolean().optional().describe("Show all active-path messages, including internal tool traffic and system/custom metadata."),
+  }).strict(),
+  zod.object({
+   view: zod.literal("checkpoints"),
+   limit: timelineLimitSchema,
+   filter: zod.string().trim().min(1).max(500).optional().describe("Optional non-blank checkpoint label or entry-ID filter, matched case-insensitively."),
+  }).strict(),
+  zod.object({
+   view: zod.literal("search"),
+   limit: timelineLimitSchema,
+   query: zod.string().trim().min(1).max(500).describe("Required non-blank full-tree query matching labels, node IDs, or rendered content case-insensitively."),
+  }).strict(),
+  zod.object({
+   view: zod.literal("tree"),
+   limit: timelineLimitSchema,
+  }).strict(),
+ ]);
+ const timelineSchema = zod.preprocess((rawParams) => {
+  if (typeof rawParams !== "object" || rawParams === null || Array.isArray(rawParams) || "view" in rawParams) return rawParams;
+  return { ...rawParams, view: "active" };
+ }, timelineViewSchema);
 
  registerTool({
   name: "acm_timeline",
   label: "ACM Timeline",
   description: TOOL_DESCRIPTIONS.timeline,
   parameters: timelineSchema as unknown as TSchema,
-  strict: false,
+  strict: true,
   async execute(
    _id: string,
    rawParams: unknown,
@@ -913,12 +884,12 @@ export default function(pi: ExtensionAPI): void {
    const bridge = getHostBridge(sm);
    const tree = bridge.getTree();
    const currentLeafId = bridge.getLeafId();
-   const verbose = params.verbose ?? false;
-   const limit = params.limit ?? 50;
-   const timelineMode = resolveTimelineMode(params);
-   const useFullTree = timelineMode === "full_tree";
-   const listCheckpoints = timelineMode === "list_checkpoints";
-   const searchTerm = params.search?.toLowerCase().trim() ?? "";
+   const view = params.view;
+   const verbose = view === "active" ? params.verbose ?? false : false;
+   const limit = params.limit;
+   const useFullTree = view === "tree";
+   const listCheckpoints = view === "checkpoints";
+   const searchTerm = (view === "search" ? params.query : view === "checkpoints" ? params.filter : undefined)?.toLowerCase() ?? "";
 
    const lines: string[] = [];
    const branch = bridge.getBranch();
@@ -930,16 +901,25 @@ export default function(pi: ExtensionAPI): void {
    const childIndex = buildChildIndex(tree);
    const offPathForks = countOffPathForks(branch, childIndex, backboneIds);
    let treeTruncated = false;
+   let activeVisibleEntries = 0;
+   let activeDisplayedEntries = 0;
+   let activeOmittedEntries = 0;
+   let checkpointsMatchingAliases = 0;
+   let checkpointsDisplayedAliases = 0;
+   let searchDisplayedMatches = 0;
+   let searchWasTruncated = false;
 
    if (listCheckpoints) {
     const listings = collectCheckpointListings(
      labelMaps, backboneIds, currentLeafId, searchTerm, entriesById, pathOrderById,
     );
+    checkpointsMatchingAliases = listings.length;
+    checkpointsDisplayedAliases = Math.min(listings.length, limit);
     const listLimit = limit;
     const usage = ctx.getContextUsage();
     const currentMessagesResult = bridge.buildSessionMessages(currentLeafId);
     if (!currentMessagesResult.ok) {
-     lines.push(`Checkpoints (${listings.length} total${searchTerm ? ` matching '${params.search}'` : ""}, showing up to ${listLimit}; cap 50). Current messages could not be built: ${currentMessagesResult.message}`);
+     lines.push(`Checkpoints (${listings.length} matching aliases, 0 displayed). Current messages could not be built: ${currentMessagesResult.message}`);
      return {
       content: [{ type: "text" as const, text: lines.join("\n") }],
       details: { error: currentMessagesResult.error, message: currentMessagesResult.message },
@@ -949,7 +929,7 @@ export default function(pi: ExtensionAPI): void {
     const targetCache = new Map<string, AgentMessage[]>();
     const currentUsageText = formatContextUsage(usage, true);
     lines.push(
-     `Checkpoints (${listings.length} total${searchTerm ? ` matching '${params.search}'` : ""}, showing up to ${listLimit}; cap 50). Current: ${currentMessages.length} msgs, ${currentUsageText}:`
+     `Checkpoints (${listings.length} matching aliases, ${checkpointsDisplayedAliases} displayed${searchTerm ? ` for '${params.filter}'` : ""}; cap 50). Current: ${currentMessages.length} msgs, ${currentUsageText}:`
     );
     for (const cp of listings.slice(0, listLimit)) {
      const pathTag = cp.onActivePath ? "on-path" : "off-path";
@@ -967,30 +947,30 @@ export default function(pi: ExtensionAPI): void {
      lines.push(`  ${cp.label} → ${cp.entryId} (${pathTag}${headTag}) ${estPart}`);
     }
     if (listings.length > listLimit) {
-     lines.push(`  ... +${listings.length - listLimit} more — use search to narrow (display cap 50)`);
+     lines.push(`  ... +${listings.length - listLimit} more — use a narrower filter`);
     }
-   } else if (searchTerm) {
-    const searchLimit = limit;
+   } else if (view === "search") {
     const { matches, truncated } = searchFullSessionTree(
-     tree, labelMaps, searchTerm, searchLimit, signal,
+     tree, labelMaps, searchTerm, limit, signal,
     );
-    lines.push(...formatTreeSearchResults(matches, currentLeafId, params.search!, searchLimit, truncated));
+    searchDisplayedMatches = Math.min(matches.length, limit);
+    searchWasTruncated = truncated;
+    lines.push(...formatTreeSearchResults(matches, currentLeafId, params.query!, limit, truncated));
    } else if (useFullTree) {
     const maxDepth = limit;
     for (let i = 0; i < tree.length; i++) {
      if (signal?.aborted) break;
      const truncated = renderTreeNode(
-      tree[i], labelMaps, currentLeafId, backboneIds, 0, maxDepth, "", i === tree.length - 1, lines, signal,
+     tree[i], labelMaps, currentLeafId, backboneIds, 1, maxDepth, "", i === tree.length - 1, lines, signal,
      );
      if (truncated) treeTruncated = true;
     }
     if (lines.length >= 200) treeTruncated = true;
     if (treeTruncated) {
-     lines.unshift("⚠ tree truncated by depth/line limit — use list_checkpoints or search to see hidden nodes");
+     lines.unshift("⚠ tree truncated by depth/line limit — use view checkpoints or view search to see hidden nodes");
     }
    } else {
     const sequence: SessionEntry[] = [...branch];
-    if (params.search !== undefined && searchTerm === "") lines.push("query is empty; showing active path");
 
     const contentCache = new Map<string, string>();
     for (const e of sequence) {
@@ -1006,19 +986,25 @@ export default function(pi: ExtensionAPI): void {
      }
     }
 
+    const allVisibleSequenceIds = new Set(visibleSequenceIds);
     const visibleEntries = sequence.filter((e: SessionEntry) => visibleSequenceIds.has(e.id));
-    const effectiveLimit = limit;
-    if (visibleEntries.length > effectiveLimit) {
-     const allowedIds = new Set(visibleEntries.slice(-effectiveLimit).map((e) => e.id));
+    activeVisibleEntries = visibleEntries.length;
+    activeDisplayedEntries = Math.min(visibleEntries.length, limit);
+    activeOmittedEntries = Math.max(0, visibleEntries.length - limit);
+    if (activeOmittedEntries > 0) {
+     const allowedIds = new Set(visibleEntries.slice(-limit).map((e) => e.id));
      visibleSequenceIds.clear();
      allowedIds.forEach((id) => visibleSequenceIds.add(id));
     }
 
+    if (activeOmittedEntries > 0) {
+     lines.push(`  :  ... (${activeOmittedEntries} earlier visible entries omitted by limit) ...`);
+    }
     let hiddenCount = 0;
     for (const entry of sequence) {
      if (signal?.aborted) break;
      if (!visibleSequenceIds.has(entry.id)) {
-      hiddenCount++;
+      if (!allVisibleSequenceIds.has(entry.id)) hiddenCount++;
       continue;
      }
      if (hiddenCount > 0) {
@@ -1088,7 +1074,9 @@ export default function(pi: ExtensionAPI): void {
     `• Travel Cue:       ${travelCue}`,
    ];
    if (refreshFailure) {
-    hudParts.push(`• Context Sync:     last travel refresh failed — ${refreshFailure}`);
+    const attempts = contextRefresh.getAttemptCount(sm);
+    const exhausted = attempts >= ContextRefreshRegistry.MAX_ATTEMPTS && !refreshPending;
+    hudParts.push(`• Context Sync:     last travel refresh failed — ${refreshFailure}${exhausted ? ` ${RECOVERY_GUIDANCE.refreshExhausted}` : ""}`);
    } else if (refreshPending) {
     const attempt = contextRefresh.getAttemptCount(sm);
     const retrySuffix = attempt > 0
@@ -1097,10 +1085,10 @@ export default function(pi: ExtensionAPI): void {
     const pendingSuffix = contextRefresh.hasRebuilt(sm) ? "" : " (travel pending)";
     hudParts.push(`• Context Sync:     persistent rebuild active${pendingSuffix}${retrySuffix}`);
    }
-   if (!listCheckpoints && !useFullTree) {
-    hudParts.push(`• Tip:              large trees → list_checkpoints or search before full_tree`);
+   if (view === "active" || view === "search") {
+    hudParts.push(`• Tip:              large trees → view checkpoints or search before tree`);
    } else if (useFullTree && treeTruncated) {
-    hudParts.push(`• Tip:              tree truncated → list_checkpoints: true or search: "checkpoint-name"`);
+    hudParts.push(`• Tip:              tree truncated → { view: "checkpoints" } or { view: "search", query: "checkpoint-name" }`);
    }
    const hud = [...hudParts, `---------------------------------------------------`].join("\n");
 
@@ -1113,12 +1101,17 @@ export default function(pi: ExtensionAPI): void {
      stepsSinceCheckpoint,
      activePathNodes: branch.length,
      offPathSummaries: offPathForks,
-     fullTree: useFullTree,
-     listCheckpoints,
-     timelineMode,
-     search: searchTerm || null,
+     view,
+     limit,
      verbose,
      treeTruncated,
+     activeVisibleEntries: view === "active" ? activeVisibleEntries : null,
+     activeDisplayedEntries: view === "active" ? activeDisplayedEntries : null,
+     activeOmittedEntries: view === "active" ? activeOmittedEntries : null,
+     checkpointsMatchingAliases: view === "checkpoints" ? checkpointsMatchingAliases : null,
+     checkpointsDisplayedAliases: view === "checkpoints" ? checkpointsDisplayedAliases : null,
+     searchDisplayedMatches: view === "search" ? searchDisplayedMatches : null,
+     searchTruncated: view === "search" ? searchWasTruncated : false,
      outputLines: lines.length,
      contextRefreshPending: refreshPending,
      contextRefreshFailure: refreshFailure ?? null,
@@ -1130,7 +1123,7 @@ export default function(pi: ExtensionAPI): void {
  // ── Tool: acm_travel ───────────────────────────────────────
  const travelSchema = zod.object({
   target: zod.string().min(1).max(256).describe(
-   "Checkpoint name, history node ID, or 'root'. Name the boundary first, then choose a target before that boundary. On large trees use acm_timeline with list_checkpoints or search; use full_tree only when the surrounding branch structure is needed.",
+   "Checkpoint name, history node ID, or 'root'. Name the boundary first, then choose a target before that boundary. On large trees use acm_timeline with view checkpoints or search; use view tree only when the surrounding branch structure is needed.",
   ),
   summary: zod.string().min(1).max(10000).describe(
    `Handoff summary — the working state after travel. It must make the next action executable without rereading the folded trail. Fill every slot, write 'none' rather than dropping one: ${HANDOFF_SLOT_HINT}. Include recovery pointers; pointers over dumps. Max 10000 chars.`,
@@ -1154,21 +1147,31 @@ export default function(pi: ExtensionAPI): void {
    ctx: ExtensionContext,
   ) {
    const params = travelSchema.parse(rawParams);
+   const handoffValidation = validateHandoffStructure(params.summary);
+   if (!handoffValidation.ok) {
+    return {
+     content: [{ type: "text" as const, text: `Error: handoff must contain each non-empty slot once and in order: ${HANDOFF_SLOT_HINT}. Travel aborted before mutation.` }],
+     details: { error: "invalid_handoff", validation: handoffValidation },
+    };
+   }
+
    const sm = ctx.sessionManager;
    const bridge = getHostBridge(sm);
    const tree = bridge.getTree();
    const branch = bridge.getBranch();
    const labelMaps = bridge.buildLabelMaps();
    const branchIds: Set<string> = new Set(branch.map((e: SessionEntry) => e.id));
+   const requestedRoot = params.target.toLowerCase() === "root";
+   const resolvedBy = requestedRoot ? "root" : labelMaps.labelToEntryId.has(params.target) ? "checkpoint" : "entry_id";
    const resolved = resolveTargetId(bridge, tree, params.target, branchIds, labelMaps);
    const tid = resolved.id;
-   if (params.target.toLowerCase() === "root" && !isValidEntryId(tid)) {
+   if (requestedRoot && !isValidEntryId(tid)) {
     return {
      content: [{ type: "text" as const, text: "Error: Cannot travel to root — session tree is empty." }],
      details: { error: "empty_session", requestedTarget: params.target },
     };
    }
-   if (params.target.toLowerCase() === "root" && tree.length > 1) {
+   if (requestedRoot && tree.length > 1) {
     ctx.ui.notify(
      `Note: 'root' resolved to the first top-level node (${tid}); this session has ${tree.length} top-level roots.`,
      "info",
@@ -1236,9 +1239,7 @@ export default function(pi: ExtensionAPI): void {
 
    let backupEntryId: string | undefined;
    let backupResolvedFromHead: string | undefined;
-   let backupLabelWrittenThisCall = false;
-   let backupHadNoPriorLabels = false;
-   let backupLabelEntryId: string | undefined;
+   let backupPrevalidation: CheckpointLabelPrevalidation | undefined;
    if (params.backupCurrentHeadAs) {
     const headResolve = findLastMeaningfulEntry(branch, signal);
     if (headResolve.aborted) {
@@ -1261,26 +1262,70 @@ export default function(pi: ExtensionAPI): void {
       "info",
      );
     }
-    const backupAppend = bridge.appendCheckpointLabel(backupEntryId, params.backupCurrentHeadAs);
-    if (!backupAppend.ok) {
-     if (backupAppend.error === "label_conflict") {
-      const conflict = backupAppend.details as CheckpointLabelConflict | undefined;
+   }
+
+   const branchPrevalidation = bridge.prevalidateBranchWithSummary(tid);
+   if (!branchPrevalidation.ok) {
+    return {
+     content: [{ type: "text" as const, text: `Error: travel host prevalidation failed: ${branchPrevalidation.message}. No mutation was attempted. ${RECOVERY_GUIDANCE.hostCapability}` }],
+     details: {
+      error: "branch_prevalidation_failed",
+      hostError: branchPrevalidation.error,
+      message: branchPrevalidation.message,
+      target: params.target,
+      targetId: tid,
+     },
+    };
+   }
+
+   if (params.backupCurrentHeadAs && backupEntryId) {
+    const backupCheck = bridge.prevalidateCheckpointLabel(backupEntryId, params.backupCurrentHeadAs);
+    if (!backupCheck.ok) {
+     if (backupCheck.error === "label_conflict") {
+      const conflict = backupCheck.details as CheckpointLabelConflict | undefined;
       const existing = `${conflict?.entryId ?? "unknown"}${conflict?.onActivePath ? " (on-path)" : " (off-path)"}`;
       return {
-       content: [{ type: "text" as const, text: `Error: archive bookmark name '${params.backupCurrentHeadAs}' already exists at ${existing}. Use a different backupCurrentHeadAs name; the handoff must still carry the executable state.` }],
+       content: [{ type: "text" as const, text: `Error: archive bookmark name '${params.backupCurrentHeadAs}' already exists at ${existing}. ${RECOVERY_GUIDANCE.nameCollision}` }],
        details: { error: "duplicate_backup_name", name: params.backupCurrentHeadAs, owner: conflict },
       };
      }
      return {
-      content: [{ type: "text" as const, text: `Error: archive bookmark '${params.backupCurrentHeadAs}' could not be set: ${backupAppend.message}. Travel aborted.` }],
-      details: { error: "backup_label_failed", name: params.backupCurrentHeadAs, message: backupAppend.message },
+      content: [{ type: "text" as const, text: `Error: archive bookmark '${params.backupCurrentHeadAs}' failed prevalidation: ${backupCheck.message}. No mutation was attempted. ${RECOVERY_GUIDANCE.hostCapability}` }],
+      details: { error: "backup_prevalidation_failed", name: params.backupCurrentHeadAs, message: backupCheck.message, recoveryAction: RECOVERY_GUIDANCE.hostCapability },
      };
     }
-    if (backupAppend.value.status === "created") {
-     backupHadNoPriorLabels = backupAppend.value.aliases.length === 1;
-     backupLabelEntryId = backupAppend.value.labelEntryId;
-     backupLabelWrittenThisCall = true;
+    backupPrevalidation = backupCheck.value;
+   }
+
+   if (signal?.aborted) {
+    return {
+     content: [{ type: "text" as const, text: "acm_travel aborted after prevalidation and before mutation." }],
+     details: { error: "aborted", target: params.target, targetId: tid },
+    };
+   }
+
+   let backupLabelWrittenThisCall = false;
+   let backupHadNoPriorLabels = false;
+   let backupLabelEntryId: string | undefined;
+   if (params.backupCurrentHeadAs && backupEntryId && backupPrevalidation?.status === "would_create") {
+    const backupAppend = bridge.appendCheckpointLabel(backupEntryId, params.backupCurrentHeadAs);
+    if (!backupAppend.ok) {
+     const labelOwner = bridge.buildLabelMaps().labelToEntryId.get(params.backupCurrentHeadAs);
+     const labelRemaining = labelOwner === backupEntryId;
+     return {
+      content: [{ type: "text" as const, text: `Error: archive bookmark '${params.backupCurrentHeadAs}' could not be set: ${backupAppend.message}. Travel aborted. ${RECOVERY_GUIDANCE.hostCapability}${labelRemaining ? ` ${RECOVERY_GUIDANCE.rollbackFailed}` : ""}` }],
+      details: {
+       error: "backup_label_failed",
+       name: params.backupCurrentHeadAs,
+       message: backupAppend.message,
+       backupEntryId,
+       labelRemaining,
+      },
+     };
     }
+    backupHadNoPriorLabels = backupPrevalidation.aliases.length === 0;
+    backupLabelEntryId = backupAppend.value.labelEntryId;
+    backupLabelWrittenThisCall = true;
    }
 
    const travelDetails: TravelSummaryDetails = {
@@ -1290,51 +1335,81 @@ export default function(pi: ExtensionAPI): void {
     targetId: tid,
     backupCurrentHeadAs: params.backupCurrentHeadAs ?? null,
    };
-   let summaryEntryId: string | undefined;
    const branchResult = bridge.branchWithSummary(tid, params.summary, travelDetails);
    if (!branchResult.ok) {
-    const errText = branchResult.message;
+    const branchFailure = parseBranchFailureDetails(branchResult.details);
+    const mutationApplied = branchFailure?.mutationApplied ?? bridge.getLeafId() !== originId;
     let backupRolledBack = false;
     let backupRollbackFailed = false;
     let backupRollbackSkipped = false;
+    let backupRollbackSkipReason: "branch_mutation_observed" | "prior_aliases" | null = null;
+
     if (backupLabelWrittenThisCall && backupLabelEntryId) {
-     if (backupHadNoPriorLabels) {
-      const clear = bridge.clearCreatedLabel(backupLabelEntryId);
-      if (clear.ok) {
-       backupRolledBack = true;
-      } else {
-       backupRollbackFailed = true;
-      }
-     } else {
+     if (mutationApplied) {
       backupRollbackSkipped = true;
+      backupRollbackSkipReason = "branch_mutation_observed";
+     } else if (!backupHadNoPriorLabels) {
+      backupRollbackSkipped = true;
+      backupRollbackSkipReason = "prior_aliases";
+     } else {
+      const clear = bridge.clearCreatedLabel(backupLabelEntryId);
+      const aliasesAfterRollback = backupEntryId
+       ? bridge.buildLabelMaps().entryToLabels.get(backupEntryId) ?? []
+       : [];
+      const labelStillPresent = params.backupCurrentHeadAs
+       ? aliasesAfterRollback.includes(params.backupCurrentHeadAs)
+       : false;
+      backupRolledBack = clear.ok || !labelStillPresent;
+      backupRollbackFailed = !backupRolledBack;
      }
     }
+
+    const aliasesAfterFailure = backupEntryId
+     ? bridge.buildLabelMaps().entryToLabels.get(backupEntryId) ?? []
+     : [];
+    const backupLabelRemaining = params.backupCurrentHeadAs
+     ? aliasesAfterFailure.includes(params.backupCurrentHeadAs)
+     : false;
+    const recoveryAction = backupRollbackFailed
+     ? RECOVERY_GUIDANCE.rollbackFailed
+     : backupRollbackSkipped || mutationApplied
+      ? RECOVERY_GUIDANCE.rollbackSkipped
+      : backupRolledBack
+       ? RECOVERY_GUIDANCE.branchRolledBack
+       : RECOVERY_GUIDANCE.hostCapability;
+
     let backupNote = "";
-    if (params.backupCurrentHeadAs) {
-     if (backupRollbackSkipped) {
-      backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains on the tree (rollback skipped — entry had other checkpoint aliases).`;
-     } else if (backupRollbackFailed) {
-      backupNote = ` Backup label '${params.backupCurrentHeadAs}' was written but could not be rolled back.`;
-     } else if (backupRolledBack) {
-      backupNote = ` Backup label '${params.backupCurrentHeadAs}' was rolled back.`;
-     } else if (backupLabelWrittenThisCall) {
-      backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains on the tree.`;
-     }
+    if (backupRollbackSkipped && backupRollbackSkipReason === "branch_mutation_observed") {
+     backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains because branch mutation was observed.`;
+    } else if (backupRollbackSkipped) {
+     backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains because the target had prior aliases.`;
+    } else if (backupRollbackFailed) {
+     backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains at ${backupEntryId}; rollback failed.`;
+    } else if (backupRolledBack) {
+     backupNote = ` Backup label '${params.backupCurrentHeadAs}' was rolled back.`;
+    } else if (backupLabelWrittenThisCall) {
+     backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains on the tree.`;
     }
+
     return {
-     content: [{ type: "text" as const, text: `Error: branchWithSummary failed: ${errText}.${backupNote}` }],
+     content: [{ type: "text" as const, text: `Error: branchWithSummary failed: ${branchResult.message}.${backupNote} ${recoveryAction}` }],
      details: {
       error: "branch_failed",
+      hostError: branchResult.error,
+      branchFailure: branchFailure ?? null,
       backupCurrentHeadAs: params.backupCurrentHeadAs ?? null,
       backupEntryId,
       backupLabelWritten: backupLabelWrittenThisCall,
       backupRolledBack,
       backupRollbackFailed,
       backupRollbackSkipped,
+      backupRollbackSkipReason,
+      remainingBackupLabel: backupLabelRemaining ? params.backupCurrentHeadAs ?? null : null,
+      recoveryAction,
      },
     };
    }
-   summaryEntryId = branchResult.value.summaryEntryId;
+   const summaryEntryId = branchResult.value.summaryEntryId;
 
    contextRefresh.markPending(sm);
    refreshTargetLeafIds.set(sm, summaryEntryId);
@@ -1342,56 +1417,91 @@ export default function(pi: ExtensionAPI): void {
    const afterMessagesResult = bridge.buildSessionMessages();
    if (!afterMessagesResult.ok) {
     return {
-     content: [{ type: "text" as const, text: `Travel completed but could not rebuild session messages: ${afterMessagesResult.message}.` }],
-     details: { error: "build_messages_failed", message: afterMessagesResult.message, summaryEntryId },
+     content: [{ type: "text" as const, text: `Travel mutation completed, but session-message evidence is unavailable: ${afterMessagesResult.message}. ${RECOVERY_GUIDANCE.refreshPending}` }],
+     details: {
+      error: "build_messages_failed",
+      message: afterMessagesResult.message,
+      target: params.target,
+      targetId: tid,
+      originId,
+      summaryEntryId,
+      resultingLeafId: branchResult.value.leafAfter,
+      contextRefreshPending: true,
+      recoveryAction: RECOVERY_GUIDANCE.refreshPending,
+     },
     };
    }
    const afterMessages = afterMessagesResult.value;
    const messagesAfter = afterMessages.length;
    const estimatedUsageAfter = estimateUsageAfterMessageChange(usageBefore, currentMessages, afterMessages);
    const estimatedUsageAfterText = formatContextUsage(estimatedUsageAfter, true);
-   const estimatedEffect = classifyTravelEffect(usageBefore, estimatedUsageAfter);
-   const structuralEffect = classifyStructuralMessageEffect(messagesBefore, messagesAfter);
+   const usageDelta = calculateUsageDelta(usageBefore, estimatedUsageAfter);
+   const structuralMessageDelta = messagesAfter - messagesBefore;
+   const structuralMessageDirection = classifyStructuralMessageDirection(messagesBefore, messagesAfter);
    const backupText = formatBackupText(params.backupCurrentHeadAs, backupEntryId, backupResolvedFromHead);
-   const messageDelta = `${messagesBefore} → ${messagesAfter} (${structuralEffect})`;
+   const backupOutcome = !params.backupCurrentHeadAs
+    ? "none"
+    : backupPrevalidation?.status === "already_present"
+     ? "already_present"
+     : backupLabelWrittenThisCall
+      ? "created"
+      : "unknown";
+   const messageDelta = `${messagesBefore} → ${messagesAfter} (${formatSignedDelta(structuralMessageDelta)}, ${structuralMessageDirection})`;
+   const usageBeforeTokens = usageBefore?.tokens ?? null;
+   const usageBeforePercent = usageBefore?.percent ?? null;
+   const usageContextWindow = usageBefore?.contextWindow ?? estimatedUsageAfter?.contextWindow ?? null;
+   const estimatedUsageAfterTokens = estimatedUsageAfter?.tokens ?? null;
+   const estimatedUsageAfterPercent = estimatedUsageAfter?.percent ?? null;
+   const usageBeforePercentText = usageBeforePercent === null ? "unknown" : `${usageBeforePercent.toFixed(1)}%`;
+   const estimatedUsageAfterPercentText = estimatedUsageAfterPercent === null ? "unknown" : `${estimatedUsageAfterPercent.toFixed(1)}%`;
+   const nextCue = params.backupCurrentHeadAs?.endsWith("-done")
+    ? GUIDANCE_CUES.travelTask
+    : GUIDANCE_CUES.travelPhase;
 
    return {
     content: [{
      type: "text" as const,
      text: [
-      `Travel complete. You are now on the handoff branch. target=${params.target} (${tid}); archive=${backupText}; context ${usageBeforeText} → ${estimatedUsageAfterText} est. (estimatedEffect=${estimatedEffect}, structuralEffect=${structuralEffect}); sessionMessages=${messageDelta}; summaryEntryId=${summaryEntryId}.`,
-      "Treat the handoff as the working state: execute its NEXT. Raw trail is archived off-path; recover it via the archive pointer or timeline search.",
-      "Context rebuild is now persistent: every subsequent LLM turn is rebuilt from the handoff branch until the next travel or session reload. Run acm_timeline if official token % or sync status is unclear.",
-      estimatedUsagePreview
-       ? `Pre-travel preview was ${estimatedPreviewText} est. — compare with post-travel estimate above.`
-       : null,
-      "Estimates use buildSessionContext + token model; official % confirms on the next LLM context event or acm_timeline.",
-      "Note: the branch summary entry is appended synchronously and may appear before this tool call in the session log.",
-      "If this was a task-end fold, give the final answer from the handoff. Otherwise checkpoint the next phase ('<phase>-start') before its first action.",
+      `Travel complete. target=${params.target} (${tid}); origin=${originLabel ? `${originLabel}@${originId}` : originId}; summaryEntryId=${summaryEntryId}; resultingLeafId=${branchResult.value.leafAfter}; backup=${backupText} (${backupOutcome}); contextTokens=${formatNumericValue(usageBeforeTokens)} → ${formatNumericValue(estimatedUsageAfterTokens)} est. (delta=${formatSignedDelta(usageDelta.tokenDelta)}); contextPercent=${usageBeforePercentText} → ${estimatedUsageAfterPercentText} est. (delta=${formatSignedDelta(usageDelta.percentagePointDelta, 1, " pp")}); sessionMessages=${messageDelta}; contextRefresh=pending.`,
+      resolved.fromOffPath ? RECOVERY_GUIDANCE.restoredHistory : null,
+      nextCue,
      ].filter((line): line is string => line !== null).join("\n"),
     }],
     details: {
      target: params.target,
      targetId: tid,
+     resolvedBy,
+     resolvedEntryId: tid,
+     rootCount: requestedRoot ? tree.length : null,
      originId,
      originLabel,
      hasBackup: !!params.backupCurrentHeadAs,
      backupCurrentHeadAs: params.backupCurrentHeadAs ?? null,
      backupEntryId,
      backupResolvedFromHead,
+     backupOutcome,
      usageBefore: usageBeforeText,
      usageAfter: "pending_next_context_event",
      estimatedUsagePreview: estimatedPreviewText,
      estimatedUsageAfter: estimatedUsageAfterText,
-     estimatedEffect,
+     usageBeforeTokens,
+     usageBeforePercent,
+     usageContextWindow,
+     estimatedUsageAfterTokens,
+     estimatedUsageAfterPercent,
+     tokenDelta: usageDelta.tokenDelta,
+     percentagePointDelta: usageDelta.percentagePointDelta,
      structuralMessagesBefore: messagesBefore,
      structuralMessagesAfter: messagesAfter,
-     structuralEffect,
+     structuralMessageDelta,
+     structuralMessageDirection,
      sessionMessages: messageDelta,
      messagesBefore,
      messagesAfter,
      summaryEntryId,
+     resultingLeafId: branchResult.value.leafAfter,
      contextRefreshPending: true,
+     contextRefreshState: "pending",
      fromOffPath: resolved.fromOffPath,
     },
    };
@@ -1425,7 +1535,7 @@ export default function(pi: ExtensionAPI): void {
    ctx.ui.notify(
     willRetry
      ? `Context refresh after travel failed (${attempt}/${ContextRefreshRegistry.MAX_ATTEMPTS}): ${message}. Will retry on the next LLM turn.`
-     : `Context refresh after travel failed after ${attempt} attempts: ${message}. Reload the session to sync messages.`,
+     : `Context refresh after travel failed after ${attempt} attempts: ${message}. ${RECOVERY_GUIDANCE.refreshExhausted}`,
     "warning",
    );
    return { messages: event.messages };
@@ -1472,11 +1582,13 @@ export default function(pi: ExtensionAPI): void {
   if (branch.length === 0) return;
   const labelMaps = bridge.buildLabelMaps();
   const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-  const checkpointName = `pre-compact-${ts}`;
+  const checkpointBase = `pre-compact-${ts}`;
+  let checkpointName = checkpointBase;
+  for (let ordinal = 2; labelMaps.labelToEntryId.has(checkpointName); ordinal++) {
+   checkpointName = `${checkpointBase}-${ordinal}`;
+  }
   const resolve = findLastMeaningfulEntry(branch, event.signal);
   if (!resolve.entryId) return;
-  const priorLabels = getEntryLabels(labelMaps, resolve.entryId);
-  if (priorLabels.includes(checkpointName)) return;
   const append = bridge.appendCheckpointLabel(resolve.entryId, checkpointName);
   if (!append.ok) {
    ctx.ui.notify(`Could not create pre-compaction checkpoint: ${append.message}`, "warning");

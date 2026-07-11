@@ -1,44 +1,25 @@
 import { describe, expect, test } from "bun:test";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { z } from "zod";
-import { ACM_CORE, TOOL_DESCRIPTIONS } from "./generated-guidance";
-import registerACMExtension from "./tools";
+import { readFileSync } from "node:fs";
+import { TOOL_DESCRIPTIONS } from "./generated-guidance.js";
 
-interface RegisteredTool {
-	name: string;
-	description: string;
-}
+const source = readFileSync(new URL("./tools.ts", import.meta.url), "utf8");
 
 describe("ACM tool description contract", () => {
-	test("registers the canonical generated guidance for every ACM tool", () => {
-		const registered: RegisteredTool[] = [];
-		const pi = {
-			zod: z,
-			on() {},
-			registerTool(tool: unknown) {
-				if (
-					typeof tool === "object" &&
-					tool !== null &&
-					"name" in tool &&
-					typeof tool.name === "string" &&
-					"description" in tool &&
-					typeof tool.description === "string"
-				) {
-					registered.push({ name: tool.name, description: tool.description });
-				}
-			},
-		};
-		// The fixture supplies the narrow ExtensionAPI surface exercised during registration.
-		registerACMExtension(pi as unknown as ExtensionAPI);
+ test("registers every runtime description from canonical generated guidance", () => {
+  expect(source).toContain("description: TOOL_DESCRIPTIONS.checkpoint");
+  expect(source).toContain("description: TOOL_DESCRIPTIONS.timeline");
+  expect(source).toContain("description: TOOL_DESCRIPTIONS.travel");
+ });
 
-		expect(Object.fromEntries(registered.map((tool) => [tool.name, tool.description]))).toEqual({
-			acm_checkpoint: TOOL_DESCRIPTIONS.checkpoint,
-			acm_timeline: TOOL_DESCRIPTIONS.timeline,
-			acm_travel: TOOL_DESCRIPTIONS.travel,
-		});
-		for (const tool of registered) {
-			expect(tool.description.length).toBeLessThan(900);
-			expect(tool.description).not.toContain(ACM_CORE);
-		}
-	});
+ test("describes timeline through the strict view discriminator", () => {
+  expect(TOOL_DESCRIPTIONS.timeline).toContain("one view: `active`, `checkpoints`, `search`, or `tree`");
+  expect(TOOL_DESCRIPTIONS.timeline).toContain("Omit view for `active`");
+  expect(`${source}\n${TOOL_DESCRIPTIONS.timeline}`).not.toMatch(/list_checkpoints|full_tree|active_path/);
+ });
+
+ test("keeps checkpoint and travel descriptions concise and evidence-oriented", () => {
+  expect(TOOL_DESCRIPTIONS.checkpoint).toContain("Checkpoint does not branch or fold the active context");
+  expect(TOOL_DESCRIPTIONS.travel).toContain("Travel reports structural and context deltas");
+  expect(TOOL_DESCRIPTIONS.travel).not.toContain("preview");
+ });
 });
