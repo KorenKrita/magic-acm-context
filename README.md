@@ -58,7 +58,7 @@ Use `--verify-only` to prove every mapped artifact and the generated provenance 
 
 ## Exact OMP support
 
-The integrated OMP plugin supports exactly OMP `16.4.2`. Its `@oh-my-pi/pi-coding-agent`, `@oh-my-pi/pi-agent-core`, `@oh-my-pi/pi-ai`, and `@oh-my-pi/pi-tui` peer and development versions must move atomically. There is no compatibility range or multi-version shim.
+The integrated OMP plugin supports exactly OMP `16.4.5`. Its `@oh-my-pi/pi-coding-agent`, `@oh-my-pi/pi-agent-core`, `@oh-my-pi/pi-ai`, and `@oh-my-pi/pi-tui` peer and development versions must move atomically. There is no compatibility range or multi-version shim.
 
 Candidate upgrades are first exercised by the synchronized isolated host fixture. The fixture installs its own frozen lock, builds ACM source inside the fixture package, and proves all runtime OMP imports resolve from that package before running real SessionManager and captured extension-handler tests.
 
@@ -79,7 +79,7 @@ The generator must be idempotent, sync verification must report no writes, the r
 
 ## Host limitations
 
-- OMP `16.4.2` does not expose an atomic tree-navigation/state-sync API to ordinary tool contexts. Typed mutation ports inspect the actual label journal and resulting leaf, return `not_applied` / `applied` / `indeterminate`, and schedule context refresh whenever branch mutation occurred or cannot be excluded.
+- OMP `16.4.5` does not expose an atomic tree-navigation/state-sync API to ordinary tool contexts. Typed mutation ports inspect the actual label journal and resulting leaf, return `not_applied` / `applied` / `indeterminate`, and schedule context refresh whenever branch mutation occurred or cannot be excluded.
 - `branchWithSummary()` updates the session tree without directly replacing host-owned `agent.state.messages`; the extension rebuilds provider context through the public `context` event instead of mutating private agent state.
 - Native pre-prompt compaction may inspect stale host-owned messages once after travel. The plugin does not cancel or replace native compaction.
 - Travel changes the session tree and future model context. It **does not roll back files, processes, browser state, commits, or remote side effects**.

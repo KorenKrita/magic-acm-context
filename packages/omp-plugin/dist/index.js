@@ -202029,20 +202029,20 @@ var package_default = {
   },
   devDependencies: {
     "@biomejs/biome": "^2.5.1",
-    "@oh-my-pi/pi-agent-core": "16.4.2",
-    "@oh-my-pi/pi-ai": "16.4.2",
-    "@oh-my-pi/pi-coding-agent": "16.4.2",
-    "@oh-my-pi/pi-tui": "16.4.2",
+    "@oh-my-pi/pi-agent-core": "16.4.5",
+    "@oh-my-pi/pi-ai": "16.4.5",
+    "@oh-my-pi/pi-coding-agent": "16.4.5",
+    "@oh-my-pi/pi-tui": "16.4.5",
     "@types/better-sqlite3": "^7.6.13",
     "@types/bun": "^1.3.10",
     "@types/node": "^22.20.0",
     typescript: "^5.8.0"
   },
   peerDependencies: {
-    "@oh-my-pi/pi-coding-agent": "16.4.2",
-    "@oh-my-pi/pi-tui": "16.4.2",
-    "@oh-my-pi/pi-agent-core": "16.4.2",
-    "@oh-my-pi/pi-ai": "16.4.2"
+    "@oh-my-pi/pi-coding-agent": "16.4.5",
+    "@oh-my-pi/pi-tui": "16.4.5",
+    "@oh-my-pi/pi-agent-core": "16.4.5",
+    "@oh-my-pi/pi-ai": "16.4.5"
   },
   peerDependenciesMeta: {
     "@oh-my-pi/pi-coding-agent": {

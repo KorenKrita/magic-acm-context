@@ -11,7 +11,7 @@ describe("consumer ACM maintainer documentation", () => {
       "sole canonical ACM implementation and guidance source",
       "bun run sync:acm",
       "scheduled workflow publishes OMP ACM only through canonical",
-      "16.4.2",
+      "16.4.5",
       "bun run --cwd packages/omp-plugin verify:acm",
       "acm-provenance.json",
       "agent.state.messages",
@@ -26,7 +26,7 @@ describe("consumer ACM maintainer documentation", () => {
   test("keeps the published plugin README on the exact OMP contract", async () => {
     const readme = await repoFile("../README.md");
 
-    expect(readme).toContain("`@oh-my-pi/pi-coding-agent@16.4.2`");
+    expect(readme).toContain("`@oh-my-pi/pi-coding-agent@16.4.5`");
     expect(readme).toContain("bun run verify:acm");
     expect(readme).toContain("acm-provenance.json");
     expect(readme).toContain("one consumer-owned hook");

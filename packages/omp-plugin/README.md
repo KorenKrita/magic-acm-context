@@ -2,7 +2,7 @@
 
 Magic Context extension for [OMP (Oh My Pi)](https://github.com/anthropics/omp) — cross-session memory and context management.
 
-This is the OMP adapter of [Magic Context](https://github.com/cortexkit/magic-context). It integrates the canonical ACM surface and supports exactly `@oh-my-pi/pi-coding-agent@16.4.2`.
+This is the OMP adapter of [Magic Context](https://github.com/cortexkit/magic-context). It integrates the canonical ACM surface and supports exactly `@oh-my-pi/pi-coding-agent@16.4.5`.
 
 ## What it does
 
@@ -110,7 +110,7 @@ This means:
 | Aspect | Pi plugin | OMP plugin |
 |--------|-----------|------------|
 | Package | `@cortexkit/pi-magic-context` | `@cortexkit/omp-magic-context` |
-| Peer dep | `@earendil-works/pi-coding-agent@^0.80` | `@oh-my-pi/pi-coding-agent@16.4.2` |
+| Peer dep | `@earendil-works/pi-coding-agent@^0.80` | `@oh-my-pi/pi-coding-agent@16.4.5` |
 | Harness ID | `"pi"` | `"omp"` |
 | systemPrompt type | `string` | `string[]`; one consumer-owned hook inserts CORE and MC segments without flattening unrelated segments |
 | Subagent CLI fallback | `pi` | `omp` |
@@ -126,7 +126,7 @@ The historian, dreamer, and sidekick spawn OMP child processes via:
 omp --print --mode json --no-session --no-skills --system-prompt <path> --model <id> [message]
 ```
 
-All required CLI flags are verified against OMP `16.4.2`.
+All required CLI flags are verified against OMP `16.4.5`.
 
 ## ACM maintenance
 
