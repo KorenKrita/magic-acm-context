@@ -144,6 +144,7 @@ import {
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools } from "./tools";
 import registerACMExtension from "./acm/tools";
+import { composeMagicContextSegments } from "./acm/prompt";
 import {
 	parseTodos,
 	registerTodoOverlay,
@@ -1389,11 +1390,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			if (effectiveConfig.system_prompt_injection?.enabled === false) {
 				return;
 			}
-			// OMP passes systemPrompt as string[]; join for compatibility with
-			// the shared injection logic that operates on a single string.
-			const systemPromptText = Array.isArray(event.systemPrompt)
-				? event.systemPrompt.join("\n")
-				: (event.systemPrompt as unknown as string);
+			// Preserve OMP's system-prompt segments for marker-based composition.
+			const systemPromptSegments = Array.isArray(event.systemPrompt)
+				? [...event.systemPrompt]
+				: [event.systemPrompt as unknown as string];
+			const systemPromptText = systemPromptSegments.join("\n");
 			const skipSigs =
 				effectiveConfig.system_prompt_injection?.skip_signatures ?? [];
 			if (
@@ -1444,20 +1445,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				existingSystemPrompt: systemPromptText,
 			});
 
-			// Compose the final system prompt: base prompt from Pi + our
-			// magic-context block. We always run hash detection on the
-			// composed string so even sessions with no data block (e.g.
-			// memories disabled, no docs, no key files) still get
-			// sticky-date freezing and hash-change tracking.
-			const composedPrompt = block
-				? `${systemPromptText}\n\n${block}`
-				: systemPromptText;
+			// Insert only Magic Context-owned material around the canonical ACM
+			// segment. Existing segments remain byte-for-byte intact at this seam.
+			const composedSegments = block
+				? composeMagicContextSegments(systemPromptSegments, block)
+				: systemPromptSegments;
+			const composedPrompt = composedSegments.join("\n");
 
 			if (!sessionId) {
-				// No session id yet — return the composed prompt without
-				// cache logic. The next turn (with a session id) will
-				// compute the first hash and set sticky date.
-				if (block) return { systemPrompt: [composedPrompt] };
+				// No session id yet — preserve the composed segment array. The next
+				// turn computes the first hash and freezes the sticky date.
+				if (block) return { systemPrompt: composedSegments };
 				return;
 			}
 

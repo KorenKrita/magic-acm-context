@@ -10,7 +10,6 @@
 
 import { createHash } from "node:crypto";
 import { buildMagicContextSection } from "@magic-context/core/agents/magic-context-prompt";
-import { buildUnifiedPromptSection } from "./acm/prompt";
 import {
 	type ContextDatabase,
 	getOrCreateSessionMeta,
@@ -79,8 +78,7 @@ export function buildMagicContextBlock(
 		opts.memoryEnabled !== false,
 	);
 
-	// Assemble unified prompt: Foreword → ACM → MC → Closing
-	return buildUnifiedPromptSection(mcBlock ?? "");
+	return mcBlock;
 }
 
 export interface SystemPromptHashResult {
