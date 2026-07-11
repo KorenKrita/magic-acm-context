@@ -2,7 +2,7 @@
 
 Magic Context extension for [OMP (Oh My Pi)](https://github.com/anthropics/omp) — cross-session memory and context management.
 
-This is the OMP adapter of [Magic Context](https://github.com/cortexkit/magic-context). It provides the same capabilities as the Pi plugin (`@cortexkit/pi-magic-context`) but targets `@oh-my-pi/pi-coding-agent` v16+.
+This is the OMP adapter of [Magic Context](https://github.com/cortexkit/magic-context). It integrates the canonical ACM surface and supports exactly `@oh-my-pi/pi-coding-agent@16.4.2`.
 
 ## What it does
 
@@ -110,7 +110,7 @@ This means:
 | Aspect | Pi plugin | OMP plugin |
 |--------|-----------|------------|
 | Package | `@cortexkit/pi-magic-context` | `@cortexkit/omp-magic-context` |
-| Peer dep | `@earendil-works/pi-coding-agent@^0.80` | `@oh-my-pi/pi-coding-agent@^16` |
+| Peer dep | `@earendil-works/pi-coding-agent@^0.80` | `@oh-my-pi/pi-coding-agent@16.4.2` |
 | Harness ID | `"pi"` | `"omp"` |
 | systemPrompt type | `string` | `string[]` (joined/wrapped automatically) |
 | Subagent CLI fallback | `pi` | `omp` |
@@ -126,7 +126,11 @@ The historian, dreamer, and sidekick spawn OMP child processes via:
 omp --print --mode json --no-session --no-skills --system-prompt <path> --model <id> [message]
 ```
 
-All required CLI flags are supported by OMP v16+.
+All required CLI flags are verified against OMP `16.4.2`.
+
+## ACM maintenance
+
+[`omp-context`](https://github.com/KorenKrita/omp-context) is the canonical ACM implementation and guidance repository. This package consumes its CORE, advanced Skill, Host Bridge, tools, generated artifacts, and tests through the canonical manual sync command. Make ACM changes there first, synchronize them here, then verify both repositories independently.
 
 ## Development
 
@@ -139,6 +143,13 @@ bun run typecheck
 
 # Run tests
 bun test
+
+# Regenerate and verify canonical ACM guidance
+bun run generate:guidance
+bun run test:guidance
+
+# Verify against the isolated exact OMP fixture
+bun run test:host
 
 # Build
 bun run build

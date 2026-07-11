@@ -17,13 +17,13 @@ Magic Context + ACM (Active Context Management) unified extension for pi and omp
 
 ### How it works
 
-1. Extension registers all tools (MC's ctx_* + ACM's acm_*) via platform ExtensionAPI
-2. `before_agent_start` injects unified system prompt: MC guidance + ACM discipline
-3. No skill file needed — all behavioral guidance is always in context
+1. The extension registers Magic Context's `ctx_*` tools and ACM's `acm_*` tools through the OMP ExtensionAPI.
+2. `before_agent_start` combines Magic Context guidance with the generated always-on ACM CORE.
+3. The OMP package ships an advanced Skill for non-obvious target selection, archive round trips, and exceptional recovery. Normal-path guidance remains in CORE rather than being duplicated in the Skill or this README.
 
 ### System Prompt Structure
 
-```
+```text
 ## Magic Context
 ├── Long-term partner frame
 ├── ctx_reduce mechanics
@@ -31,16 +31,55 @@ Magic Context + ACM (Active Context Management) unified extension for pi and omp
 └── Reduction triggers
 
 ## Context Management (ACM)
-├── Core decision vocabulary (working set, boundary, handoff, chain)
-├── Fold gate (boundary named, NEXT executable, raw recoverable)
-├── Checkpoint discipline and semantic anchor naming
-├── Boundary-first fold discipline and task-end no-saving fallback
-├── Handoff contract (7 slots) and after-travel ordering
-└── Embedded playbook (decision tree, filled handoffs, recovery edge cases)
+├── Generated always-on CORE from the canonical source
+├── Generated tool descriptions, result cues, and recovery guidance
+└── Model-invoked advanced Skill with three focused references
 ```
 
 ### Collaboration Model
 
-- ACM defines the structural backbone (checkpoints at boundaries, travel when needed)
-- MC fills the gaps between checkpoints (reduce spent outputs, search history, persist knowledge)
-- Most checkpoint intervals are maintained by reduce alone; travel only at real boundaries
+- ACM owns structural context operations and the session-tree boundary.
+- Magic Context owns content-level reduction, history search, notes, and durable memory.
+- The integrated wrapper composes those systems; it does not fork the ACM contract.
+
+## Canonical ACM maintenance
+
+[`omp-context`](https://github.com/KorenKrita/omp-context) is the **sole canonical ACM implementation and guidance source**. This repository is a consumer. ACM implementation, CORE, advanced Skill, generated artifacts, real-host fixtures, and contract tests arrive through **manual one-way synchronization** from `omp-context`; do not edit the synchronized copies here as an independent authority.
+
+Run synchronization from an `omp-context` checkout:
+
+```bash
+bun run sync:acm -- \
+  --canonical-root /path/to/omp-context \
+  --consumer-root /path/to/magic-acm-context
+```
+
+Use `--verify-only` to prove every mapped artifact matches without writing. The sync command performs no Git operations; review and commit each repository separately.
+
+## Exact OMP support
+
+The integrated OMP plugin supports exactly OMP `16.4.2`. Its `@oh-my-pi/pi-coding-agent`, `@oh-my-pi/pi-agent-core`, `@oh-my-pi/pi-ai`, and `@oh-my-pi/pi-tui` peer and development versions must move atomically. There is no compatibility range or multi-version shim.
+
+Candidate upgrades are first exercised by the synchronized isolated host fixture. The fixture installs its own frozen lock, builds ACM source inside the fixture package, and proves all runtime OMP imports resolve from that package before running real SessionManager and captured extension-handler tests.
+
+## Verification
+
+After synchronization, run:
+
+```bash
+bun run --cwd packages/omp-plugin generate:guidance
+bun run --cwd packages/omp-plugin test:guidance
+bun run --cwd packages/omp-plugin test:host
+bun run --cwd packages/omp-plugin typecheck
+bun run --cwd packages/omp-plugin test
+bun run --cwd packages/omp-plugin build
+```
+
+The generator must be idempotent, sync verification must report no writes, the real-host fixture must resolve only its pinned OMP packages, and the built plugin's default export must remain callable.
+
+## Host limitations
+
+- OMP `16.4.2` does not expose an atomic tree-navigation/state-sync API to ordinary tool contexts, so the Host Bridge uses guarded, runtime-verified SessionManager capabilities.
+- `branchWithSummary()` updates the session tree without directly replacing the host-owned `agent.state.messages`; the extension rebuilds provider context through the public `context` event instead of mutating private agent state.
+- Native pre-prompt compaction may inspect stale host-owned messages once after travel. The plugin does not cancel or replace native compaction.
+- Travel changes the session tree and future model context. It **does not roll back files, processes, browser state, commits, or remote side effects**.
