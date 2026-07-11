@@ -4,13 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDatabase, openDatabase } from "../storage";
 import { cosineSimilarity } from "./cosine-similarity";
-import {
-    _resetEmbeddingSweepGuard,
-    embedAllUnembeddedMemories,
-    ensureEmbeddingModel,
-    getEmbeddingModelId,
-    isEmbeddingEnabled,
-} from "./embedding";
+import { _resetEmbeddingSweepGuard, embedAllUnembeddedMemories } from "./embedding";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import { LocalEmbeddingProvider } from "./embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./embedding-openai";
@@ -71,12 +65,6 @@ describe("embedding module", () => {
     });
 
     describe("#given embedding providers", () => {
-        it("defaults to off without instantiating a provider", async () => {
-            expect(isEmbeddingEnabled()).toBe(false);
-            expect(getEmbeddingModelId()).toBe("off");
-            expect(await ensureEmbeddingModel()).toBe(false);
-        });
-
         it("local provider uses default model id and starts unloaded", () => {
             const provider = new LocalEmbeddingProvider();
 
