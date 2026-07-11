@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # sync-mc.sh — Sync magic-context upstream into magic-acm-context.
 #
-# Copies packages/plugin, packages/pi-plugin, packages/omp-plugin from
-# magic-context, preserving ACM-only files (src/acm/) and local package
-# manifest customizations, then injects the minimal ACM glue into index.ts
-# and system-prompt.ts. Required generated schema/docs and test-isolation
-# support files are synchronized too so the sliced repository remains testable.
+# Copies upstream packages while preserving canonical ACM artifacts under
+# src/acm/. Pi keeps its legacy injector. OMP integration is a reviewed patch
+# that must apply cleanly or the sync aborts before publication.
 #
 # Usage: ./scripts/sync-mc.sh <path-to-magic-context>
 # In CI:  ./scripts/sync-mc.sh /tmp/magic-context
@@ -79,15 +77,14 @@ cp "$MC_ROOT/packages/docs/src/content/docs/reference/configuration.md" \
 cp "$MC_ROOT/packages/cli/bunfig.toml" \
   "$ACM_ROOT/packages/cli/bunfig.toml"
 
-# --- 6. Inject ACM glue ---
-echo "→ Injecting ACM glue into pi-plugin..."
-node "$SCRIPT_DIR/inject-acm.mjs" \
+# --- 6. Restore consumer-owned integration seams ---
+echo "→ Injecting Pi ACM glue..."
+node "$SCRIPT_DIR/inject-pi-acm.mjs" \
   "$ACM_ROOT/packages/pi-plugin/src/index.ts" \
   "$ACM_ROOT/packages/pi-plugin/src/system-prompt.ts"
 
-echo "→ Injecting ACM glue into omp-plugin..."
-node "$SCRIPT_DIR/inject-acm.mjs" \
-  "$ACM_ROOT/packages/omp-plugin/src/index.ts" \
-  "$ACM_ROOT/packages/omp-plugin/src/system-prompt.ts"
+echo "→ Applying checked OMP integration overlay..."
+git -C "$ACM_ROOT" apply --check "$SCRIPT_DIR/omp-integration.patch"
+git -C "$ACM_ROOT" apply "$SCRIPT_DIR/omp-integration.patch"
 
-echo "✓ Sync complete. Review changes with: git diff"
+echo "✓ Magic Context sync complete. OMP canonical artifacts must be published separately by omp-context sync:acm."

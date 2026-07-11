@@ -144,7 +144,7 @@ import {
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools } from "./tools";
 import registerACMExtension from "./acm/tools";
-import { composeMagicContextSegments } from "./acm/prompt";
+import { applyProcessedPromptToSegments, composeIntegratedPromptSegments } from "./acm/prompt";
 import {
 	parseTodos,
 	registerTodoOverlay,
@@ -921,8 +921,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		todowriteEnabled,
 	});
-	// Register ACM tools (acm_checkpoint, acm_timeline, acm_travel)
-	registerACMExtension(pi);
+	// ACM owns tools and lifecycle; this consumer owns the sole prompt hook.
+	registerACMExtension(pi, { promptInjection: false });
 
 	info(
 		todowriteEnabled
@@ -1213,6 +1213,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// `experimental.chat.system.transform` handler in
 	// `system-prompt-hash.ts`.
 	pi.on("before_agent_start", async (event, ctx) => {
+		const originalSystemPromptSegments = Array.isArray(event.systemPrompt)
+			? [...event.systemPrompt]
+			: [event.systemPrompt as unknown as string];
+		const acmSystemPromptSegments = composeIntegratedPromptSegments(
+			originalSystemPromptSegments,
+			null,
+		);
+		const acmPromptChanged =
+			acmSystemPromptSegments.length !== originalSystemPromptSegments.length ||
+			acmSystemPromptSegments.some(
+				(segment, index) => segment !== originalSystemPromptSegments[index],
+			);
 		// Startup release announcement (Pi parity with OpenCode TUI dialog +
 		// Desktop ignored message). Fires once per ANNOUNCEMENT_VERSION across
 		// the whole machine — persistence file is shared with the OpenCode
@@ -1388,19 +1400,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			// (memory/docs/key-files/injection toggles). Reusing boot `config`
 			// would render the launch project's adjuncts in the new checkout.
 			if (effectiveConfig.system_prompt_injection?.enabled === false) {
-				return;
+				return acmPromptChanged
+					? { systemPrompt: acmSystemPromptSegments }
+					: undefined;
 			}
-			// Preserve OMP's system-prompt segments for marker-based composition.
-			const systemPromptSegments = Array.isArray(event.systemPrompt)
-				? [...event.systemPrompt]
-				: [event.systemPrompt as unknown as string];
+			const systemPromptSegments = acmSystemPromptSegments;
 			const systemPromptText = systemPromptSegments.join("\n");
 			const skipSigs =
 				effectiveConfig.system_prompt_injection?.skip_signatures ?? [];
 			if (
 				skipSigs.some((sig) => sig.length > 0 && systemPromptText.includes(sig))
 			) {
-				return;
+				return acmPromptChanged
+					? { systemPrompt: acmSystemPromptSegments }
+					: undefined;
 			}
 
 			// PEEK the system-prompt refresh signal. Set by:
@@ -1445,18 +1458,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				existingSystemPrompt: systemPromptText,
 			});
 
-			// Insert only Magic Context-owned material around the canonical ACM
-			// segment. Existing segments remain byte-for-byte intact at this seam.
-			const composedSegments = block
-				? composeMagicContextSegments(systemPromptSegments, block)
-				: systemPromptSegments;
+			const composedSegments = composeIntegratedPromptSegments(
+				systemPromptSegments,
+				block,
+			);
 			const composedPrompt = composedSegments.join("\n");
 
 			if (!sessionId) {
-				// No session id yet — preserve the composed segment array. The next
-				// turn computes the first hash and freezes the sticky date.
-				if (block) return { systemPrompt: composedSegments };
-				return;
+				const promptChanged =
+					composedSegments.length !== originalSystemPromptSegments.length ||
+					composedSegments.some(
+						(segment, index) => segment !== originalSystemPromptSegments[index],
+					);
+				return promptChanged ? { systemPrompt: composedSegments } : undefined;
 			}
 
 			const result = processSystemPromptForCache({
@@ -1488,10 +1502,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				clearSystemPromptRefresh(sessionId);
 			}
 
-			return { systemPrompt: [result.systemPrompt] };
+			return {
+				systemPrompt: applyProcessedPromptToSegments(
+					composedSegments,
+					result.systemPrompt,
+				),
+			};
 		} catch (error) {
 			warn("failed to build magic-context block:", error);
-			return;
+			return acmPromptChanged
+				? { systemPrompt: acmSystemPromptSegments }
+				: undefined;
 		}
 	});
 	info("registered before_agent_start system prompt injector");

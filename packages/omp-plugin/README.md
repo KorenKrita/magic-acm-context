@@ -112,7 +112,7 @@ This means:
 | Package | `@cortexkit/pi-magic-context` | `@cortexkit/omp-magic-context` |
 | Peer dep | `@earendil-works/pi-coding-agent@^0.80` | `@oh-my-pi/pi-coding-agent@16.4.2` |
 | Harness ID | `"pi"` | `"omp"` |
-| systemPrompt type | `string` | `string[]` (joined/wrapped automatically) |
+| systemPrompt type | `string` | `string[]`; one consumer-owned hook inserts CORE and MC segments without flattening unrelated segments |
 | Subagent CLI fallback | `pi` | `omp` |
 | CLI flags | `--no-prompt-templates`, `--no-context-files` | Not needed (covered by `--system-prompt` replace mode) |
 | TUI package | `@earendil-works/pi-tui` | `@oh-my-pi/pi-tui` |
@@ -130,7 +130,7 @@ All required CLI flags are verified against OMP `16.4.2`.
 
 ## ACM maintenance
 
-[`omp-context`](https://github.com/KorenKrita/omp-context) is the canonical ACM implementation and guidance repository. This package consumes its CORE, advanced Skill, Host Bridge, tools, generated artifacts, and tests through the canonical manual sync command. Make ACM changes there first, synchronize them here, then verify both repositories independently.
+[`omp-context`](https://github.com/KorenKrita/omp-context) is the canonical ACM implementation and guidance repository. This package receives its behavior-owned tools, typed mutation ports, CORE, advanced Skill, generator, fixture, verifier, and tests only through canonical `sync-acm.mjs`. `acm-provenance.json` binds the synchronized bytes to the canonical manifest and exact host version; the scheduled workflow runs the same publisher plus `--verify-only`.
 
 ## Development
 
@@ -144,12 +144,8 @@ bun run typecheck
 # Run tests
 bun test
 
-# Regenerate and verify canonical ACM guidance
-bun run generate:guidance
-bun run test:guidance
-
-# Verify against the isolated exact OMP fixture
-bun run test:host
+# Run the complete non-mutating ACM gate
+bun run verify:acm
 
 # Build
 bun run build

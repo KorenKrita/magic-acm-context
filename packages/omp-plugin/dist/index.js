@@ -202016,7 +202016,8 @@ var package_default = {
     prepublishOnly: "bun run build",
     "generate:guidance": "bun scripts/generate-guidance.mjs",
     "test:guidance": "bun test scripts/generate-guidance.test.mjs",
-    "test:host": "bun run --cwd src/acm/host-fixture verify"
+    "test:host": "bun run --cwd src/acm/host-fixture verify",
+    "verify:acm": "bun scripts/verify-acm.mjs && bun scripts/generate-guidance.mjs --check && bun run test:guidance && bun run test:host"
   },
   dependencies: {
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
@@ -209015,6 +209016,43 @@ function registerMagicContextTools(pi, opts) {
 // src/acm/lib.ts
 import { estimateTokens as estimateTokens2 } from "@oh-my-pi/pi-agent-core/compaction/compaction";
 import { countTokens } from "@oh-my-pi/pi-agent-core/tokenizer";
+
+// src/acm/label-journal.ts
+function buildLabelMaps(entries) {
+  const labelToEntryId = new Map;
+  const entryToLabels = new Map;
+  for (const entry of entries) {
+    if (entry.type !== "label")
+      continue;
+    const { targetId, label } = entry;
+    if (label === null || label === undefined) {
+      const existingLabels = entryToLabels.get(targetId);
+      if (existingLabels)
+        for (const existing2 of existingLabels)
+          labelToEntryId.delete(existing2);
+      entryToLabels.delete(targetId);
+      continue;
+    }
+    const previousOwner = labelToEntryId.get(label);
+    if (previousOwner && previousOwner !== targetId) {
+      const previousLabels = entryToLabels.get(previousOwner);
+      if (previousLabels) {
+        const filtered = previousLabels.filter((existing2) => existing2 !== label);
+        if (filtered.length === 0)
+          entryToLabels.delete(previousOwner);
+        else
+          entryToLabels.set(previousOwner, filtered);
+      }
+    }
+    labelToEntryId.set(label, targetId);
+    const existing = entryToLabels.get(targetId) ?? [];
+    if (!existing.includes(label))
+      entryToLabels.set(targetId, [...existing, label]);
+  }
+  return { labelToEntryId, entryToLabels };
+}
+
+// src/acm/lib.ts
 var ACM_INTERNAL_TOOLS = new Set(["acm_checkpoint", "acm_timeline", "acm_travel"]);
 var BRANCH_SUMMARY_ENTRY_OVERHEAD_TOKENS = 100;
 var HANDOFF_SLOT_HINT = "Goal/State/Evidence/External/Exclusions/Recover/NEXT";
@@ -209145,51 +209183,12 @@ function findInTree(nodes, predicate) {
   }
   return;
 }
-function buildLabelMaps(entries) {
-  const labelToEntryId = new Map;
-  const entryToLabels = new Map;
-  for (const entry of entries) {
-    if (entry.type !== "label")
-      continue;
-    const { targetId, label } = entry;
-    if (label === null || label === undefined) {
-      const existingLabels = entryToLabels.get(targetId);
-      if (existingLabels) {
-        for (const l of existingLabels) {
-          labelToEntryId.delete(l);
-        }
-      }
-      entryToLabels.delete(targetId);
-      continue;
-    }
-    const previousOwner = labelToEntryId.get(label);
-    if (previousOwner && previousOwner !== targetId) {
-      const prevLabels = entryToLabels.get(previousOwner);
-      if (prevLabels) {
-        const filtered = prevLabels.filter((l) => l !== label);
-        if (filtered.length === 0)
-          entryToLabels.delete(previousOwner);
-        else
-          entryToLabels.set(previousOwner, filtered);
-      }
-    }
-    labelToEntryId.set(label, targetId);
-    const existing = entryToLabels.get(targetId) ?? [];
-    if (!existing.includes(label)) {
-      entryToLabels.set(targetId, [...existing, label]);
-    }
-  }
-  return { labelToEntryId, entryToLabels };
-}
 function getEntryLabels(labelMaps, entryId) {
   return labelMaps.entryToLabels.get(entryId) ?? [];
 }
 function formatEntryLabels(labelMaps, entryId) {
   const labels = getEntryLabels(labelMaps, entryId);
   return labels.length > 0 ? labels.join(", ") : undefined;
-}
-function entryMatchesLabelSearch(labelMaps, entryId, searchTerm) {
-  return getEntryLabels(labelMaps, entryId).some((label) => label.toLowerCase().includes(searchTerm));
 }
 function findCheckpointLabelOwner(labelMaps, label, backboneIds) {
   const entryId = labelMaps.labelToEntryId.get(label);
@@ -209240,9 +209239,6 @@ function classifyStructuralMessageDirection(before, after) {
   if (after === before)
     return "equal";
   return after < before ? "decreased" : "increased";
-}
-function compareEntriesByTimestamp(a, b) {
-  return a.timestamp.localeCompare(b.timestamp);
 }
 function sumMessageTokens(messages) {
   return messages.reduce((sum, msg) => sum + estimateTokens2(msg), 0);
@@ -209328,10 +209324,10 @@ function findLastMeaningfulEntry(branch, isSkipped, getRole, getSnippet, signal)
 
 // src/acm/host-bridge.ts
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
-function ok5(value) {
+function success2(value) {
   return { ok: true, value };
 }
-function err5(error51, message, details) {
+function failure(error51, message, details) {
   return { ok: false, error: error51, message, details };
 }
 function hasFunction(sm, name2) {
@@ -209340,228 +209336,255 @@ function hasFunction(sm, name2) {
   const record4 = sm;
   return name2 in record4 && typeof record4[name2] === "function";
 }
-function isLabelEntry(entry) {
-  return entry.type === "label";
-}
 function getHostMethod(sm, name2) {
   if (!hasFunction(sm, name2))
     return;
   const record4 = sm;
-  const fn = record4[name2];
-  return Function.prototype.bind.call(fn, sm);
+  return Function.prototype.bind.call(record4[name2], sm);
 }
-
-class HostBridge {
-  sm;
-  capabilities;
-  createdLabels = new Map;
-  constructor(sm) {
-    this.sm = sm;
-    this.capabilities = {
-      appendLabelChange: hasFunction(sm, "appendLabelChange"),
-      branchWithSummary: hasFunction(sm, "branchWithSummary")
-    };
+function isLabelEntry(entry) {
+  return entry.type === "label";
+}
+function sameStrings(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+function findLastEntry(entries, predicate) {
+  for (let index = entries.length - 1;index >= 0; index--) {
+    const entry = entries[index];
+    if (predicate(entry))
+      return entry;
   }
-  getEntries() {
-    return this.sm.getEntries();
+  return;
+}
+function currentAliases(sm, targetId) {
+  return buildLabelMaps(sm.getEntries()).entryToLabels.get(targetId) ?? [];
+}
+function findNewLabelEntry(entries, beforeIds, targetId, name2) {
+  return findLastEntry(entries, (entry) => !beforeIds.has(entry.id) && isLabelEntry(entry) && entry.targetId === targetId && entry.label === name2);
+}
+function getHostCapabilities(sm) {
+  return {
+    appendLabelChange: hasFunction(sm, "appendLabelChange"),
+    branchWithSummary: hasFunction(sm, "branchWithSummary")
+  };
+}
+function buildSessionMessages(sm, leafId) {
+  const effectiveLeaf = leafId === undefined ? sm.getLeafId() : leafId;
+  try {
+    const entries = sm.getEntries();
+    const byId = new Map(entries.map((entry) => [entry.id, entry]));
+    return success2(buildSessionContext(entries, effectiveLeaf, byId).messages);
+  } catch (error51) {
+    const cause = error51 instanceof Error ? error51.message : String(error51);
+    return failure("malformed_capability", `Failed to build session messages: ${cause}`, { leafId: effectiveLeaf, cause });
   }
-  getTree() {
-    return this.sm.getTree();
+}
+function prevalidateCheckpointLabel(sm, targetId, name2) {
+  if (!getHostCapabilities(sm).appendLabelChange) {
+    return failure("missing_capability", "SessionManager does not support appendLabelChange — cannot create checkpoint label", { targetId, name: name2 });
   }
-  getBranch(fromId) {
-    return this.sm.getBranch(fromId);
+  if (!sm.getEntry(targetId))
+    return failure("entry_not_found", `Entry ${targetId} not found`, { targetId, name: name2 });
+  const entries = sm.getEntries();
+  const maps = buildLabelMaps(entries);
+  const existingOwner = maps.labelToEntryId.get(name2);
+  if (existingOwner && existingOwner !== targetId) {
+    const activeIds = new Set(sm.getBranch().map((entry) => entry.id));
+    return failure("label_conflict", `Checkpoint name '${name2}' already exists at ${existingOwner}`, {
+      entryId: existingOwner,
+      onActivePath: activeIds.has(existingOwner)
+    });
   }
-  getLeafId() {
-    return this.sm.getLeafId();
-  }
-  getEntry(id) {
-    return this.sm.getEntry(id);
-  }
-  buildLabelMaps() {
-    return buildLabelMaps(this.sm.getEntries());
-  }
-  getBranchIds() {
-    return new Set(this.sm.getBranch().map((entry) => entry.id));
-  }
-  buildSessionMessages(leafId) {
-    try {
-      const entries = this.sm.getEntries();
-      const effectiveLeaf = leafId === undefined ? this.sm.getLeafId() : leafId;
-      const byId = new Map(entries.map((entry) => [entry.id, entry]));
-      const ctx = buildSessionContext(entries, effectiveLeaf, byId);
-      return ok5(ctx.messages);
-    } catch (e) {
-      return err5("malformed_capability", `Failed to build session messages: ${e instanceof Error ? e.message : String(e)}`);
+  const aliases = maps.entryToLabels.get(targetId) ?? [];
+  if (aliases.includes(name2)) {
+    const existing = findLastEntry(entries, (entry) => isLabelEntry(entry) && entry.targetId === targetId && entry.label === name2);
+    if (!existing) {
+      return failure("malformed_capability", `Checkpoint '${name2}' is present in the alias map but has no label journal entry`, { targetId, name: name2 });
     }
+    return success2({ targetId, name: name2, status: "already_present", aliases, existingLabelEntryId: existing.id });
   }
-  prevalidateCheckpointLabel(targetId, name2) {
-    if (!this.capabilities.appendLabelChange) {
-      return err5("missing_capability", "SessionManager does not support appendLabelChange — cannot create checkpoint label");
-    }
-    if (!this.sm.getEntry(targetId)) {
-      return err5("entry_not_found", `Entry ${targetId} not found`, { targetId });
-    }
-    const labelMaps = this.buildLabelMaps();
-    const existingOwner = labelMaps.labelToEntryId.get(name2);
-    if (existingOwner && existingOwner !== targetId) {
-      const conflict = {
-        entryId: existingOwner,
-        onActivePath: this.getBranchIds().has(existingOwner)
-      };
-      return err5("label_conflict", `Checkpoint name '${name2}' already exists at ${existingOwner}`, conflict);
-    }
-    const aliases = labelMaps.entryToLabels.get(targetId) ?? [];
-    if (aliases.includes(name2)) {
-      const existingLabelEntry = this.sm.getEntries().find((entry) => isLabelEntry(entry) && entry.targetId === targetId && entry.label === name2);
-      return ok5({
-        targetId,
-        name: name2,
-        status: "already_present",
-        aliases,
-        existingLabelEntryId: existingLabelEntry?.id
-      });
-    }
-    return ok5({ targetId, name: name2, status: "would_create", aliases });
-  }
-  appendCheckpointLabel(targetId, name2) {
-    const prevalidation = this.prevalidateCheckpointLabel(targetId, name2);
-    if (!prevalidation.ok)
-      return prevalidation;
-    if (prevalidation.value.status === "already_present") {
-      if (!prevalidation.value.existingLabelEntryId) {
-        return err5("malformed_capability", `Checkpoint '${name2}' is present in the alias map but has no label journal entry`, { targetId, name: name2 });
-      }
-      return ok5({
+  return success2({ targetId, name: name2, status: "would_create", aliases });
+}
+function appendCheckpointLabel(sm, targetId, name2) {
+  const prevalidation = prevalidateCheckpointLabel(sm, targetId, name2);
+  if (!prevalidation.ok)
+    return { ...prevalidation, state: "not_applied" };
+  if (prevalidation.value.status === "already_present") {
+    return {
+      ok: true,
+      state: "not_applied",
+      value: {
         labelEntryId: prevalidation.value.existingLabelEntryId,
         targetId,
         name: name2,
         status: "already_present",
         aliases: prevalidation.value.aliases
-      });
-    }
-    const appendLabelChange = getHostMethod(this.sm, "appendLabelChange");
-    let returned;
-    try {
-      returned = appendLabelChange(targetId, name2);
-    } catch (error51) {
-      return err5("host_operation_failed", `appendLabelChange failed: ${error51 instanceof Error ? error51.message : String(error51)}`, { targetId, name: name2 });
-    }
-    if (typeof returned !== "string" || returned.length === 0) {
-      return err5("malformed_capability", `appendLabelChange returned an invalid entry id: ${typeof returned}`, { returned, targetId, name: name2 });
-    }
-    const labelEntryId = returned;
-    const labelEntry = this.sm.getEntry(labelEntryId);
-    const labelOwner = this.buildLabelMaps().labelToEntryId.get(name2);
-    if (!labelEntry || !isLabelEntry(labelEntry) || labelEntry.targetId !== targetId || labelEntry.label !== name2 || labelOwner !== targetId) {
-      return err5("malformed_capability", "appendLabelChange did not create the expected label journal entry", { labelEntryId, targetId, name: name2, labelOwner });
-    }
-    this.createdLabels.set(labelEntryId, { labelEntryId, targetId, label: name2 });
-    return ok5({
-      labelEntryId,
+      }
+    };
+  }
+  const append = getHostMethod(sm, "appendLabelChange");
+  const entriesBefore = sm.getEntries();
+  const beforeIds = new Set(entriesBefore.map((entry) => entry.id));
+  let returned;
+  let hostError;
+  try {
+    returned = append(targetId, name2);
+  } catch (error51) {
+    hostError = error51 instanceof Error ? error51.message : String(error51);
+  }
+  const entriesAfter = sm.getEntries();
+  const aliasesAfter = currentAliases(sm, targetId);
+  const observed = findNewLabelEntry(entriesAfter, beforeIds, targetId, name2);
+  const owner = buildLabelMaps(entriesAfter).labelToEntryId.get(name2);
+  const hostReturnedEntryId = typeof returned === "string" && returned.length > 0 ? returned : undefined;
+  if (owner === targetId && observed) {
+    const rollback = { targetId, name: name2, labelEntryId: observed.id, priorAliases: prevalidation.value.aliases };
+    return {
+      ok: true,
+      state: "applied",
+      value: {
+        labelEntryId: observed.id,
+        targetId,
+        name: name2,
+        status: "created",
+        aliases: aliasesAfter,
+        rollback,
+        hostReturnedEntryId
+      }
+    };
+  }
+  const changed = entriesAfter.length !== entriesBefore.length || !sameStrings(aliasesAfter, prevalidation.value.aliases);
+  return {
+    ...failure(hostError ? "host_operation_failed" : "malformed_capability", hostError ? `appendLabelChange failed: ${hostError}` : "appendLabelChange did not create the expected label journal entry", {
       targetId,
       name: name2,
-      status: "created",
-      aliases: [...prevalidation.value.aliases, name2]
-    });
-  }
-  clearCreatedLabel(labelEntryId) {
-    const created = this.createdLabels.get(labelEntryId);
-    if (!created) {
-      return err5("label_not_created_here", "Label was not created by this Host Bridge instance — cannot safely clear");
-    }
-    if (!this.capabilities.appendLabelChange) {
-      return err5("missing_capability", "SessionManager does not support appendLabelChange — cannot clear checkpoint label");
-    }
-    const currentAliases = this.buildLabelMaps().entryToLabels.get(created.targetId) ?? [];
-    if (currentAliases.length !== 1 || currentAliases[0] !== created.label) {
-      return err5("unsafe_clear", "Target entry has prior aliases or additional labels; cannot safely clear this label", { targetId: created.targetId, currentAliases, labelStillPresent: currentAliases.includes(created.label) });
-    }
-    const appendLabelChange = getHostMethod(this.sm, "appendLabelChange");
-    let returned;
-    try {
-      returned = appendLabelChange(created.targetId, undefined);
-    } catch (error51) {
-      const aliasesAfterFailure = this.buildLabelMaps().entryToLabels.get(created.targetId) ?? [];
-      return err5("host_operation_failed", `appendLabelChange rollback failed: ${error51 instanceof Error ? error51.message : String(error51)}`, {
-        targetId: created.targetId,
-        label: created.label,
-        labelStillPresent: aliasesAfterFailure.includes(created.label)
-      });
-    }
-    const aliasesAfterClear = this.buildLabelMaps().entryToLabels.get(created.targetId) ?? [];
-    if (typeof returned !== "string" || returned.length === 0 || aliasesAfterClear.includes(created.label)) {
-      return err5("malformed_capability", "appendLabelChange did not produce a verifiable label clear", {
-        returned,
-        targetId: created.targetId,
-        label: created.label,
-        labelStillPresent: aliasesAfterClear.includes(created.label)
-      });
-    }
-    this.createdLabels.delete(labelEntryId);
-    return ok5({ clearEntryId: returned, targetId: created.targetId, label: created.label });
-  }
-  prevalidateBranchWithSummary(branchFromId) {
-    if (!this.capabilities.branchWithSummary) {
-      return err5("missing_capability", "SessionManager does not support branchWithSummary — cannot travel");
-    }
-    if (!this.sm.getEntry(branchFromId)) {
-      return err5("entry_not_found", `Entry ${branchFromId} not found`, { branchFromId });
-    }
-    return ok5({ branchFromId, leafBefore: this.sm.getLeafId() });
-  }
-  branchWithSummary(branchFromId, summary, details) {
-    const prevalidation = this.prevalidateBranchWithSummary(branchFromId);
-    if (!prevalidation.ok)
-      return prevalidation;
-    const { leafBefore } = prevalidation.value;
-    const branchWithSummary = getHostMethod(this.sm, "branchWithSummary");
-    let returned;
-    try {
-      returned = branchWithSummary(branchFromId, summary, details, true);
-    } catch (error51) {
-      const leafAfter2 = this.sm.getLeafId();
-      const leafEntry2 = leafAfter2 ? this.sm.getEntry(leafAfter2) : undefined;
-      const failure2 = {
-        branchFromId,
-        leafBefore,
-        leafAfter: leafAfter2,
-        mutationApplied: leafAfter2 !== leafBefore,
-        actualSummaryEntryId: leafEntry2?.type === "branch_summary" ? leafAfter2 ?? undefined : undefined
-      };
-      return err5("host_operation_failed", `branchWithSummary failed: ${error51 instanceof Error ? error51.message : String(error51)}`, failure2);
-    }
-    const leafAfter = this.sm.getLeafId();
-    const leafEntry = leafAfter ? this.sm.getEntry(leafAfter) : undefined;
-    const actualSummaryEntryId = leafEntry?.type === "branch_summary" ? leafAfter ?? undefined : undefined;
-    const failure = {
-      branchFromId,
-      leafBefore,
-      leafAfter,
-      mutationApplied: leafAfter !== leafBefore,
-      returnedSummaryEntryId: returned,
-      actualSummaryEntryId
-    };
-    if (typeof returned !== "string" || returned.length === 0) {
-      return err5("branch_verification_failed", `branchWithSummary returned an invalid entry id: ${typeof returned}`, failure);
-    }
-    const summaryEntry = this.sm.getEntry(returned);
-    if (!summaryEntry || summaryEntry.type !== "branch_summary" || summaryEntry.parentId !== branchFromId || summaryEntry.summary !== summary) {
-      return err5("branch_verification_failed", "branchWithSummary did not create the expected summary entry", failure);
-    }
-    if (leafAfter !== returned) {
-      return err5("branch_verification_failed", `branchWithSummary returned ${returned}, but the resulting leaf is ${leafAfter ?? "null"}`, failure);
-    }
-    return ok5({ summaryEntryId: returned, branchFromId, summary, leafBefore, leafAfter: returned });
-  }
+      priorAliases: prevalidation.value.aliases,
+      aliasesAfter,
+      observedLabelEntryId: observed?.id,
+      hostReturnedEntryId,
+      hostError
+    }),
+    state: changed ? "indeterminate" : "not_applied"
+  };
 }
-var hostBridges = new WeakMap;
-function getHostBridge(sm) {
-  let bridge = hostBridges.get(sm);
-  if (!bridge) {
-    bridge = new HostBridge(sm);
-    hostBridges.set(sm, bridge);
+function rollbackCheckpointLabel(sm, token) {
+  const append = getHostMethod(sm, "appendLabelChange");
+  const aliasesBefore = currentAliases(sm, token.targetId);
+  const expectedCurrent = [...token.priorAliases, token.name];
+  if (!append || !sameStrings(aliasesBefore, expectedCurrent)) {
+    return {
+      ...failure(append ? "unsafe_rollback" : "missing_capability", append ? "Checkpoint aliases changed after append; rollback would overwrite another operation" : "SessionManager does not support appendLabelChange — cannot roll back checkpoint label", {
+        targetId: token.targetId,
+        label: token.name,
+        expectedAliases: token.priorAliases,
+        aliasesBefore,
+        aliasesAfter: aliasesBefore
+      }),
+      state: append ? "indeterminate" : "not_applied"
+    };
   }
-  return bridge;
+  let hostError;
+  try {
+    append(token.targetId, undefined);
+    for (const alias of token.priorAliases)
+      append(token.targetId, alias);
+  } catch (error51) {
+    hostError = error51 instanceof Error ? error51.message : String(error51);
+  }
+  const aliasesAfter = currentAliases(sm, token.targetId);
+  if (sameStrings(aliasesAfter, token.priorAliases)) {
+    return { ok: true, state: "applied", value: { targetId: token.targetId, label: token.name, restoredAliases: aliasesAfter } };
+  }
+  return {
+    ...failure(hostError ? "host_operation_failed" : "malformed_capability", hostError ? `appendLabelChange rollback failed: ${hostError}` : "appendLabelChange rollback did not restore the previous aliases", {
+      targetId: token.targetId,
+      label: token.name,
+      expectedAliases: token.priorAliases,
+      aliasesBefore,
+      aliasesAfter,
+      hostError
+    }),
+    state: "indeterminate"
+  };
+}
+function prevalidateBranchWithSummary(sm, branchFromId) {
+  if (!getHostCapabilities(sm).branchWithSummary) {
+    return failure("missing_capability", "SessionManager does not support branchWithSummary — cannot travel", { branchFromId });
+  }
+  if (!sm.getEntry(branchFromId))
+    return failure("entry_not_found", `Entry ${branchFromId} not found`, { branchFromId });
+  return success2({ branchFromId, leafBefore: sm.getLeafId() });
+}
+function applyBranchWithSummary(sm, branchFromId, summary, details) {
+  const prevalidation = prevalidateBranchWithSummary(sm, branchFromId);
+  if (!prevalidation.ok)
+    return { ...prevalidation, state: "not_applied" };
+  const { leafBefore } = prevalidation.value;
+  const branch = getHostMethod(sm, "branchWithSummary");
+  let returned;
+  let hostError;
+  try {
+    returned = branch(branchFromId, summary, details, true);
+  } catch (error51) {
+    hostError = error51 instanceof Error ? error51.message : String(error51);
+  }
+  const leafAfter = sm.getLeafId();
+  const leafEntry = leafAfter ? sm.getEntry(leafAfter) : undefined;
+  const exactSummary = leafEntry?.type === "branch_summary" && leafEntry.parentId === branchFromId && leafEntry.summary === summary;
+  const hostReturnedEntryId = typeof returned === "string" && returned.length > 0 ? returned : undefined;
+  if (exactSummary && leafAfter) {
+    return {
+      ok: true,
+      state: "applied",
+      value: { summaryEntryId: leafAfter, branchFromId, summary, leafBefore, leafAfter, hostReturnedEntryId }
+    };
+  }
+  const failureDetails = {
+    branchFromId,
+    leafBefore,
+    leafAfter,
+    actualSummaryEntryId: leafEntry?.type === "branch_summary" ? leafAfter ?? undefined : undefined,
+    hostReturnedEntryId,
+    hostError
+  };
+  return {
+    ...failure(hostError ? "host_operation_failed" : "branch_verification_failed", hostError ? `branchWithSummary failed: ${hostError}` : "branchWithSummary did not create the expected summary entry at the resulting leaf", failureDetails),
+    state: leafAfter === leafBefore ? "not_applied" : "indeterminate"
+  };
+}
+
+// src/acm/entry-resolution.ts
+function getMessageRoleLabel(entry) {
+  if (entry.type !== "message")
+    return;
+  const role = entry.message.role;
+  if (role === "assistant")
+    return "AI";
+  if (role === "user")
+    return "USER";
+  if (role === "toolResult")
+    return `TOOL:${entry.message.toolName}`;
+  if (role === "bashExecution")
+    return "BASH";
+  if (role === "custom")
+    return "CUSTOM";
+  if (role === "system")
+    return "SYSTEM";
+  return role.toUpperCase();
+}
+function isCheckpointableMessage(entry) {
+  return entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant");
+}
+function describeEntrySnippet(entry, maxLength = 60) {
+  const raw = entry.type === "message" ? "content" in entry.message ? extractTextFromContent(entry.message.content) : "" : entry.type === "branch_summary" || entry.type === "compaction" ? entry.summary : "";
+  const content = raw.replace(/\s+/g, " ").trim();
+  return content.length > maxLength ? `${content.slice(0, maxLength)}...` : content;
+}
+function findLastMeaningfulEntry2(branch, signal) {
+  return findLastMeaningfulEntry(branch, getMeaningfulSkipReason, getMessageRoleLabel, (entry) => describeEntrySnippet(entry), signal);
+}
+function findEntryInTree(tree, id) {
+  return findInTree(tree, (node) => node.entry.id === id)?.entry;
 }
 
 // src/acm/generated-guidance.ts
@@ -209685,525 +209708,42 @@ var RECOVERY_GUIDANCE = {
   refreshExhausted: "Context reconstruction exhausted bounded retries. Reload the session, inspect timeline sync state, and resume only after the selected branch is authoritative."
 };
 
-// src/acm/tools.ts
-function formatBackupText(name2, entryId, resolvedFromHead) {
-  if (!name2 || !entryId)
-    return "none";
-  if (resolvedFromHead) {
-    return `${name2}@${entryId} (resolved from HEAD ${resolvedFromHead})`;
-  }
-  return `${name2}@${entryId}`;
-}
-function formatNumericValue(value, fractionDigits = 0) {
-  if (value === null || !Number.isFinite(value))
-    return "unknown";
-  return value.toFixed(fractionDigits);
-}
-function formatSignedDelta(value, fractionDigits = 0, suffix = "") {
-  if (value === null || !Number.isFinite(value))
-    return "unknown";
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${value.toFixed(fractionDigits)}${suffix}`;
-}
-function getMessageRoleLabel(entry) {
-  if (entry.type !== "message")
-    return;
-  const msg = entry.message;
-  if (msg.role === "assistant")
-    return "AI";
-  if (msg.role === "user")
-    return "USER";
-  if (msg.role === "toolResult")
-    return `TOOL:${msg.toolName}`;
-  if (msg.role === "bashExecution")
-    return "BASH";
-  if (msg.role === "custom")
-    return "CUSTOM";
-  if (msg.role === "system")
-    return "SYSTEM";
-  return msg.role.toUpperCase();
-}
-function isCheckpointableMessage(entry) {
-  if (entry.type !== "message")
-    return false;
-  const role = entry.message.role;
-  return role === "user" || role === "assistant";
-}
-function describeEntrySnippet(entry, maxLen = 60) {
-  const content = getMsgContent(entry, false).replace(/\s+/g, " ").trim();
-  if (!content)
-    return "";
-  return content.length > maxLen ? `${content.slice(0, maxLen)}...` : content;
-}
-function findLastMeaningfulEntry2(branch, signal) {
-  return findLastMeaningfulEntry(branch, getMeaningfulSkipReason, getMessageRoleLabel, (entry) => describeEntrySnippet(entry), signal);
-}
-function findEntryInTree(tree, id) {
-  return findInTree(tree, (n) => n.entry.id === id)?.entry;
-}
-function isTravelSummaryDetails(details) {
-  if (typeof details !== "object" || details === null)
-    return false;
-  const d = details;
-  if (typeof d.originId !== "string")
-    return false;
-  if (d.originLabel !== undefined && typeof d.originLabel !== "string")
-    return false;
-  if (typeof d.target !== "string")
-    return false;
-  if (typeof d.targetId !== "string")
-    return false;
-  if (d.backupCurrentHeadAs !== undefined && d.backupCurrentHeadAs !== null && typeof d.backupCurrentHeadAs !== "string")
-    return false;
-  return true;
-}
-function parseBranchFailureDetails(details) {
-  if (typeof details !== "object" || details === null)
-    return;
-  const record4 = details;
-  if (typeof record4.branchFromId !== "string")
-    return;
-  if (record4.leafBefore !== null && typeof record4.leafBefore !== "string")
-    return;
-  if (record4.leafAfter !== null && typeof record4.leafAfter !== "string")
-    return;
-  if (typeof record4.mutationApplied !== "boolean")
-    return;
-  if (record4.actualSummaryEntryId !== undefined && typeof record4.actualSummaryEntryId !== "string")
-    return;
-  return {
-    branchFromId: record4.branchFromId,
-    leafBefore: record4.leafBefore,
-    leafAfter: record4.leafAfter,
-    mutationApplied: record4.mutationApplied,
-    returnedSummaryEntryId: record4.returnedSummaryEntryId,
-    actualSummaryEntryId: record4.actualSummaryEntryId
-  };
-}
-function getBranchSummaryMetaParts(entry) {
-  if (entry.type !== "branch_summary")
-    return [];
-  const parts = [`branchPoint: ${entry.fromId}`];
-  const details = isTravelSummaryDetails(entry.details) ? entry.details : undefined;
-  if (details?.originId) {
-    const origin = details.originLabel ? `${details.originLabel} (${details.originId})` : details.originId;
-    parts.push(`origin: ${origin}`);
-  }
-  if (details?.target)
-    parts.push(`target: ${details.target}`);
-  if (details?.backupCurrentHeadAs)
-    parts.push(`backupCurrentHeadAs: ${details.backupCurrentHeadAs}`);
-  return parts;
-}
-function extractMessageText(content) {
-  return extractTextFromContent(content);
-}
-function getMsgContent(entry, verbose) {
-  if (entry.type === "branch_summary" || entry.type === "compaction") {
-    return entry.summary || "[No summary provided]";
-  }
-  if (entry.type === "label") {
-    return `checkpoint: ${entry.label}`;
-  }
-  if (entry.type !== "message")
-    return "";
-  const msg = entry.message;
-  if (msg.role === "toolResult") {
-    if (!verbose && ACM_INTERNAL_TOOLS.has(msg.toolName))
-      return "";
-    let resText = (msg.content ?? []).map((p) => p.type === "text" ? p.text : "").join(" ").trim();
-    const details = msg.details;
-    if (typeof details === "object" && details !== null && "path" in details && typeof details.path === "string") {
-      resText = `${details.path}: ${resText}`;
-    }
-    return `(${msg.toolName}) ${resText}`;
-  }
-  if (msg.role === "bashExecution") {
-    return `[Bash] ${msg.command}`;
-  }
-  if (msg.role === "system" || msg.role === "custom") {
-    const text = "content" in msg ? extractMessageText(msg.content) : "";
-    const label = msg.role === "system" ? "System" : "Custom";
-    return text ? `[${label}] ${text}` : "";
-  }
-  if (msg.role === "user" || msg.role === "assistant") {
-    let text = extractMessageText(msg.content);
-    let toolCallsText = "";
-    if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      const toolCalls = msg.content.filter((c) => c.type === "toolCall");
-      toolCallsText = toolCalls.filter((tc) => verbose || !ACM_INTERNAL_TOOLS.has(tc.name)).map((tc) => `call: ${tc.name}(${JSON.stringify(tc.arguments)})`).join("; ");
-    }
-    return [text, toolCallsText].filter(Boolean).join(" ");
-  }
-  return "";
-}
-function isInteresting(entry, labelMaps, childIndex, branch, currentLeafId, backboneIds) {
-  if (entry.id === currentLeafId)
-    return true;
-  if (branch.length > 0 && entry.id === branch[0].id)
-    return true;
-  if (getEntryLabels(labelMaps, entry.id).length > 0)
-    return true;
-  if (entry.type === "label")
-    return false;
-  if (entry.type === "branch_summary" || entry.type === "compaction") {
-    return backboneIds.has(entry.id);
-  }
-  if ((childIndex.get(entry.id) ?? []).length > 1)
-    return true;
-  if (entry.type === "message" && entry.message.role === "user")
-    return true;
-  return false;
-}
-function getDisplayRole(entry) {
-  if (entry.type === "message") {
-    const m = entry.message;
-    if (m.role === "assistant")
-      return "AI";
-    if (m.role === "user")
-      return "USER";
-    if (m.role === "bashExecution")
-      return "BASH";
-    if (m.role === "custom")
-      return "CUSTOM";
-    if (m.role === "system")
-      return "SYSTEM";
-    return "TOOL";
-  }
-  if (entry.type === "branch_summary" || entry.type === "compaction")
-    return "SUMMARY";
-  if (entry.type === "label")
-    return "LABEL";
-  return entry.type.toUpperCase();
-}
-function countSubtreeNodes(node) {
-  let count = 1;
-  const stack = [...node.children ?? []];
-  while (stack.length > 0) {
-    const n = stack.pop();
-    count++;
-    if (n.children?.length)
-      stack.push(...n.children);
-  }
-  return count;
-}
-function countOffPathForks(branch, childIndex, backboneIds) {
-  let forks = 0;
-  for (const entry of branch) {
-    const children = childIndex.get(entry.id) ?? [];
-    if (children.some((c) => (c.entry.type === "branch_summary" || c.entry.type === "compaction") && !backboneIds.has(c.entry.id))) {
-      forks++;
-    }
-  }
-  return forks;
-}
-function formatOffPathFootnotes(entry, childIndex, backboneIds) {
-  const children = childIndex.get(entry.id) ?? [];
-  const offPath = children.filter((c) => (c.entry.type === "branch_summary" || c.entry.type === "compaction") && !backboneIds.has(c.entry.id));
-  if (offPath.length === 0)
-    return [];
-  const footnotes = [];
-  const maxShow = 3;
-  for (let i = 0;i < Math.min(offPath.length, maxShow); i++) {
-    const child = offPath[i];
-    const e = child.entry;
-    const kind = e.type;
-    const meta3 = e.type === "branch_summary" ? getBranchSummaryMetaParts(e).join(", ") : e.type === "compaction" ? `firstKept: ${e.firstKeptEntryId}` : "";
-    const subtreeSize = countSubtreeNodes(child);
-    footnotes.push(`  :  [off-path] ${kind} ${e.id} (${meta3}) — ${subtreeSize} node(s), not on active path`);
-  }
-  if (offPath.length > maxShow) {
-    footnotes.push(`  :  [off-path] +${offPath.length - maxShow} more — use view search or tree`);
-  }
-  return footnotes;
-}
-function buildChildIndex(tree) {
-  const childIndex = new Map;
-  const idxStack = [...tree];
-  while (idxStack.length > 0) {
-    const n = idxStack.pop();
-    childIndex.set(n.entry.id, n.children ?? []);
-    if (n.children?.length) {
-      for (const child of n.children)
-        idxStack.push(child);
-    }
-  }
-  return childIndex;
-}
-function collectCheckpointListings(labelMaps, backboneIds, currentLeafId, searchTerm, entriesById, pathOrderById) {
-  const listings = [];
-  for (const [label, entryId] of labelMaps.labelToEntryId) {
-    if (searchTerm && !label.toLowerCase().includes(searchTerm) && !entryId.toLowerCase().includes(searchTerm)) {
-      continue;
-    }
-    listings.push({
-      entryId,
-      label,
-      onActivePath: backboneIds.has(entryId),
-      isHead: entryId === currentLeafId,
-      pathOrder: pathOrderById.get(entryId) ?? Number.MAX_SAFE_INTEGER,
-      timestamp: entriesById.get(entryId)?.timestamp ?? ""
-    });
-  }
-  listings.sort((a, b) => {
-    if (a.onActivePath !== b.onActivePath)
-      return a.onActivePath ? -1 : 1;
-    if (a.onActivePath && a.pathOrder !== b.pathOrder)
-      return a.pathOrder - b.pathOrder;
-    const timeOrder = a.timestamp.localeCompare(b.timestamp);
-    if (timeOrder !== 0)
-      return timeOrder;
-    const entryOrder = a.entryId.localeCompare(b.entryId);
-    return entryOrder !== 0 ? entryOrder : a.label.localeCompare(b.label);
-  });
-  return listings;
-}
-function renderTreeNode(node, labelMaps, currentLeafId, backboneIds, depth, maxDepth, prefix, isLast, lines, signal) {
-  if (depth > maxDepth)
-    return true;
-  if (lines.length >= 200)
-    return true;
-  if (signal?.aborted)
-    return true;
-  const entry = node.entry;
-  const isHead = entry.id === currentLeafId;
-  const checkpointLabels = formatEntryLabels(labelMaps, entry.id);
-  const role = getDisplayRole(entry);
-  const metaParts = [];
-  if (!backboneIds.has(entry.id))
-    metaParts.push("off-path");
-  if (checkpointLabels)
-    metaParts.push(`checkpoint: ${checkpointLabels}`);
-  if (entry.type === "branch_summary")
-    metaParts.push(...getBranchSummaryMetaParts(entry));
-  if (entry.type === "compaction")
-    metaParts.push(`firstKept: ${entry.firstKeptEntryId}`);
-  if (isHead)
-    metaParts.push("*HEAD*");
-  const content = getMsgContent(entry, false).replace(/\s+/g, " ");
-  const body = content.length > 50 ? content.slice(0, 50) + "..." : content;
-  const connector = isLast ? "└─" : "├─";
-  const meta3 = metaParts.length > 0 ? ` (${metaParts.join(", ")})` : "";
-  lines.push(`${prefix}${connector} ${entry.id}${meta3} [${role}] ${body}`);
-  let truncated = false;
-  const childPrefix = prefix + (isLast ? "   " : "│  ");
-  const children = node.children ?? [];
-  for (let i = 0;i < children.length; i++) {
-    if (lines.length >= 200) {
-      truncated = true;
-      break;
-    }
-    const childTruncated = renderTreeNode(children[i], labelMaps, currentLeafId, backboneIds, depth + 1, maxDepth, childPrefix, i === children.length - 1, lines, signal);
-    if (childTruncated)
-      truncated = true;
-  }
-  return truncated || depth >= maxDepth && children.length > 0;
-}
-function createLiteralSearchPattern(searchTerm) {
-  return new RegExp(searchTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-}
-function entryContentMatchesSearch(entry, pattern2) {
-  if (entry.type === "branch_summary" || entry.type === "compaction") {
-    return pattern2.test(entry.summary ?? "");
-  }
-  if (entry.type === "label")
-    return pattern2.test(`checkpoint: ${entry.label ?? ""}`);
-  if (entry.type !== "message")
-    return false;
-  const message = entry.message;
-  if (message.role === "toolResult") {
-    if (pattern2.test(message.toolName ?? ""))
-      return true;
-    const details = message.details;
-    if (typeof details?.path === "string" && pattern2.test(details.path))
-      return true;
-    return Array.isArray(message.content) && message.content.some((part) => {
-      if (typeof part !== "object" || part === null || !("type" in part) || !("text" in part))
-        return false;
-      return part.type === "text" && typeof part.text === "string" && pattern2.test(part.text);
-    });
-  }
-  if (message.role === "bashExecution")
-    return pattern2.test(`[Bash] ${message.command ?? ""}`);
-  if (message.role !== "user" && message.role !== "assistant")
-    return false;
-  if (typeof message.content === "string")
-    return pattern2.test(message.content);
-  if (!Array.isArray(message.content))
-    return false;
-  return message.content.some((part) => {
-    if (typeof part !== "object" || part === null || !("type" in part))
-      return false;
-    if (part.type === "text" && "text" in part && typeof part.text === "string")
-      return pattern2.test(part.text);
-    if (message.role === "assistant" && part.type === "toolCall") {
-      const toolCall = part;
-      const callText = `call: ${toolCall.name ?? "unknown"}(${JSON.stringify(toolCall.arguments ?? {})}) ${toolCall.id ?? ""}`;
-      return pattern2.test(callText);
-    }
-    return false;
-  });
-}
-function searchFullSessionTree(tree, labelMaps, searchTerm, searchLimit, signal) {
-  const matched = [];
-  const searchStack = [];
-  pushTreeChildrenPreOrder(searchStack, tree);
-  const contentPattern = createLiteralSearchPattern(searchTerm);
-  let visited = 0;
-  const maxVisited = 1e4;
-  while (searchStack.length > 0 && visited < maxVisited) {
-    if (signal?.aborted)
-      break;
-    visited++;
-    const n = searchStack.pop();
-    if (n.children?.length)
-      pushTreeChildrenPreOrder(searchStack, n.children);
-    const checkpointLabels = formatEntryLabels(labelMaps, n.entry.id) ?? "";
-    const cheapMatch = checkpointLabels.toLowerCase().includes(searchTerm) || entryMatchesLabelSearch(labelMaps, n.entry.id, searchTerm) || n.entry.id.toLowerCase().includes(searchTerm);
-    if (cheapMatch || entryContentMatchesSearch(n.entry, contentPattern)) {
-      const normalized = getMsgContent(n.entry, false).replace(/\s+/g, " ");
-      matched.push({
-        node: n,
-        checkpointLabels,
-        preview: normalized.length > 80 ? normalized.slice(0, 80) + "..." : normalized
-      });
-    }
-  }
-  matched.sort((a, b) => {
-    const timestampOrder = compareEntriesByTimestamp(a.node.entry, b.node.entry);
-    return timestampOrder !== 0 ? timestampOrder : a.node.entry.id.localeCompare(b.node.entry.id);
-  });
-  return {
-    matches: matched,
-    visited,
-    truncated: matched.length > searchLimit || searchStack.length > 0 || signal?.aborted === true
-  };
-}
-function formatTreeSearchResults(matches, currentLeafId, searchQuery, searchLimit, truncated) {
-  const lines = [];
-  const displayedCount = Math.min(matches.length, searchLimit);
-  lines.push(`Search '${searchQuery}': ${displayedCount} displayed${truncated ? "; additional matches truncated" : ` of ${matches.length} matching node(s)`}.`);
-  for (const m of matches.slice(0, searchLimit)) {
-    const isHead = m.node.entry.id === currentLeafId;
-    const role = getDisplayRole(m.node.entry);
-    const body = m.preview;
-    const metaParts = [
-      m.checkpointLabels ? `checkpoint: ${m.checkpointLabels}` : null,
-      isHead ? "*HEAD*" : null,
-      `type: ${m.node.entry.type}`
-    ].filter((s) => s !== null);
-    const meta3 = metaParts.length > 0 ? ` (${metaParts.join(", ")})` : "";
-    lines.push(`${isHead ? "*" : " "} ${m.node.entry.id}${meta3} [${role}] ${body}`);
-  }
-  return lines;
-}
-function isToolCallBlock(block) {
-  return typeof block === "object" && block !== null && "type" in block && block.type === "toolCall" && "id" in block && "name" in block;
-}
-function fixOrphanedToolUse(messages) {
-  const result = [...messages];
-  for (let i = result.length - 1;i >= 0; i--) {
-    const msg = result[i];
-    if (msg.role !== "toolResult")
-      continue;
-    const toolCallId = msg.toolCallId;
-    let precedingIndex = i - 1;
-    while (precedingIndex >= 0 && result[precedingIndex].role === "toolResult")
-      precedingIndex--;
-    const preceding = precedingIndex >= 0 ? result[precedingIndex] : undefined;
-    const hasMatchingCall = Boolean(toolCallId && preceding?.role === "assistant" && preceding.stopReason !== "error" && preceding.stopReason !== "aborted" && Array.isArray(preceding.content) && preceding.content.some((block) => isToolCallBlock(block) && block.id === toolCallId));
-    if (!hasMatchingCall)
-      result.splice(i, 1);
-  }
-  for (let i = 0;i < result.length; i++) {
-    const msg = result[i];
-    if (msg.role !== "assistant" || !Array.isArray(msg.content))
-      continue;
-    if (msg.stopReason === "error" || msg.stopReason === "aborted")
-      continue;
-    const toolUseIds = [];
-    for (const block of msg.content) {
-      if (isToolCallBlock(block)) {
-        if (block.id)
-          toolUseIds.push({ id: block.id, name: block.name });
-      }
-    }
-    if (toolUseIds.length === 0)
-      continue;
-    const resolvedIds = new Set;
-    for (let j = i + 1;j < result.length; j++) {
-      const tr = result[j];
-      if (tr.role === "toolResult") {
-        if (tr.toolCallId)
-          resolvedIds.add(tr.toolCallId);
-      } else {
-        break;
-      }
-    }
-    const orphaned = toolUseIds.filter((t) => !resolvedIds.has(t.id));
-    if (orphaned.length === 0)
-      continue;
-    const synthetics = orphaned.map((t) => ({
-      role: "toolResult",
-      toolCallId: t.id,
-      toolName: t.name,
-      content: [{ type: "text", text: "[Interrupted by context travel]" }],
-      timestamp: Date.now(),
-      isError: true
-    }));
-    result.splice(i + 1, 0, ...synthetics);
-    i += synthetics.length;
-  }
-  return result;
-}
-function tools_default(pi) {
-  const zod = pi.zod;
-  const contextRefresh = new ContextRefreshRegistry;
-  const cachedUsageMap = new WeakMap;
-  const refreshTargetLeafIds = new WeakMap;
+// src/acm/checkpoint-tool.ts
+function registerCheckpointTool(pi) {
   const registerTool = (tool) => pi.registerTool(tool);
-  pi.on("before_agent_start", (event) => {
-    if (event.systemPrompt.some((segment) => segment.includes(ACM_CORE_MARKER)))
-      return;
-    return {
-      systemPrompt: [...event.systemPrompt, `${ACM_CORE_MARKER}
-${ACM_CORE}`]
-    };
-  });
-  const checkpointSchema = zod.object({
-    name: zod.string().min(1).max(64).regex(/^[\w\-\.]+$/).describe("Unique semantic anchor name. Use '<name>-start' for the beginning of a boundary you may later compress: task chain, phase, burst, or risky attempt. Use '<name>-done' for a milestone/archive pointer after results are in hand. E.g. parser-fix-start, timeout-investigation-start, root-cause-done. Avoid generic names like start, checkpoint-1. Only letters, digits, hyphens, underscores, and dots. Max 64 chars."),
-    target: zod.string().min(1).max(256).optional().describe("History node ID or checkpoint name to label. Defaults to current meaningful position near HEAD.")
+  const schema2 = pi.zod.object({
+    name: pi.zod.string().min(1).max(64).regex(/^[\w\-\.]+$/).describe("Unique semantic anchor name. Use '<name>-start' for the beginning of a boundary you may later compress: task chain, phase, burst, or risky attempt. Use '<name>-done' for a milestone/archive pointer after results are in hand. E.g. parser-fix-start, timeout-investigation-start, root-cause-done. Avoid generic names like start, checkpoint-1. Only letters, digits, hyphens, underscores, and dots. Max 64 chars."),
+    target: pi.zod.string().min(1).max(256).optional().describe("History node ID or checkpoint name to label. Defaults to current meaningful position near HEAD.")
   });
   registerTool({
     name: "acm_checkpoint",
     label: "ACM Checkpoint",
     description: TOOL_DESCRIPTIONS.checkpoint,
-    parameters: checkpointSchema,
+    parameters: schema2,
     strict: false,
     async execute(_id, rawParams, signal, _onUpdate, ctx) {
-      const params = checkpointSchema.parse(rawParams);
-      const sm = ctx.sessionManager;
-      const bridge = getHostBridge(sm);
-      const tree = bridge.getTree();
-      const labelMaps = bridge.buildLabelMaps();
-      const branch = bridge.getBranch();
-      const branchIds = new Set(branch.map((e) => e.id));
-      let id;
+      const params = schema2.parse(rawParams);
+      const sessionManager = ctx.sessionManager;
+      const tree = sessionManager.getTree();
+      const labelMaps = buildLabelMaps(sessionManager.getEntries());
+      const branch = sessionManager.getBranch();
+      const branchIds = new Set(branch.map((entry) => entry.id));
+      let entryId;
       let autoResolved;
       let targetEntry;
       if (params.target) {
-        const resolved = resolveTargetId(bridge, tree, params.target, branchIds, labelMaps);
-        id = resolved.id;
-        if (!isValidEntryId(id)) {
+        const resolved = resolveTargetId(sessionManager, tree, params.target, branchIds, labelMaps);
+        entryId = resolved.id;
+        if (!isValidEntryId(entryId)) {
           return {
             content: [{ type: "text", text: "Error: Cannot checkpoint root — session tree is empty." }],
             details: { error: "empty_session", requestedTarget: params.target }
           };
         }
         if (params.target.toLowerCase() === "root" && tree.length > 1) {
-          ctx.ui.notify(`Note: 'root' resolved to the first top-level node (${id}); this session has ${tree.length} top-level roots.`, "info");
+          ctx.ui.notify(`Note: 'root' resolved to the first top-level node (${entryId}); this session has ${tree.length} top-level roots.`, "info");
         }
-        targetEntry = findEntryInTree(tree, id);
+        targetEntry = findEntryInTree(tree, entryId);
         if (!targetEntry) {
           const hint = " Use acm_timeline to choose the last clean node before the boundary you want to label; raw node IDs are valid targets.";
           return {
@@ -210213,64 +209753,62 @@ ${ACM_CORE}`]
         }
         if (!isCheckpointableMessage(targetEntry)) {
           const role2 = getMessageRoleLabel(targetEntry) ?? targetEntry.type;
-          ctx.ui.notify(`Warning: explicit checkpoint target '${params.target}' (${id}) is a ${role2} node, not USER/AI. Prefer conversational turns; travel semantics may be unintuitive.`, "warning");
+          ctx.ui.notify(`Warning: explicit checkpoint target '${params.target}' (${entryId}) is a ${role2} node, not USER/AI. Prefer conversational turns; travel semantics may be unintuitive.`, "warning");
         }
         if (resolved.fromOffPath) {
           ctx.ui.notify(`Note: target '${params.target}' resolved from an off-path branch. Checkpoint will be placed on a non-active node.`, "warning");
         }
       } else {
         autoResolved = findLastMeaningfulEntry2(branch, signal);
-        id = autoResolved.entryId ?? "";
+        entryId = autoResolved.entryId ?? "";
       }
       if (signal?.aborted || autoResolved?.aborted) {
-        return {
-          content: [{ type: "text", text: "acm_checkpoint aborted." }],
-          details: { error: "aborted" }
-        };
+        return { content: [{ type: "text", text: "acm_checkpoint aborted." }], details: { error: "aborted" } };
       }
-      if (!id) {
+      if (!entryId) {
         const isEmpty = branch.length === 0;
-        const msg = isEmpty ? "No session entry to checkpoint. The conversation is empty." : "No meaningful entry to checkpoint. Recent HEAD traffic is tool/bash/custom/system-only or empty — specify a target explicitly.";
         return {
-          content: [{ type: "text", text: msg }],
+          content: [{
+            type: "text",
+            text: isEmpty ? "No session entry to checkpoint. The conversation is empty." : "No meaningful entry to checkpoint. Recent HEAD traffic is tool/bash/custom/system-only or empty — specify a target explicitly."
+          }],
           details: { error: isEmpty ? "empty_session" : "no_meaningful_entry" }
         };
       }
-      const appendResult = bridge.appendCheckpointLabel(id, params.name);
-      if (!appendResult.ok) {
-        if (appendResult.error === "label_conflict") {
-          const conflict = appendResult.details;
-          const onPath = conflict?.onActivePath ? "on-path" : "off-path";
+      const append = appendCheckpointLabel(sessionManager, entryId, params.name);
+      if (!append.ok) {
+        if (append.error === "label_conflict") {
+          const conflict = append.details;
           return {
             content: [{
               type: "text",
-              text: `Checkpoint '${params.name}' already belongs to ${conflict?.entryId ?? "unknown"} (${onPath}). ${RECOVERY_GUIDANCE.nameCollision}`
+              text: `Checkpoint '${params.name}' already belongs to ${conflict.entryId} (${conflict.onActivePath ? "on-path" : "off-path"}). ${RECOVERY_GUIDANCE.nameCollision}`
             }],
             details: {
               error: "duplicate_name",
               label: params.name,
               name: params.name,
-              entryId: conflict?.entryId ?? "",
-              existingEntryId: conflict?.entryId ?? null,
-              existingEntryOnActivePath: conflict?.onActivePath ?? null
+              entryId: conflict.entryId,
+              existingEntryId: conflict.entryId,
+              existingEntryOnActivePath: conflict.onActivePath
             }
           };
         }
         return {
-          content: [{ type: "text", text: `${appendResult.message}. ${RECOVERY_GUIDANCE.hostCapability}` }],
+          content: [{ type: "text", text: `${append.message}. ${RECOVERY_GUIDANCE.hostCapability}` }],
           details: {
-            error: appendResult.error,
+            error: append.error,
             label: params.name,
             name: params.name,
-            entryId: id,
-            message: appendResult.message,
-            resolvedEntryId: id,
-            hostBridgeMessage: appendResult.message
+            entryId,
+            message: append.message,
+            resolvedEntryId: entryId,
+            hostBridgeMessage: append.message
           }
         };
       }
-      const { status, aliases, labelEntryId } = appendResult.value;
-      const resolvedEntry = targetEntry ?? findEntryInTree(tree, id);
+      const { status, aliases, labelEntryId } = append.value;
+      const resolvedEntry = targetEntry ?? findEntryInTree(tree, entryId);
       const role = autoResolved?.role ?? (resolvedEntry ? getMessageRoleLabel(resolvedEntry) : undefined) ?? resolvedEntry?.type.toUpperCase() ?? "NODE";
       const usage = ctx.getContextUsage();
       const usageText = usage ? formatContextUsage(usage, true) : "unknown";
@@ -210278,19 +209816,18 @@ ${ACM_CORE}`]
       const skippedCount = autoResolved?.skipped.length;
       const placement = autoResolved ? `${role}${skippedCount ? `; skipped ${skippedCount} nearer transient/non-meaningful entr${skippedCount === 1 ? "y" : "ies"}` : ""}` : `${role}; explicit target '${params.target}'`;
       const action2 = status === "already_present" ? "Reused" : "Created";
-      const aliasesText = aliases.join(", ");
       return {
         content: [{
           type: "text",
-          text: `${action2} checkpoint '${params.name}' at ${id} via label entry ${labelEntryId} (${placement}). Aliases: ${aliasesText}. Context usage: ${usageText}. ${cue}`
+          text: `${action2} checkpoint '${params.name}' at ${entryId} via label entry ${labelEntryId} (${placement}). Aliases: ${aliases.join(", ")}. Context usage: ${usageText}. ${cue}`
         }],
         details: {
           status,
           alreadyPresent: status === "already_present",
           label: params.name,
           labelEntryId,
-          entryId: id,
-          resolvedEntryId: id,
+          entryId,
+          resolvedEntryId: entryId,
           role,
           aliases,
           target: params.target ?? "auto",
@@ -210309,60 +209846,359 @@ ${ACM_CORE}`]
       };
     }
   });
-  const timelineLimitSchema = zod.number().int().min(1).max(50).default(50).describe("Maximum recent visible entries (active), sorted aliases (checkpoints), matches (search), or traversal depth per root (tree). Range 1..50; default 50.");
-  const timelineViewSchema = zod.discriminatedUnion("view", [
-    zod.object({
-      view: zod.literal("active"),
-      limit: timelineLimitSchema,
-      verbose: zod.boolean().optional().describe("Show all active-path messages, including internal tool traffic and system/custom metadata.")
+}
+
+// src/acm/message-sanitizer.ts
+function isToolCallBlock(block) {
+  return typeof block === "object" && block !== null && "type" in block && block.type === "toolCall" && "id" in block && "name" in block;
+}
+function fixOrphanedToolUse(messages) {
+  const result = [...messages];
+  for (let index = result.length - 1;index >= 0; index--) {
+    const message = result[index];
+    if (message.role !== "toolResult")
+      continue;
+    const toolCallId = message.toolCallId;
+    let precedingIndex = index - 1;
+    while (precedingIndex >= 0 && result[precedingIndex].role === "toolResult")
+      precedingIndex--;
+    const preceding = precedingIndex >= 0 ? result[precedingIndex] : undefined;
+    const hasMatchingCall = Boolean(toolCallId && preceding?.role === "assistant" && preceding.stopReason !== "error" && preceding.stopReason !== "aborted" && Array.isArray(preceding.content) && preceding.content.some((block) => isToolCallBlock(block) && block.id === toolCallId));
+    if (!hasMatchingCall)
+      result.splice(index, 1);
+  }
+  for (let index = 0;index < result.length; index++) {
+    const message = result[index];
+    if (message.role !== "assistant" || !Array.isArray(message.content))
+      continue;
+    if (message.stopReason === "error" || message.stopReason === "aborted")
+      continue;
+    const toolUseIds = [];
+    for (const block of message.content) {
+      if (isToolCallBlock(block) && block.id)
+        toolUseIds.push({ id: block.id, name: block.name });
+    }
+    if (toolUseIds.length === 0)
+      continue;
+    const resolvedIds = new Set;
+    for (let followingIndex = index + 1;followingIndex < result.length; followingIndex++) {
+      const following = result[followingIndex];
+      if (following.role !== "toolResult")
+        break;
+      if (following.toolCallId)
+        resolvedIds.add(following.toolCallId);
+    }
+    const orphaned = toolUseIds.filter((toolUse) => !resolvedIds.has(toolUse.id));
+    if (orphaned.length === 0)
+      continue;
+    const synthetics = orphaned.map((toolUse) => ({
+      role: "toolResult",
+      toolCallId: toolUse.id,
+      toolName: toolUse.name,
+      content: [{ type: "text", text: "[Interrupted by context travel]" }],
+      timestamp: Date.now(),
+      isError: true
+    }));
+    result.splice(index + 1, 0, ...synthetics);
+    index += synthetics.length;
+  }
+  return result;
+}
+
+// src/acm/runtime-lifecycle.ts
+function registerAcmLifecycle(pi, runtime) {
+  const contextRefresh = runtime.contextRefresh;
+  pi.on("context", (event, ctx) => {
+    const sessionManager = ctx.sessionManager;
+    if (!contextRefresh.isPending(sessionManager)) {
+      const original = event.messages;
+      const fixed = fixOrphanedToolUse(original);
+      const changed = fixed.length !== original.length || fixed.some((message, index) => message !== original[index]);
+      return changed ? { messages: fixed } : undefined;
+    }
+    const reportFailure = (message) => {
+      const willRetry = contextRefresh.recordFailedAttempt(sessionManager, message);
+      const attempt = contextRefresh.getAttemptCount(sessionManager);
+      ctx.ui.notify(willRetry ? `Context refresh after travel failed (${attempt}/${ContextRefreshRegistry.MAX_ATTEMPTS}): ${message}. Will retry on the next LLM turn.` : `Context refresh after travel failed after ${attempt} attempts: ${message}. ${RECOVERY_GUIDANCE.refreshExhausted}`, "warning");
+      return { messages: event.messages };
+    };
+    try {
+      const messagesResult = buildSessionMessages(sessionManager);
+      if (!messagesResult.ok)
+        return reportFailure(messagesResult.message);
+      let messages = messagesResult.value;
+      if (messages.length === 0) {
+        const fallbackLeafId = runtime.getRefreshTarget(sessionManager);
+        const fallbackResult = fallbackLeafId ? buildSessionMessages(sessionManager, fallbackLeafId) : { ok: true, value: [] };
+        messages = fallbackResult.ok ? fallbackResult.value : [];
+      }
+      if (messages.length === 0)
+        return reportFailure("rebuilt messages array is empty");
+      const fixed = fixOrphanedToolUse(messages);
+      contextRefresh.markRebuilt(sessionManager);
+      return { messages: fixed };
+    } catch (error51) {
+      return reportFailure(error51 instanceof Error ? error51.message : String(error51));
+    }
+  });
+  pi.on("turn_end", (event, ctx) => {
+    const message = event.message;
+    if (message.role !== "assistant" || !message.usage)
+      return;
+    const promptTokens = (message.usage.input ?? 0) + (message.usage.cacheRead ?? 0);
+    const contextWindow = ctx.getContextUsage()?.contextWindow;
+    if (typeof contextWindow === "number" && contextWindow > 0) {
+      runtime.setUsage(ctx.sessionManager, {
+        tokens: promptTokens,
+        contextWindow,
+        percent: promptTokens / contextWindow * 100
+      });
+    }
+  });
+  pi.on("session_before_compact", (event, ctx) => {
+    const sessionManager = ctx.sessionManager;
+    const branch = sessionManager.getBranch();
+    if (branch.length === 0)
+      return;
+    const labelMaps = buildLabelMaps(sessionManager.getEntries());
+    const timestamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const checkpointBase = `pre-compact-${timestamp}`;
+    let checkpointName = checkpointBase;
+    for (let ordinal = 2;labelMaps.labelToEntryId.has(checkpointName); ordinal++) {
+      checkpointName = `${checkpointBase}-${ordinal}`;
+    }
+    const resolved = findLastMeaningfulEntry2(branch, event.signal);
+    if (!resolved.entryId)
+      return;
+    const append = appendCheckpointLabel(sessionManager, resolved.entryId, checkpointName);
+    if (!append.ok)
+      ctx.ui.notify(`Could not create pre-compaction checkpoint: ${append.message}`, "warning");
+  });
+  pi.on("session_compact", (_event, ctx) => runtime.clear(ctx.sessionManager));
+  pi.on("session_start", (_event, ctx) => runtime.clear(ctx.sessionManager));
+  pi.on("session_shutdown", (_event, ctx) => runtime.clear(ctx.sessionManager));
+}
+
+// src/acm/prompt-registration.ts
+function ensureAcmCoreSegment(systemPrompt) {
+  if (systemPrompt.some((segment) => segment.includes(ACM_CORE_MARKER)))
+    return systemPrompt;
+  return [...systemPrompt, `${ACM_CORE_MARKER}
+${ACM_CORE}`];
+}
+function registerAcmPrompt(pi) {
+  pi.on("before_agent_start", (event) => {
+    const systemPrompt = ensureAcmCoreSegment(event.systemPrompt);
+    return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
+  });
+}
+
+// src/acm/runtime.ts
+class AcmSessionRuntime {
+  contextRefresh = new ContextRefreshRegistry;
+  cachedUsage = new WeakMap;
+  refreshTargets = new WeakMap;
+  scheduleRefresh(session, preferredLeafId) {
+    this.contextRefresh.markPending(session);
+    if (preferredLeafId)
+      this.refreshTargets.set(session, preferredLeafId);
+    else
+      this.refreshTargets.delete(session);
+  }
+  getRefreshTarget(session) {
+    return this.refreshTargets.get(session);
+  }
+  setUsage(session, usage) {
+    this.cachedUsage.set(session, usage);
+  }
+  getUsage(session) {
+    return this.cachedUsage.get(session);
+  }
+  clear(session) {
+    this.contextRefresh.clear(session);
+    this.refreshTargets.delete(session);
+    this.cachedUsage.delete(session);
+  }
+}
+
+// src/acm/timeline-tool.ts
+function entryText(entry, verbose) {
+  if (entry.type === "branch_summary" || entry.type === "compaction")
+    return entry.summary || "[No summary provided]";
+  if (entry.type === "label")
+    return verbose ? `label ${entry.label ?? "cleared"} → ${entry.targetId}` : "";
+  if (entry.type !== "message")
+    return verbose ? entry.type : "";
+  const role = entry.message.role;
+  if (!verbose && (role === "custom" || role === "system"))
+    return "";
+  return "content" in entry.message ? extractTextFromContent(entry.message.content) : "";
+}
+function displayRole(entry) {
+  if (entry.type === "branch_summary")
+    return "SUMMARY";
+  if (entry.type === "compaction")
+    return "COMPACTION";
+  if (entry.type === "label")
+    return "LABEL";
+  if (entry.type !== "message")
+    return entry.type.toUpperCase();
+  if (entry.message.role === "assistant")
+    return "AI";
+  if (entry.message.role === "user")
+    return "USER";
+  if (entry.message.role === "toolResult")
+    return `TOOL:${entry.message.toolName}`;
+  if (entry.message.role === "bashExecution")
+    return "BASH";
+  return entry.message.role.toUpperCase();
+}
+function visibleOnActivePath(entry, labelMaps, leafId, verbose) {
+  if (verbose)
+    return true;
+  if (entry.id === leafId || getEntryLabels(labelMaps, entry.id).length > 0)
+    return true;
+  if (entry.type === "branch_summary" || entry.type === "compaction")
+    return true;
+  return entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant");
+}
+function collectListings(labelMaps, activeIds, leafId, filter, entriesById, pathOrder) {
+  const listings = [];
+  for (const [entryId, labels] of labelMaps.entryToLabels) {
+    const entry = entriesById.get(entryId);
+    if (!entry)
+      continue;
+    for (const label of labels) {
+      if (filter && !label.toLowerCase().includes(filter) && !entryId.toLowerCase().includes(filter))
+        continue;
+      listings.push({
+        entryId,
+        label,
+        onActivePath: activeIds.has(entryId),
+        isHead: entryId === leafId,
+        pathOrder: pathOrder.get(entryId) ?? Number.MAX_SAFE_INTEGER,
+        timestamp: entry.timestamp
+      });
+    }
+  }
+  return listings.sort((left, right) => {
+    if (left.onActivePath !== right.onActivePath)
+      return left.onActivePath ? -1 : 1;
+    if (left.onActivePath && left.pathOrder !== right.pathOrder)
+      return left.pathOrder - right.pathOrder;
+    const timestampOrder = left.timestamp.localeCompare(right.timestamp);
+    return timestampOrder || left.entryId.localeCompare(right.entryId) || left.label.localeCompare(right.label);
+  });
+}
+function literalPattern(query) {
+  return new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+}
+function searchTree(tree, labelMaps, query, limit, signal) {
+  const pattern2 = literalPattern(query);
+  const stack = [...tree].reverse();
+  const matches = [];
+  let truncated = false;
+  while (stack.length > 0) {
+    if (signal?.aborted) {
+      truncated = true;
+      break;
+    }
+    const node = stack.pop();
+    const labels = getEntryLabels(labelMaps, node.entry.id);
+    const matched = pattern2.test(node.entry.id) || labels.some((label) => pattern2.test(label)) || pattern2.test(entryText(node.entry, true));
+    if (matched) {
+      if (matches.length < limit)
+        matches.push({ entry: node.entry, labels });
+      else
+        truncated = true;
+    }
+    pushTreeChildrenPreOrder(stack, node.children);
+  }
+  return { matches, truncated };
+}
+function renderTree(tree, labelMaps, leafId, activeIds, maxDepth, signal) {
+  const lines = [];
+  let truncated = false;
+  const visit = (node, depth, prefix, last) => {
+    if (signal?.aborted || lines.length >= 200) {
+      truncated = true;
+      return;
+    }
+    const role = displayRole(node.entry);
+    const labels = formatEntryLabels(labelMaps, node.entry.id);
+    const tags = [
+      node.entry.id === leafId ? "HEAD" : null,
+      activeIds.has(node.entry.id) ? "active" : "off-path",
+      labels ? `checkpoint: ${labels}` : null
+    ].filter((tag) => tag !== null);
+    const body = entryText(node.entry, true).replace(/\s+/g, " ").slice(0, 100);
+    lines.push(`${prefix}${last ? "└─" : "├─"} ${node.entry.id} (${tags.join(", ")}) [${role}] ${body}`);
+    if (depth >= maxDepth && node.children.length > 0) {
+      truncated = true;
+      return;
+    }
+    const childPrefix = `${prefix}${last ? "  " : "│ "}`;
+    node.children.forEach((child, index) => visit(child, depth + 1, childPrefix, index === node.children.length - 1));
+  };
+  tree.forEach((root, index) => visit(root, 1, "", index === tree.length - 1));
+  return { lines, truncated };
+}
+function countOffPathSummaries(branch, tree, activeIds) {
+  const branchIds = new Set(branch.map((entry) => entry.id));
+  let count = 0;
+  const stack = [...tree];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (branchIds.has(node.entry.id) && node.children.some((child) => !activeIds.has(child.entry.id) && child.entry.type === "branch_summary"))
+      count++;
+    stack.push(...node.children);
+  }
+  return count;
+}
+function registerTimelineTool(pi, runtime) {
+  const registerTool = (tool) => pi.registerTool(tool);
+  const limitSchema = pi.zod.number().int().min(1).max(50).default(50).describe("Maximum recent visible entries (active), sorted aliases (checkpoints), matches (search), or traversal depth per root (tree). Range 1..50; default 50.");
+  const viewSchema = pi.zod.discriminatedUnion("view", [
+    pi.zod.object({
+      view: pi.zod.literal("active"),
+      limit: limitSchema,
+      verbose: pi.zod.boolean().optional().describe("Show all active-path messages, including internal tool traffic and system/custom metadata.")
     }).strict(),
-    zod.object({
-      view: zod.literal("checkpoints"),
-      limit: timelineLimitSchema,
-      filter: zod.string().trim().min(1).max(500).optional().describe("Optional non-blank checkpoint label or entry-ID filter, matched case-insensitively.")
+    pi.zod.object({
+      view: pi.zod.literal("checkpoints"),
+      limit: limitSchema,
+      filter: pi.zod.string().trim().min(1).max(500).optional().describe("Optional non-blank checkpoint label or entry-ID filter, matched case-insensitively.")
     }).strict(),
-    zod.object({
-      view: zod.literal("search"),
-      limit: timelineLimitSchema,
-      query: zod.string().trim().min(1).max(500).describe("Required non-blank full-tree query matching labels, node IDs, or rendered content case-insensitively.")
+    pi.zod.object({
+      view: pi.zod.literal("search"),
+      limit: limitSchema,
+      query: pi.zod.string().trim().min(1).max(500).describe("Required non-blank full-tree query matching labels, node IDs, or rendered content case-insensitively.")
     }).strict(),
-    zod.object({
-      view: zod.literal("tree"),
-      limit: timelineLimitSchema
-    }).strict()
+    pi.zod.object({ view: pi.zod.literal("tree"), limit: limitSchema }).strict()
   ]);
-  const timelineSchema = zod.preprocess((rawParams) => {
+  const schema2 = pi.zod.preprocess((rawParams) => {
     if (typeof rawParams !== "object" || rawParams === null || Array.isArray(rawParams) || "view" in rawParams)
       return rawParams;
     return { ...rawParams, view: "active" };
-  }, timelineViewSchema);
+  }, viewSchema);
   registerTool({
     name: "acm_timeline",
     label: "ACM Timeline",
     description: TOOL_DESCRIPTIONS.timeline,
-    parameters: timelineSchema,
+    parameters: schema2,
     strict: true,
     async execute(_id, rawParams, signal, _onUpdate, ctx) {
-      const params = timelineSchema.parse(rawParams);
-      const sm = ctx.sessionManager;
-      const bridge = getHostBridge(sm);
-      const tree = bridge.getTree();
-      const currentLeafId = bridge.getLeafId();
-      const view = params.view;
-      const verbose = view === "active" ? params.verbose ?? false : false;
-      const limit = params.limit;
-      const useFullTree = view === "tree";
-      const listCheckpoints = view === "checkpoints";
-      const searchTerm = (view === "search" ? params.query : view === "checkpoints" ? params.filter : undefined)?.toLowerCase() ?? "";
-      const lines = [];
-      const branch = bridge.getBranch();
-      const entries = bridge.getEntries();
+      const params = schema2.parse(rawParams);
+      const sessionManager = ctx.sessionManager;
+      const tree = sessionManager.getTree();
+      const branch = sessionManager.getBranch();
+      const entries = sessionManager.getEntries();
+      const leafId = sessionManager.getLeafId();
+      const labelMaps = buildLabelMaps(entries);
+      const activeIds = new Set(branch.map((entry) => entry.id));
       const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
-      const labelMaps = bridge.buildLabelMaps();
-      const backboneIds = new Set(branch.map((e) => e.id));
-      const pathOrderById = new Map(branch.map((entry, index) => [entry.id, index]));
-      const childIndex = buildChildIndex(tree);
-      const offPathForks = countOffPathForks(branch, childIndex, backboneIds);
+      const pathOrder = new Map(branch.map((entry, index) => [entry.id, index]));
+      const lines = [];
       let treeTruncated = false;
       let activeVisibleEntries = 0;
       let activeDisplayedEntries = 0;
@@ -210370,195 +210206,123 @@ ${ACM_CORE}`]
       let checkpointsMatchingAliases = 0;
       let checkpointsDisplayedAliases = 0;
       let searchDisplayedMatches = 0;
-      let searchWasTruncated = false;
-      if (listCheckpoints) {
-        const listings = collectCheckpointListings(labelMaps, backboneIds, currentLeafId, searchTerm, entriesById, pathOrderById);
+      let searchTruncated = false;
+      if (params.view === "checkpoints") {
+        const filter = params.filter?.toLowerCase() ?? "";
+        const listings = collectListings(labelMaps, activeIds, leafId, filter, entriesById, pathOrder);
         checkpointsMatchingAliases = listings.length;
-        checkpointsDisplayedAliases = Math.min(listings.length, limit);
-        const listLimit = limit;
+        checkpointsDisplayedAliases = Math.min(listings.length, params.limit);
         const usage = ctx.getContextUsage();
-        const currentMessagesResult = bridge.buildSessionMessages(currentLeafId);
-        if (!currentMessagesResult.ok) {
-          lines.push(`Checkpoints (${listings.length} matching aliases, 0 displayed). Current messages could not be built: ${currentMessagesResult.message}`);
+        const currentResult = buildSessionMessages(sessionManager, leafId);
+        if (!currentResult.ok) {
           return {
-            content: [{ type: "text", text: lines.join(`
-`) }],
-            details: { error: currentMessagesResult.error, message: currentMessagesResult.message }
+            content: [{ type: "text", text: `Checkpoints (${listings.length} matching aliases, 0 displayed). Current messages could not be built: ${currentResult.message}` }],
+            details: { error: currentResult.error, message: currentResult.message }
           };
         }
-        const currentMessages = currentMessagesResult.value;
-        const targetCache = new Map;
-        const currentUsageText = formatContextUsage(usage, true);
-        lines.push(`Checkpoints (${listings.length} matching aliases, ${checkpointsDisplayedAliases} displayed${searchTerm ? ` for '${params.filter}'` : ""}; cap 50). Current: ${currentMessages.length} msgs, ${currentUsageText}:`);
-        for (const cp of listings.slice(0, listLimit)) {
-          const pathTag = cp.onActivePath ? "on-path" : "off-path";
-          const headTag = cp.isHead ? ", *HEAD*" : "";
-          let targetMessages = targetCache.get(cp.entryId);
+        lines.push(`Checkpoints (${listings.length} matching aliases, ${checkpointsDisplayedAliases} displayed${filter ? ` for '${params.filter}'` : ""}; cap 50). Current: ${currentResult.value.length} msgs, ${formatContextUsage(usage, true)}:`);
+        const cache = new Map;
+        for (const checkpoint of listings.slice(0, params.limit)) {
+          let targetMessages = cache.get(checkpoint.entryId);
           if (!targetMessages) {
-            const targetResult = bridge.buildSessionMessages(cp.entryId);
+            const targetResult = buildSessionMessages(sessionManager, checkpoint.entryId);
             targetMessages = targetResult.ok ? targetResult.value : [];
-            targetCache.set(cp.entryId, targetMessages);
+            cache.set(checkpoint.entryId, targetMessages);
           }
-          const estimated = estimateUsageAfterMessageChange(usage, currentMessages, targetMessages);
-          const estPart = estimated ? `~${targetMessages.length} msgs, ~${formatContextUsage(estimated, true)} est. (+summary)` : `~${targetMessages.length} msgs`;
-          lines.push(`  ${cp.label} → ${cp.entryId} (${pathTag}${headTag}) ${estPart}`);
+          const estimated = estimateUsageAfterMessageChange(usage, currentResult.value, targetMessages);
+          const estimateText = estimated ? `~${targetMessages.length} msgs, ~${formatContextUsage(estimated, true)} est. (+summary)` : `~${targetMessages.length} msgs`;
+          lines.push(`  ${checkpoint.label} → ${checkpoint.entryId} (${checkpoint.onActivePath ? "on-path" : "off-path"}${checkpoint.isHead ? ", *HEAD*" : ""}) ${estimateText}`);
         }
-        if (listings.length > listLimit) {
-          lines.push(`  ... +${listings.length - listLimit} more — use a narrower filter`);
+        if (listings.length > params.limit)
+          lines.push(`  ... +${listings.length - params.limit} more — use a narrower filter`);
+      } else if (params.view === "search") {
+        const search = searchTree(tree, labelMaps, params.query, params.limit, signal);
+        searchDisplayedMatches = search.matches.length;
+        searchTruncated = search.truncated;
+        lines.push(`Search '${params.query}': ${search.matches.length} displayed of ${search.matches.length + (search.truncated ? 1 : 0)} matching node(s).`);
+        for (const match of search.matches) {
+          const body = entryText(match.entry, true).replace(/\s+/g, " ").slice(0, 100);
+          lines.push(`  ${match.entry.id}${match.labels.length ? ` (checkpoint: ${match.labels.join(", ")})` : ""} [${displayRole(match.entry)}] ${body}`);
         }
-      } else if (view === "search") {
-        const { matches, truncated } = searchFullSessionTree(tree, labelMaps, searchTerm, limit, signal);
-        searchDisplayedMatches = Math.min(matches.length, limit);
-        searchWasTruncated = truncated;
-        lines.push(...formatTreeSearchResults(matches, currentLeafId, params.query, limit, truncated));
-      } else if (useFullTree) {
-        const maxDepth = limit;
-        for (let i = 0;i < tree.length; i++) {
-          if (signal?.aborted)
-            break;
-          const truncated = renderTreeNode(tree[i], labelMaps, currentLeafId, backboneIds, 1, maxDepth, "", i === tree.length - 1, lines, signal);
-          if (truncated)
-            treeTruncated = true;
-        }
-        if (lines.length >= 200)
-          treeTruncated = true;
-        if (treeTruncated) {
+        if (search.truncated)
+          lines.push("  ... additional matches truncated");
+      } else if (params.view === "tree") {
+        const rendered = renderTree(tree, labelMaps, leafId, activeIds, params.limit, signal);
+        lines.push(...rendered.lines);
+        treeTruncated = rendered.truncated || lines.length >= 200;
+        if (treeTruncated)
           lines.unshift("⚠ tree truncated by depth/line limit — use view checkpoints or view search to see hidden nodes");
-        }
       } else {
-        const sequence = [...branch];
-        const contentCache = new Map;
-        for (const e of sequence) {
-          if (signal?.aborted)
-            break;
-          contentCache.set(e.id, getMsgContent(e, verbose));
-        }
-        const visibleSequenceIds = new Set;
-        for (const e of sequence) {
-          if (signal?.aborted)
-            break;
-          if (verbose || isInteresting(e, labelMaps, childIndex, branch, currentLeafId, backboneIds)) {
-            visibleSequenceIds.add(e.id);
-          }
-        }
-        const allVisibleSequenceIds = new Set(visibleSequenceIds);
-        const visibleEntries = sequence.filter((e) => visibleSequenceIds.has(e.id));
-        activeVisibleEntries = visibleEntries.length;
-        activeDisplayedEntries = Math.min(visibleEntries.length, limit);
-        activeOmittedEntries = Math.max(0, visibleEntries.length - limit);
-        if (activeOmittedEntries > 0) {
-          const allowedIds = new Set(visibleEntries.slice(-limit).map((e) => e.id));
-          visibleSequenceIds.clear();
-          allowedIds.forEach((id) => visibleSequenceIds.add(id));
-        }
-        if (activeOmittedEntries > 0) {
+        const verbose = params.verbose ?? false;
+        const visible = branch.filter((entry) => visibleOnActivePath(entry, labelMaps, leafId, verbose));
+        activeVisibleEntries = visible.length;
+        activeDisplayedEntries = Math.min(visible.length, params.limit);
+        activeOmittedEntries = Math.max(0, visible.length - params.limit);
+        if (activeOmittedEntries > 0)
           lines.push(`  :  ... (${activeOmittedEntries} earlier visible entries omitted by limit) ...`);
-        }
-        let hiddenCount = 0;
-        for (const entry of sequence) {
-          if (signal?.aborted)
-            break;
-          if (!visibleSequenceIds.has(entry.id)) {
-            if (!allVisibleSequenceIds.has(entry.id))
-              hiddenCount++;
-            continue;
-          }
-          if (hiddenCount > 0) {
-            lines.push(`  :  ... (${hiddenCount} hidden messages) ...`);
-            hiddenCount = 0;
-          }
-          const isHead = entry.id === currentLeafId;
-          const checkpointLabels = formatEntryLabels(labelMaps, entry.id);
-          const content = (contentCache.get(entry.id) ?? "").replace(/\s+/g, " ");
-          const role = getDisplayRole(entry);
-          if (!verbose && (role === "CUSTOM" || role === "SYSTEM")) {
-            hiddenCount++;
-            continue;
-          }
-          const isRoot = branch.length > 0 && entry.id === branch[0].id;
-          const metaParts = [
-            isRoot ? "ROOT" : null,
-            isHead ? "HEAD" : null,
-            checkpointLabels ? `checkpoint: ${checkpointLabels}` : null,
-            ...getBranchSummaryMetaParts(entry)
-          ].filter((s) => s !== null);
-          const meta3 = metaParts.length > 0 ? ` (${metaParts.join(", ")})` : "";
-          const body = content.length > 100 ? content.slice(0, 100) + "..." : content;
-          let marker = "|";
-          if (isHead)
-            marker = "*";
-          else if (role === "USER")
-            marker = "•";
-          lines.push(`${marker} ${entry.id}${meta3} [${role}] ${body}`);
-          for (const footnote of formatOffPathFootnotes(entry, childIndex, backboneIds)) {
-            lines.push(footnote);
-          }
-        }
-        if (hiddenCount > 0) {
-          lines.push(`  :  ... (${hiddenCount} hidden messages) ...`);
+        for (const entry of visible.slice(-params.limit)) {
+          const labels = formatEntryLabels(labelMaps, entry.id);
+          const tags = [entry === branch[0] ? "ROOT" : null, entry.id === leafId ? "HEAD" : null, labels ? `checkpoint: ${labels}` : null].filter((tag) => tag !== null);
+          const body = entryText(entry, verbose).replace(/\s+/g, " ").slice(0, 100);
+          lines.push(`${entry.id === leafId ? "*" : displayRole(entry) === "USER" ? "•" : "|"} ${entry.id}${tags.length ? ` (${tags.join(", ")})` : ""} [${displayRole(entry)}] ${body}`);
         }
       }
       const officialUsage = ctx.getContextUsage();
-      const officialStr = formatContextUsage(officialUsage, true);
-      const lastLlmStr = cachedUsageMap.has(sm) ? formatContextUsage(cachedUsageMap.get(sm), true) : "N/A";
+      const lastUsage = runtime.getUsage(sessionManager);
       let stepsSinceCheckpoint = 0;
-      let nearestCheckpointName = null;
-      for (let i = branch.length - 1;i >= 0; i--) {
-        const labels = getEntryLabels(labelMaps, branch[i].id);
+      let nearestCheckpoint = null;
+      for (let index = branch.length - 1;index >= 0; index--) {
+        const labels = getEntryLabels(labelMaps, branch[index].id);
         if (labels.length > 0) {
-          nearestCheckpointName = labels[labels.length - 1];
+          nearestCheckpoint = labels.at(-1) ?? null;
           break;
         }
         stepsSinceCheckpoint++;
       }
-      const travelCue = formatBoundaryTravelCue(nearestCheckpointName);
-      const refreshFailure = contextRefresh.getFailure(sm);
-      const refreshPending = contextRefresh.isPending(sm);
+      const refreshFailure = runtime.contextRefresh.getFailure(sessionManager);
+      const refreshPending = runtime.contextRefresh.isPending(sessionManager);
       const hudParts = [
-        `[Context Dashboard]`,
-        `• Context Usage:    ${officialStr} (official)`,
-        `• Last LLM Prompt:  ${lastLlmStr} (turn_end)`,
+        "[Context Dashboard]",
+        `• Context Usage:    ${formatContextUsage(officialUsage, true)} (official)`,
+        `• Last LLM Prompt:  ${lastUsage ? formatContextUsage(lastUsage, true) : "N/A"} (turn_end)`,
         `• Active Path:      ${branch.length} node(s) — LLM context follows this spine`,
-        `• Off-path Summaries: ${offPathForks} branch point(s) with abandoned summaries`,
-        `• Segment Size:     ${stepsSinceCheckpoint} steps since last checkpoint '${nearestCheckpointName ?? "None"}'`,
-        `• Travel Cue:       ${travelCue}`
+        `• Off-path Summaries: ${countOffPathSummaries(branch, tree, activeIds)} branch point(s) with abandoned summaries`,
+        `• Segment Size:     ${stepsSinceCheckpoint} steps since last checkpoint '${nearestCheckpoint ?? "None"}'`,
+        `• Travel Cue:       ${formatBoundaryTravelCue(nearestCheckpoint)}`
       ];
       if (refreshFailure) {
-        const attempts = contextRefresh.getAttemptCount(sm);
+        const attempts = runtime.contextRefresh.getAttemptCount(sessionManager);
         const exhausted = attempts >= ContextRefreshRegistry.MAX_ATTEMPTS && !refreshPending;
         hudParts.push(`• Context Sync:     last travel refresh failed — ${refreshFailure}${exhausted ? ` ${RECOVERY_GUIDANCE.refreshExhausted}` : ""}`);
       } else if (refreshPending) {
-        const attempt = contextRefresh.getAttemptCount(sm);
-        const retrySuffix = attempt > 0 ? ` (retry ${attempt}/${ContextRefreshRegistry.MAX_ATTEMPTS})` : "";
-        const pendingSuffix = contextRefresh.hasRebuilt(sm) ? "" : " (travel pending)";
-        hudParts.push(`• Context Sync:     persistent rebuild active${pendingSuffix}${retrySuffix}`);
+        const attempt = runtime.contextRefresh.getAttemptCount(sessionManager);
+        hudParts.push(`• Context Sync:     persistent rebuild active${runtime.contextRefresh.hasRebuilt(sessionManager) ? "" : " (travel pending)"}${attempt > 0 ? ` (retry ${attempt}/${ContextRefreshRegistry.MAX_ATTEMPTS})` : ""}`);
       }
-      const timelineCue = view === "active" ? GUIDANCE_CUES.timelineActive : view === "checkpoints" ? GUIDANCE_CUES.timelineCheckpoints : view === "search" ? GUIDANCE_CUES.timelineSearch : GUIDANCE_CUES.timelineTree;
-      hudParts.push(`• Guidance:        ${timelineCue}`);
-      const hud = [...hudParts, `---------------------------------------------------`].join(`
-`);
+      const cue = params.view === "active" ? GUIDANCE_CUES.timelineActive : params.view === "checkpoints" ? GUIDANCE_CUES.timelineCheckpoints : params.view === "search" ? GUIDANCE_CUES.timelineSearch : GUIDANCE_CUES.timelineTree;
+      hudParts.push(`• Guidance:        ${cue}`, "---------------------------------------------------");
       return {
-        content: [{ type: "text", text: hud + `
-` + (lines.join(`
-`) || "(Root Path Only)") }],
+        content: [{ type: "text", text: `${hudParts.join(`
+`)}
+${lines.join(`
+`) || "(Root Path Only)"}` }],
         details: {
           contextUsage: officialUsage ? { percent: officialUsage.percent, tokens: officialUsage.tokens, contextWindow: officialUsage.contextWindow } : null,
-          leafId: currentLeafId,
-          nearestCheckpoint: nearestCheckpointName,
+          leafId,
+          nearestCheckpoint,
           stepsSinceCheckpoint,
           activePathNodes: branch.length,
-          offPathSummaries: offPathForks,
-          view,
-          limit,
-          verbose,
+          offPathSummaries: countOffPathSummaries(branch, tree, activeIds),
+          view: params.view,
+          limit: params.limit,
+          verbose: params.view === "active" ? params.verbose ?? false : false,
           treeTruncated,
-          activeVisibleEntries: view === "active" ? activeVisibleEntries : null,
-          activeDisplayedEntries: view === "active" ? activeDisplayedEntries : null,
-          activeOmittedEntries: view === "active" ? activeOmittedEntries : null,
-          checkpointsMatchingAliases: view === "checkpoints" ? checkpointsMatchingAliases : null,
-          checkpointsDisplayedAliases: view === "checkpoints" ? checkpointsDisplayedAliases : null,
-          searchDisplayedMatches: view === "search" ? searchDisplayedMatches : null,
-          searchTruncated: view === "search" ? searchWasTruncated : false,
+          activeVisibleEntries: params.view === "active" ? activeVisibleEntries : null,
+          activeDisplayedEntries: params.view === "active" ? activeDisplayedEntries : null,
+          activeOmittedEntries: params.view === "active" ? activeOmittedEntries : null,
+          checkpointsMatchingAliases: params.view === "checkpoints" ? checkpointsMatchingAliases : null,
+          checkpointsDisplayedAliases: params.view === "checkpoints" ? checkpointsDisplayedAliases : null,
+          searchDisplayedMatches: params.view === "search" ? searchDisplayedMatches : null,
+          searchTruncated: params.view === "search" ? searchTruncated : false,
           outputLines: lines.length,
           contextRefreshPending: refreshPending,
           contextRefreshFailure: refreshFailure ?? null
@@ -210566,19 +210330,133 @@ ${ACM_CORE}`]
       };
     }
   });
-  const travelSchema = zod.object({
-    target: zod.string().min(1).max(256).describe("Checkpoint name, history node ID, or 'root'. Name the boundary first, then choose a target before that boundary. On large trees use acm_timeline with view checkpoints or search; use view tree only when the surrounding branch structure is needed."),
-    summary: zod.string().min(1).max(1e4).describe(`Handoff summary — the working state after travel. It must make the next action executable without rereading the folded trail. Fill every slot, write 'none' rather than dropping one: ${HANDOFF_SLOT_HINT}. Include recovery pointers; pointers over dumps. Max 10000 chars.`),
-    backupCurrentHeadAs: zod.string().min(1).max(64).regex(/^[\w\-\.]+$/).optional().describe("Optional archive bookmark for the raw path being folded away. At task end, use '<task>-done' when the preview shows meaningful structural saving and the path does not already carry a suitable '-done' checkpoint. If the preview shows almost no saving, create a unique '-done' checkpoint and answer directly instead of calling travel merely to set this field. This is a recovery pointer, never the travel target or a substitute for a self-contained handoff.")
+}
+
+// src/acm/travel-coordinator.ts
+function labelRemains(sessionManager, targetId, name2) {
+  let aliases = [];
+  for (const entry of sessionManager.getEntries()) {
+    if (entry.type !== "label" || entry.targetId !== targetId)
+      continue;
+    if (entry.label === undefined) {
+      aliases = [];
+      continue;
+    }
+    if (!aliases.includes(entry.label))
+      aliases.push(entry.label);
+  }
+  return aliases.includes(name2);
+}
+function executeTravelMutation(request2) {
+  const { sessionManager, targetId, summary, details, backup } = request2;
+  let backupToken;
+  let backupLabelEntryId;
+  let backupOutcome = "none";
+  if (backup) {
+    if (backup.prevalidation.status === "already_present") {
+      backupOutcome = "already_present";
+      backupLabelEntryId = backup.prevalidation.existingLabelEntryId;
+    } else {
+      const append = appendCheckpointLabel(sessionManager, backup.targetId, backup.name);
+      if (!append.ok) {
+        return {
+          ok: false,
+          error: "backup_label_failed",
+          hostError: append.error,
+          message: append.message,
+          branchState: "not_attempted",
+          branchFailure: null,
+          backupOutcome: append.state === "indeterminate" ? "indeterminate" : "none",
+          backupRolledBack: false,
+          backupRollbackFailed: false,
+          backupRollbackSkipped: append.state === "indeterminate",
+          backupRollbackSkipReason: append.state === "indeterminate" ? "backup_mutation_indeterminate" : null,
+          remainingBackupLabel: labelRemains(sessionManager, backup.targetId, backup.name) ? backup.name : null,
+          refreshRequired: false
+        };
+      }
+      backupOutcome = append.value.status === "already_present" ? "already_present" : "created";
+      backupLabelEntryId = append.value.labelEntryId;
+      backupToken = append.value.rollback;
+    }
+  }
+  const branch = applyBranchWithSummary(sessionManager, targetId, summary, details);
+  if (branch.ok) {
+    return {
+      ok: true,
+      summaryEntryId: branch.value.summaryEntryId,
+      resultingLeafId: branch.value.leafAfter,
+      backupOutcome,
+      backupLabelEntryId,
+      backupRollbackToken: backupToken,
+      hostReturnedSummaryEntryId: branch.value.hostReturnedEntryId
+    };
+  }
+  let backupRolledBack = false;
+  let backupRollbackFailed = false;
+  let backupRollbackSkipped = false;
+  let backupRollbackSkipReason = null;
+  const branchFailure = "leafBefore" in branch.details ? branch.details : null;
+  if (backupToken) {
+    if (branch.state === "indeterminate") {
+      backupRollbackSkipped = true;
+      backupRollbackSkipReason = "branch_mutation_observed";
+    } else {
+      const rollback = rollbackCheckpointLabel(sessionManager, backupToken);
+      backupRolledBack = rollback.ok;
+      backupRollbackFailed = !rollback.ok;
+    }
+  }
+  const remainingBackupLabel = backup && labelRemains(sessionManager, backup.targetId, backup.name) ? backup.name : null;
+  const refreshLeafId = branchFailure?.actualSummaryEntryId ?? branchFailure?.leafAfter ?? undefined;
+  return {
+    ok: false,
+    error: "branch_failed",
+    hostError: branch.error,
+    message: branch.message,
+    branchState: branch.state,
+    branchFailure,
+    backupOutcome,
+    backupLabelEntryId,
+    backupRolledBack,
+    backupRollbackFailed,
+    backupRollbackSkipped,
+    backupRollbackSkipReason,
+    remainingBackupLabel,
+    refreshRequired: branch.state === "indeterminate",
+    refreshLeafId
+  };
+}
+
+// src/acm/travel-tool.ts
+function formatBackupText(name2, entryId, resolvedFromHead) {
+  if (!name2 || !entryId)
+    return "none";
+  return resolvedFromHead ? `${name2}@${entryId} (resolved from HEAD ${resolvedFromHead})` : `${name2}@${entryId}`;
+}
+function formatNumericValue(value, fractionDigits = 0) {
+  return value === null || !Number.isFinite(value) ? "unknown" : value.toFixed(fractionDigits);
+}
+function formatSignedDelta(value, fractionDigits = 0, suffix = "") {
+  if (value === null || !Number.isFinite(value))
+    return "unknown";
+  return `${value > 0 ? "+" : ""}${value.toFixed(fractionDigits)}${suffix}`;
+}
+function registerTravelTool(pi, runtime) {
+  const registerTool = (tool) => pi.registerTool(tool);
+  const schema2 = pi.zod.object({
+    target: pi.zod.string().min(1).max(256).describe("Checkpoint name, history node ID, or 'root'. Name the boundary first, then choose a target before that boundary. On large trees use acm_timeline with view checkpoints or search; use view tree only when the surrounding branch structure is needed."),
+    summary: pi.zod.string().min(1).max(1e4).describe(`Handoff summary — the working state after travel. It must make the next action executable without rereading the folded trail. Fill every slot, write 'none' rather than dropping one: ${HANDOFF_SLOT_HINT}. Include recovery pointers; pointers over dumps. Max 10000 chars.`),
+    backupCurrentHeadAs: pi.zod.string().min(1).max(64).regex(/^[\w\-\.]+$/).optional().describe("Optional archive bookmark for the raw path being folded away. At task end, use '<task>-done' when the preview shows meaningful structural saving and the path does not already carry a suitable '-done' checkpoint. If the preview shows almost no saving, create a unique '-done' checkpoint and answer directly instead of calling travel merely to set this field. This is a recovery pointer, never the travel target or a substitute for a self-contained handoff.")
   });
   registerTool({
     name: "acm_travel",
     label: "ACM Travel",
     description: TOOL_DESCRIPTIONS.travel,
-    parameters: travelSchema,
+    parameters: schema2,
     strict: false,
     async execute(_id, rawParams, signal, _onUpdate, ctx) {
-      const params = travelSchema.parse(rawParams);
+      const params = schema2.parse(rawParams);
       const handoffValidation = validateHandoffStructure(params.summary);
       if (!handoffValidation.ok) {
         return {
@@ -210586,50 +210464,44 @@ ${ACM_CORE}`]
           details: { error: "invalid_handoff", validation: handoffValidation }
         };
       }
-      const sm = ctx.sessionManager;
-      const bridge = getHostBridge(sm);
-      const tree = bridge.getTree();
-      const branch = bridge.getBranch();
-      const labelMaps = bridge.buildLabelMaps();
-      const branchIds = new Set(branch.map((e) => e.id));
+      const sessionManager = ctx.sessionManager;
+      const tree = sessionManager.getTree();
+      const branch = sessionManager.getBranch();
+      const labelMaps = buildLabelMaps(sessionManager.getEntries());
+      const branchIds = new Set(branch.map((entry) => entry.id));
       const requestedRoot = params.target.toLowerCase() === "root";
       const resolvedBy = requestedRoot ? "root" : labelMaps.labelToEntryId.has(params.target) ? "checkpoint" : "entry_id";
-      const resolved = resolveTargetId(bridge, tree, params.target, branchIds, labelMaps);
-      const tid = resolved.id;
-      if (requestedRoot && !isValidEntryId(tid)) {
+      const resolved = resolveTargetId(sessionManager, tree, params.target, branchIds, labelMaps);
+      const targetId = resolved.id;
+      if (requestedRoot && !isValidEntryId(targetId)) {
         return {
           content: [{ type: "text", text: "Error: Cannot travel to root — session tree is empty." }],
           details: { error: "empty_session", requestedTarget: params.target }
         };
       }
       if (requestedRoot && tree.length > 1) {
-        ctx.ui.notify(`Note: 'root' resolved to the first top-level node (${tid}); this session has ${tree.length} top-level roots.`, "info");
+        ctx.ui.notify(`Note: 'root' resolved to the first top-level node (${targetId}); this session has ${tree.length} top-level roots.`, "info");
       }
-      const targetExists = findInTree(tree, (n) => n.entry.id === tid) !== undefined;
-      if (!targetExists) {
+      if (!findInTree(tree, (node) => node.entry.id === targetId)) {
         const hint = " Use acm_timeline to choose the last clean node before the boundary you want to compress; raw node IDs are valid targets.";
         return {
           content: [{ type: "text", text: `Error: Target '${params.target}' not found in session tree.${hint}` }],
-          details: { error: "target_not_found", requestedTarget: params.target, resolvedTargetId: tid }
+          details: { error: "target_not_found", requestedTarget: params.target, resolvedTargetId: targetId }
         };
       }
-      const currentLeaf = bridge.getLeafId();
-      if (!currentLeaf) {
+      const currentLeaf = sessionManager.getLeafId();
+      if (!currentLeaf)
+        return { content: [{ type: "text", text: "Error: No active leaf in session. Cannot travel." }], details: { error: "no_active_leaf" } };
+      if (currentLeaf === targetId) {
         return {
-          content: [{ type: "text", text: "Error: No active leaf in session. Cannot travel." }],
-          details: { error: "no_active_leaf" }
-        };
-      }
-      if (currentLeaf === tid) {
-        return {
-          content: [{ type: "text", text: `Already at target ${tid}. Nothing to travel.` }],
-          details: { error: "already_at_target", targetId: tid, leafId: currentLeaf }
+          content: [{ type: "text", text: `Already at target ${targetId}. Nothing to travel.` }],
+          details: { error: "already_at_target", targetId, leafId: currentLeaf }
         };
       }
       if (signal?.aborted) {
         return {
           content: [{ type: "text", text: "acm_travel aborted: signal was already aborted." }],
-          details: { error: "aborted", target: params.target, targetId: tid }
+          details: { error: "aborted", target: params.target, targetId }
         };
       }
       if (resolved.fromOffPath) {
@@ -210639,23 +210511,22 @@ ${ACM_CORE}`]
       const originLabel = formatEntryLabels(labelMaps, originId);
       const usageBefore = ctx.getContextUsage();
       const usageBeforeText = formatContextUsage(usageBefore, true);
-      const currentMessagesResult = bridge.buildSessionMessages();
+      const currentMessagesResult = buildSessionMessages(sessionManager);
       if (!currentMessagesResult.ok) {
         return {
           content: [{ type: "text", text: `Error: cannot build current session messages: ${currentMessagesResult.message}. Travel aborted.` }],
-          details: { error: "build_messages_failed", message: currentMessagesResult.message, target: params.target, targetId: tid }
+          details: { error: "build_messages_failed", message: currentMessagesResult.message, target: params.target, targetId }
         };
       }
       const currentMessages = currentMessagesResult.value;
-      const targetMessagesResult = bridge.buildSessionMessages(tid);
+      const targetMessagesResult = buildSessionMessages(sessionManager, targetId);
       if (!targetMessagesResult.ok) {
         return {
           content: [{ type: "text", text: `Error: cannot build target session messages: ${targetMessagesResult.message}. Travel aborted.` }],
-          details: { error: "build_messages_failed", message: targetMessagesResult.message, target: params.target, targetId: tid }
+          details: { error: "build_messages_failed", message: targetMessagesResult.message, target: params.target, targetId }
         };
       }
-      const targetMessages = targetMessagesResult.value;
-      const estimatedUsagePreview = estimateUsageAtTravelTarget(usageBefore, currentMessages, targetMessages, params.summary);
+      const estimatedUsagePreview = estimateUsageAtTravelTarget(usageBefore, currentMessages, targetMessagesResult.value, params.summary);
       const estimatedPreviewText = formatContextUsage(estimatedUsagePreview, true);
       const messagesBefore = currentMessages.length;
       let backupEntryId;
@@ -210666,7 +210537,7 @@ ${ACM_CORE}`]
         if (headResolve.aborted) {
           return {
             content: [{ type: "text", text: "acm_travel aborted during backup target resolution." }],
-            details: { error: "aborted", target: params.target, targetId: tid }
+            details: { error: "aborted", target: params.target, targetId }
           };
         }
         backupEntryId = headResolve.entryId ?? undefined;
@@ -210681,7 +210552,7 @@ ${ACM_CORE}`]
           ctx.ui.notify(`Note: backupCurrentHeadAs '${params.backupCurrentHeadAs}' placed on ${backupEntryId} (${headResolve.role ?? "message"}) instead of HEAD ${originId} (tool/internal traffic).`, "info");
         }
       }
-      const branchPrevalidation = bridge.prevalidateBranchWithSummary(tid);
+      const branchPrevalidation = prevalidateBranchWithSummary(sessionManager, targetId);
       if (!branchPrevalidation.ok) {
         return {
           content: [{ type: "text", text: `Error: travel host prevalidation failed: ${branchPrevalidation.message}. No mutation was attempted. ${RECOVERY_GUIDANCE.hostCapability}` }],
@@ -210690,16 +210561,16 @@ ${ACM_CORE}`]
             hostError: branchPrevalidation.error,
             message: branchPrevalidation.message,
             target: params.target,
-            targetId: tid
+            targetId
           }
         };
       }
       if (params.backupCurrentHeadAs && backupEntryId) {
-        const backupCheck = bridge.prevalidateCheckpointLabel(backupEntryId, params.backupCurrentHeadAs);
+        const backupCheck = prevalidateCheckpointLabel(sessionManager, backupEntryId, params.backupCurrentHeadAs);
         if (!backupCheck.ok) {
           if (backupCheck.error === "label_conflict") {
             const conflict = backupCheck.details;
-            const existing = `${conflict?.entryId ?? "unknown"}${conflict?.onActivePath ? " (on-path)" : " (off-path)"}`;
+            const existing = `${conflict.entryId}${conflict.onActivePath ? " (on-path)" : " (off-path)"}`;
             return {
               content: [{ type: "text", text: `Error: archive bookmark name '${params.backupCurrentHeadAs}' already exists at ${existing}. ${RECOVERY_GUIDANCE.nameCollision}` }],
               details: { error: "duplicate_backup_name", name: params.backupCurrentHeadAs, owner: conflict }
@@ -210715,99 +210586,56 @@ ${ACM_CORE}`]
       if (signal?.aborted) {
         return {
           content: [{ type: "text", text: "acm_travel aborted after prevalidation and before mutation." }],
-          details: { error: "aborted", target: params.target, targetId: tid }
+          details: { error: "aborted", target: params.target, targetId }
         };
-      }
-      let backupLabelWrittenThisCall = false;
-      let backupHadNoPriorLabels = false;
-      let backupLabelEntryId;
-      if (params.backupCurrentHeadAs && backupEntryId && backupPrevalidation?.status === "would_create") {
-        const backupAppend = bridge.appendCheckpointLabel(backupEntryId, params.backupCurrentHeadAs);
-        if (!backupAppend.ok) {
-          const labelOwner = bridge.buildLabelMaps().labelToEntryId.get(params.backupCurrentHeadAs);
-          const labelRemaining = labelOwner === backupEntryId;
-          return {
-            content: [{ type: "text", text: `Error: archive bookmark '${params.backupCurrentHeadAs}' could not be set: ${backupAppend.message}. Travel aborted. ${RECOVERY_GUIDANCE.hostCapability}${labelRemaining ? ` ${RECOVERY_GUIDANCE.rollbackFailed}` : ""}` }],
-            details: {
-              error: "backup_label_failed",
-              name: params.backupCurrentHeadAs,
-              message: backupAppend.message,
-              backupEntryId,
-              labelRemaining
-            }
-          };
-        }
-        backupHadNoPriorLabels = backupPrevalidation.aliases.length === 0;
-        backupLabelEntryId = backupAppend.value.labelEntryId;
-        backupLabelWrittenThisCall = true;
       }
       const travelDetails = {
         originId,
         originLabel,
         target: params.target,
-        targetId: tid,
+        targetId,
         backupCurrentHeadAs: params.backupCurrentHeadAs ?? null
       };
-      const branchResult = bridge.branchWithSummary(tid, params.summary, travelDetails);
-      if (!branchResult.ok) {
-        const branchFailure = parseBranchFailureDetails(branchResult.details);
-        const mutationApplied = branchFailure?.mutationApplied ?? bridge.getLeafId() !== originId;
-        let backupRolledBack = false;
-        let backupRollbackFailed = false;
-        let backupRollbackSkipped = false;
-        let backupRollbackSkipReason = null;
-        if (backupLabelWrittenThisCall && backupLabelEntryId) {
-          if (mutationApplied) {
-            backupRollbackSkipped = true;
-            backupRollbackSkipReason = "branch_mutation_observed";
-          } else if (!backupHadNoPriorLabels) {
-            backupRollbackSkipped = true;
-            backupRollbackSkipReason = "prior_aliases";
-          } else {
-            const clear = bridge.clearCreatedLabel(backupLabelEntryId);
-            const aliasesAfterRollback = backupEntryId ? bridge.buildLabelMaps().entryToLabels.get(backupEntryId) ?? [] : [];
-            const labelStillPresent = params.backupCurrentHeadAs ? aliasesAfterRollback.includes(params.backupCurrentHeadAs) : false;
-            backupRolledBack = clear.ok || !labelStillPresent;
-            backupRollbackFailed = !backupRolledBack;
-          }
-        }
-        const aliasesAfterFailure = backupEntryId ? bridge.buildLabelMaps().entryToLabels.get(backupEntryId) ?? [] : [];
-        const backupLabelRemaining = params.backupCurrentHeadAs ? aliasesAfterFailure.includes(params.backupCurrentHeadAs) : false;
-        const recoveryAction = backupRollbackFailed ? RECOVERY_GUIDANCE.rollbackFailed : backupRollbackSkipped || mutationApplied ? RECOVERY_GUIDANCE.rollbackSkipped : backupRolledBack ? RECOVERY_GUIDANCE.branchRolledBack : RECOVERY_GUIDANCE.hostCapability;
-        let backupNote = "";
-        if (backupRollbackSkipped && backupRollbackSkipReason === "branch_mutation_observed") {
-          backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains because branch mutation was observed.`;
-        } else if (backupRollbackSkipped) {
-          backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains because the target had prior aliases.`;
-        } else if (backupRollbackFailed) {
-          backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains at ${backupEntryId}; rollback failed.`;
-        } else if (backupRolledBack) {
-          backupNote = ` Backup label '${params.backupCurrentHeadAs}' was rolled back.`;
-        } else if (backupLabelWrittenThisCall) {
-          backupNote = ` Backup label '${params.backupCurrentHeadAs}' remains on the tree.`;
-        }
+      const mutation = executeTravelMutation({
+        sessionManager,
+        targetId,
+        summary: params.summary,
+        details: travelDetails,
+        backup: params.backupCurrentHeadAs && backupEntryId && backupPrevalidation ? { targetId: backupEntryId, name: params.backupCurrentHeadAs, prevalidation: backupPrevalidation } : undefined
+      });
+      if (!mutation.ok) {
+        if (mutation.refreshRequired)
+          runtime.scheduleRefresh(sessionManager, mutation.refreshLeafId);
+        const recoveryAction = mutation.backupRollbackFailed ? RECOVERY_GUIDANCE.rollbackFailed : mutation.backupRollbackSkipped || mutation.branchState === "indeterminate" ? RECOVERY_GUIDANCE.rollbackSkipped : mutation.backupRolledBack ? RECOVERY_GUIDANCE.branchRolledBack : RECOVERY_GUIDANCE.hostCapability;
+        const backupNote = mutation.backupRollbackFailed ? ` Backup label '${params.backupCurrentHeadAs}' remains at ${backupEntryId}; rollback failed.` : mutation.backupRollbackSkipped && mutation.backupRollbackSkipReason === "branch_mutation_observed" ? ` Backup label '${params.backupCurrentHeadAs}' remains because branch mutation was observed or cannot be excluded.` : mutation.backupRollbackSkipped ? ` Backup label '${params.backupCurrentHeadAs}' may remain because its mutation state is indeterminate.` : mutation.backupRolledBack ? ` Backup label '${params.backupCurrentHeadAs}' was rolled back.` : "";
+        const refreshNote = mutation.refreshRequired ? ` ${RECOVERY_GUIDANCE.refreshPending}` : "";
+        const prefix = mutation.error === "backup_label_failed" ? `Error: archive bookmark '${params.backupCurrentHeadAs}' could not be set` : "Error: branchWithSummary failed";
         return {
-          content: [{ type: "text", text: `Error: branchWithSummary failed: ${branchResult.message}.${backupNote} ${recoveryAction}` }],
+          content: [{ type: "text", text: `${prefix}: ${mutation.message}.${backupNote} ${recoveryAction}${refreshNote}` }],
           details: {
-            error: "branch_failed",
-            hostError: branchResult.error,
-            branchFailure: branchFailure ?? null,
+            error: mutation.error,
+            hostError: mutation.hostError,
+            branchState: mutation.branchState,
+            branchFailure: mutation.branchFailure,
             backupCurrentHeadAs: params.backupCurrentHeadAs ?? null,
             backupEntryId,
-            backupLabelWritten: backupLabelWrittenThisCall,
-            backupRolledBack,
-            backupRollbackFailed,
-            backupRollbackSkipped,
-            backupRollbackSkipReason,
-            remainingBackupLabel: backupLabelRemaining ? params.backupCurrentHeadAs ?? null : null,
+            backupOutcome: mutation.backupOutcome,
+            backupLabelWritten: mutation.backupOutcome === "created",
+            backupRolledBack: mutation.backupRolledBack,
+            backupRollbackFailed: mutation.backupRollbackFailed,
+            backupRollbackSkipped: mutation.backupRollbackSkipped,
+            backupRollbackSkipReason: mutation.backupRollbackSkipReason,
+            remainingBackupLabel: mutation.remainingBackupLabel,
+            contextRefreshPending: mutation.refreshRequired,
+            contextRefreshState: mutation.refreshRequired ? "pending" : "not_scheduled",
             recoveryAction
           }
         };
       }
-      const summaryEntryId = branchResult.value.summaryEntryId;
-      contextRefresh.markPending(sm);
-      refreshTargetLeafIds.set(sm, summaryEntryId);
-      const afterMessagesResult = bridge.buildSessionMessages();
+      const summaryEntryId = mutation.summaryEntryId;
+      const resultingLeafId = mutation.resultingLeafId;
+      runtime.scheduleRefresh(sessionManager, summaryEntryId);
+      const afterMessagesResult = buildSessionMessages(sessionManager);
       if (!afterMessagesResult.ok) {
         return {
           content: [{ type: "text", text: `Travel mutation completed, but session-message evidence is unavailable: ${afterMessagesResult.message}. ${RECOVERY_GUIDANCE.refreshPending}` }],
@@ -210815,10 +210643,10 @@ ${ACM_CORE}`]
             error: "build_messages_failed",
             message: afterMessagesResult.message,
             target: params.target,
-            targetId: tid,
+            targetId,
             originId,
             summaryEntryId,
-            resultingLeafId: branchResult.value.leafAfter,
+            resultingLeafId,
             contextRefreshPending: true,
             recoveryAction: RECOVERY_GUIDANCE.refreshPending
           }
@@ -210832,7 +210660,7 @@ ${ACM_CORE}`]
       const structuralMessageDelta = messagesAfter - messagesBefore;
       const structuralMessageDirection = classifyStructuralMessageDirection(messagesBefore, messagesAfter);
       const backupText = formatBackupText(params.backupCurrentHeadAs, backupEntryId, backupResolvedFromHead);
-      const backupOutcome = !params.backupCurrentHeadAs ? "none" : backupPrevalidation?.status === "already_present" ? "already_present" : backupLabelWrittenThisCall ? "created" : "unknown";
+      const backupOutcome = mutation.backupOutcome;
       const messageDelta = `${messagesBefore} → ${messagesAfter} (${formatSignedDelta(structuralMessageDelta)}, ${structuralMessageDirection})`;
       const usageBeforeTokens = usageBefore?.tokens ?? null;
       const usageBeforePercent = usageBefore?.percent ?? null;
@@ -210846,7 +210674,7 @@ ${ACM_CORE}`]
         content: [{
           type: "text",
           text: [
-            `Travel complete. target=${params.target} (${tid}); origin=${originLabel ? `${originLabel}@${originId}` : originId}; summaryEntryId=${summaryEntryId}; resultingLeafId=${branchResult.value.leafAfter}; backup=${backupText} (${backupOutcome}); contextTokens=${formatNumericValue(usageBeforeTokens)} → ${formatNumericValue(estimatedUsageAfterTokens)} est. (delta=${formatSignedDelta(usageDelta.tokenDelta)}); contextPercent=${usageBeforePercentText} → ${estimatedUsageAfterPercentText} est. (delta=${formatSignedDelta(usageDelta.percentagePointDelta, 1, " pp")}); sessionMessages=${messageDelta}; contextRefresh=pending.`,
+            `Travel complete. target=${params.target} (${targetId}); origin=${originLabel ? `${originLabel}@${originId}` : originId}; summaryEntryId=${summaryEntryId}; resultingLeafId=${resultingLeafId}; backup=${backupText} (${backupOutcome}); contextTokens=${formatNumericValue(usageBeforeTokens)} → ${formatNumericValue(estimatedUsageAfterTokens)} est. (delta=${formatSignedDelta(usageDelta.tokenDelta)}); contextPercent=${usageBeforePercentText} → ${estimatedUsageAfterPercentText} est. (delta=${formatSignedDelta(usageDelta.percentagePointDelta, 1, " pp")}); sessionMessages=${messageDelta}; contextRefresh=pending.`,
             resolved.fromOffPath ? RECOVERY_GUIDANCE.restoredHistory : null,
             nextCue
           ].filter((line) => line !== null).join(`
@@ -210854,9 +210682,9 @@ ${ACM_CORE}`]
         }],
         details: {
           target: params.target,
-          targetId: tid,
+          targetId,
           resolvedBy,
-          resolvedEntryId: tid,
+          resolvedEntryId: targetId,
           rootCount: requestedRoot ? tree.length : null,
           originId,
           originLabel,
@@ -210884,7 +210712,7 @@ ${ACM_CORE}`]
           messagesBefore,
           messagesAfter,
           summaryEntryId,
-          resultingLeafId: branchResult.value.leafAfter,
+          resultingLeafId,
           contextRefreshPending: true,
           contextRefreshState: "pending",
           fromOffPath: resolved.fromOffPath
@@ -210892,90 +210720,17 @@ ${ACM_CORE}`]
       };
     }
   });
-  pi.on("context", (event, ctx) => {
-    const sm = ctx.sessionManager;
-    const bridge = getHostBridge(sm);
-    if (!contextRefresh.isPending(sm)) {
-      const original = event.messages;
-      const fixed = fixOrphanedToolUse(original);
-      const changed = fixed.length !== original.length || fixed.some((message, index) => message !== original[index]);
-      return changed ? { messages: fixed } : undefined;
-    }
-    const reportFailure = (message) => {
-      const willRetry = contextRefresh.recordFailedAttempt(sm, message);
-      const attempt = contextRefresh.getAttemptCount(sm);
-      ctx.ui.notify(willRetry ? `Context refresh after travel failed (${attempt}/${ContextRefreshRegistry.MAX_ATTEMPTS}): ${message}. Will retry on the next LLM turn.` : `Context refresh after travel failed after ${attempt} attempts: ${message}. ${RECOVERY_GUIDANCE.refreshExhausted}`, "warning");
-      return { messages: event.messages };
-    };
-    try {
-      const messagesResult = bridge.buildSessionMessages();
-      if (!messagesResult.ok)
-        return reportFailure(messagesResult.message);
-      let messages = messagesResult.value;
-      if (messages.length === 0) {
-        const fallbackLeafId = refreshTargetLeafIds.get(sm);
-        const fallbackResult = fallbackLeafId ? bridge.buildSessionMessages(fallbackLeafId) : { ok: true, value: [] };
-        messages = fallbackResult.ok ? fallbackResult.value : [];
-      }
-      if (messages.length === 0)
-        return reportFailure("rebuilt messages array is empty");
-      const fixed = fixOrphanedToolUse(messages);
-      contextRefresh.markRebuilt(sm);
-      return { messages: fixed };
-    } catch (e) {
-      return reportFailure(e instanceof Error ? e.message : String(e));
-    }
-  });
-  pi.on("turn_end", (event, ctx) => {
-    const msg = event.message;
-    if (msg.role !== "assistant")
-      return;
-    const usage = msg.usage;
-    if (!usage)
-      return;
-    const promptTokens = (usage.input ?? 0) + (usage.cacheRead ?? 0);
-    const officialUsage = ctx.getContextUsage();
-    const contextWindow = officialUsage?.contextWindow;
-    if (typeof contextWindow === "number" && contextWindow > 0) {
-      cachedUsageMap.set(ctx.sessionManager, { tokens: promptTokens, contextWindow, percent: promptTokens / contextWindow * 100 });
-    }
-  });
-  pi.on("session_before_compact", (event, ctx) => {
-    const sm = ctx.sessionManager;
-    const bridge = getHostBridge(sm);
-    const branch = bridge.getBranch();
-    if (branch.length === 0)
-      return;
-    const labelMaps = bridge.buildLabelMaps();
-    const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-    const checkpointBase = `pre-compact-${ts}`;
-    let checkpointName = checkpointBase;
-    for (let ordinal = 2;labelMaps.labelToEntryId.has(checkpointName); ordinal++) {
-      checkpointName = `${checkpointBase}-${ordinal}`;
-    }
-    const resolve3 = findLastMeaningfulEntry2(branch, event.signal);
-    if (!resolve3.entryId)
-      return;
-    const append = bridge.appendCheckpointLabel(resolve3.entryId, checkpointName);
-    if (!append.ok) {
-      ctx.ui.notify(`Could not create pre-compaction checkpoint: ${append.message}`, "warning");
-    }
-  });
-  pi.on("session_compact", (_event, ctx) => {
-    contextRefresh.clear(ctx.sessionManager);
-    refreshTargetLeafIds.delete(ctx.sessionManager);
-    cachedUsageMap.delete(ctx.sessionManager);
-  });
-  pi.on("session_start", (_event, ctx) => {
-    contextRefresh.clear(ctx.sessionManager);
-    refreshTargetLeafIds.delete(ctx.sessionManager);
-    cachedUsageMap.delete(ctx.sessionManager);
-  });
-  pi.on("session_shutdown", (_event, ctx) => {
-    contextRefresh.clear(ctx.sessionManager);
-    refreshTargetLeafIds.delete(ctx.sessionManager);
-    cachedUsageMap.delete(ctx.sessionManager);
-  });
+}
+
+// src/acm/tools.ts
+function registerAcmExtension(pi, options = {}) {
+  const runtime = new AcmSessionRuntime;
+  if (options.promptInjection !== false)
+    registerAcmPrompt(pi);
+  registerCheckpointTool(pi);
+  registerTimelineTool(pi, runtime);
+  registerTravelTool(pi, runtime);
+  registerAcmLifecycle(pi, runtime);
 }
 
 // src/acm/prompt.ts
@@ -210993,23 +210748,41 @@ Apply each system through its own tools and guidance. A change in one system doe
 var CLOSING_SECTION = `## Closing
 
 Use ACM for semantic boundaries and Magic Context for spent individual outputs. Preserve the current action's exact working detail; archive or reduce only material that action no longer needs.`;
-function composeMagicContextSegments(segments, magicContextSection) {
-  const composed = [...segments];
+function composeIntegratedPromptSegments(segments, magicContextSection) {
+  const composed = ensureAcmCoreSegment([...segments]);
+  if (magicContextSection === null)
+    return composed;
   if (!composed.some((segment) => segment.includes(MAGIC_CONTEXT_FOREWORD_MARKER))) {
     const acmIndex = composed.findIndex((segment) => segment.includes(ACM_CORE_MARKER));
-    const insertionIndex = acmIndex >= 0 ? acmIndex : composed.length;
-    composed.splice(insertionIndex, 0, `${MAGIC_CONTEXT_FOREWORD_MARKER}
+    composed.splice(acmIndex, 0, `${MAGIC_CONTEXT_FOREWORD_MARKER}
 ${FOREWORD_SECTION}`);
   }
   if (!composed.some((segment) => segment.includes(MAGIC_CONTEXT_TAIL_MARKER))) {
     const acmIndex = composed.findIndex((segment) => segment.includes(ACM_CORE_MARKER));
-    const insertionIndex = acmIndex >= 0 ? acmIndex + 1 : composed.length;
-    composed.splice(insertionIndex, 0, `${MAGIC_CONTEXT_TAIL_MARKER}
+    composed.splice(acmIndex + 1, 0, `${MAGIC_CONTEXT_TAIL_MARKER}
 ${magicContextSection}
 
 ${CLOSING_SECTION}`);
   }
   return composed;
+}
+function applyProcessedPromptToSegments(segments, processedPrompt) {
+  const originalPrompt = segments.join(`
+`);
+  if (processedPrompt === originalPrompt)
+    return [...segments];
+  const datePattern = /Today's date: .+/;
+  const originalDate = originalPrompt.match(datePattern)?.[0];
+  const processedDate = processedPrompt.match(datePattern)?.[0];
+  if (!originalDate || !processedDate) {
+    throw new Error("Prompt cache processing changed content outside the sticky date");
+  }
+  const updated = segments.map((segment) => segment.replace(originalDate, processedDate));
+  if (updated.join(`
+`) !== processedPrompt) {
+    throw new Error("Prompt cache processing changed segment structure");
+  }
+  return updated;
 }
 
 // src/index.ts
@@ -211149,8 +210922,8 @@ function resolvePiPressureContextLimit(args) {
     if (overflowState.detectedContextLimit > 0) {
       effectiveContextLimit = effectiveContextLimit > 0 ? Math.min(effectiveContextLimit, overflowState.detectedContextLimit) : overflowState.detectedContextLimit;
     }
-  } catch (err6) {
-    warn("message_end: getOverflowState failed:", err6);
+  } catch (err5) {
+    warn("message_end: getOverflowState failed:", err5);
   }
   return effectiveContextLimit;
 }
@@ -211269,8 +211042,8 @@ async function src_default2(pi) {
   let db;
   try {
     db = openDatabase();
-  } catch (err6) {
-    const message = err6 instanceof Error ? err6.message : String(err6);
+  } catch (err5) {
+    const message = err5 instanceof Error ? err5.message : String(err5);
     warn(`Magic Context (pi) failed to open SQLite store at ${dbPath}: ${message}. ` + "Plugin will not register hooks; storage path is unwritable or corrupt.");
     return;
   }
@@ -211279,8 +211052,8 @@ async function src_default2(pi) {
     return;
   }
   const database = db;
-  runDeferredV22Backfill(db).catch((err6) => {
-    warn(`[v22-backfill] background runner failed: ${err6}`);
+  runDeferredV22Backfill(db).catch((err5) => {
+    warn(`[v22-backfill] background runner failed: ${err5}`);
   });
   setTimeout(() => {
     (async () => {
@@ -211291,8 +211064,8 @@ async function src_default2(pi) {
           sessionId: typeof session?.id === "string" ? session.id : "",
           directory: typeof session?.cwd === "string" ? session.cwd : ""
         })));
-      } catch (err6) {
-        warn(`[session-projects] background runner failed: ${err6}`);
+      } catch (err5) {
+        warn(`[session-projects] background runner failed: ${err5}`);
       }
     })();
   }, 0);
@@ -211307,8 +211080,8 @@ async function src_default2(pi) {
     if (pendingPiMarkerSessions.length > 0) {
       log(`${PREFIX} rehydrated ${pendingPiMarkerSessions.length} Pi deferred compaction marker session(s)`);
     }
-  } catch (err6) {
-    warn(`Magic Context (pi) failed to rehydrate deferred Pi compaction markers: ${err6 instanceof Error ? err6.message : String(err6)}`);
+  } catch (err5) {
+    warn(`Magic Context (pi) failed to rehydrate deferred Pi compaction markers: ${err5 instanceof Error ? err5.message : String(err5)}`);
   }
   info(`loaded v${PLUGIN_VERSION} | harness=omp | db=${dbPath} | ` + `project=${projectIdentity} | dir=${projectDir}`);
   ensureConfigLocationsMigrated(projectDir);
@@ -211437,7 +211210,7 @@ async function src_default2(pi) {
     resolveDreamerEnabled: (ctx) => resolveCurrentProjectDeps(ctx).dreamerEnabled,
     todowriteEnabled
   });
-  tools_default(pi);
+  registerAcmExtension(pi, { promptInjection: false });
   info(todowriteEnabled ? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos" : "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)");
   const readLastTodoState = (sessionId) => getOrCreateSessionMeta(db, sessionId).lastTodoState;
   if (todowriteEnabled) {
@@ -211622,6 +211395,9 @@ async function src_default2(pi) {
     info(bootProjectDeps.dreamerEnabled ? "registered dreamer: DISABLED (no dreamer config)" : "registered dreamer: DISABLED (dreamer.disable=true or no dreamer config)");
   }
   pi.on("before_agent_start", async (event, ctx) => {
+    const originalSystemPromptSegments = Array.isArray(event.systemPrompt) ? [...event.systemPrompt] : [event.systemPrompt];
+    const acmSystemPromptSegments = composeIntegratedPromptSegments(originalSystemPromptSegments, null);
+    const acmPromptChanged = acmSystemPromptSegments.length !== originalSystemPromptSegments.length || acmSystemPromptSegments.some((segment, index) => segment !== originalSystemPromptSegments[index]);
     try {
       if (ctx.hasUI && shouldShowAnnouncement()) {
         const featureText = ANNOUNCEMENT_FEATURES.map((line) => `  • ${line}`).join(`
@@ -211661,16 +211437,16 @@ async function src_default2(pi) {
             gitCommitIndexing: effectiveConfig.memory.git_commit_indexing,
             onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject
           });
-        } catch (err6) {
-          warn("before_agent_start: registerPiDreamerProject threw:", err6);
+        } catch (err5) {
+          warn("before_agent_start: registerPiDreamerProject threw:", err5);
         }
       } else {
         try {
           unregisterPiDreamerProject({
             projectIdentity: currentProject.projectIdentity
           });
-        } catch (err6) {
-          warn("before_agent_start: unregisterPiDreamerProject threw:", err6);
+        } catch (err5) {
+          warn("before_agent_start: unregisterPiDreamerProject threw:", err5);
         }
       }
       const sm = ctx.sessionManager;
@@ -211708,14 +211484,14 @@ async function src_default2(pi) {
         }
       }
       if (effectiveConfig.system_prompt_injection?.enabled === false) {
-        return;
+        return acmPromptChanged ? { systemPrompt: acmSystemPromptSegments } : undefined;
       }
-      const systemPromptSegments = Array.isArray(event.systemPrompt) ? [...event.systemPrompt] : [event.systemPrompt];
+      const systemPromptSegments = acmSystemPromptSegments;
       const systemPromptText = systemPromptSegments.join(`
 `);
       const skipSigs = effectiveConfig.system_prompt_injection?.skip_signatures ?? [];
       if (skipSigs.some((sig) => sig.length > 0 && systemPromptText.includes(sig))) {
-        return;
+        return acmPromptChanged ? { systemPrompt: acmSystemPromptSegments } : undefined;
       }
       const isCacheBusting = sessionId ? hasSystemPromptRefresh(sessionId) : true;
       const block = buildMagicContextBlock({
@@ -211734,13 +211510,12 @@ async function src_default2(pi) {
         isCacheBusting,
         existingSystemPrompt: systemPromptText
       });
-      const composedSegments = block ? composeMagicContextSegments(systemPromptSegments, block) : systemPromptSegments;
+      const composedSegments = composeIntegratedPromptSegments(systemPromptSegments, block);
       const composedPrompt = composedSegments.join(`
 `);
       if (!sessionId) {
-        if (block)
-          return { systemPrompt: composedSegments };
-        return;
+        const promptChanged = composedSegments.length !== originalSystemPromptSegments.length || composedSegments.some((segment, index) => segment !== originalSystemPromptSegments[index]);
+        return promptChanged ? { systemPrompt: composedSegments } : undefined;
       }
       const result = processSystemPromptForCache({
         db,
@@ -211756,10 +211531,12 @@ async function src_default2(pi) {
       if (isCacheBusting) {
         clearSystemPromptRefresh(sessionId);
       }
-      return { systemPrompt: [result.systemPrompt] };
+      return {
+        systemPrompt: applyProcessedPromptToSegments(composedSegments, result.systemPrompt)
+      };
     } catch (error51) {
       warn("failed to build magic-context block:", error51);
-      return;
+      return acmPromptChanged ? { systemPrompt: acmSystemPromptSegments } : undefined;
     }
   });
   info("registered before_agent_start system prompt injector");
@@ -211773,8 +211550,8 @@ async function src_default2(pi) {
         if (sessionId && db)
           maybeDeliverChannel2Pi(pi, db, sessionId);
       }
-    } catch (err6) {
-      log(`agent_end: channel2 delivery skipped: ${String(err6)}`);
+    } catch (err5) {
+      log(`agent_end: channel2 delivery skipped: ${String(err5)}`);
     }
   });
   pi.on("tool_execution_start", async (event, ctx) => {
@@ -211800,8 +211577,8 @@ async function src_default2(pi) {
       } else if (event.toolName === "ctx_note") {
         clearNoteNudgeTriggerAndCooldown(db, sessionId);
       }
-    } catch (err6) {
-      log(`tool_execution_start hook failed (continuing): ${err6 instanceof Error ? err6.message : String(err6)}`);
+    } catch (err5) {
+      log(`tool_execution_start hook failed (continuing): ${err5 instanceof Error ? err5.message : String(err5)}`);
     }
   });
   pi.on("tool_execution_end", async (event, ctx) => {
@@ -211812,8 +211589,8 @@ async function src_default2(pi) {
       if (event.toolName === "ctx_reduce") {
         markPiChannel1Reduced(sessionId, db);
       }
-    } catch (err6) {
-      log(`tool_execution_end hook failed (continuing): ${err6 instanceof Error ? err6.message : String(err6)}`);
+    } catch (err5) {
+      log(`tool_execution_end hook failed (continuing): ${err5 instanceof Error ? err5.message : String(err5)}`);
     }
   });
   pi.on("tool_result", async (event, ctx) => {
@@ -211832,8 +211609,8 @@ async function src_default2(pi) {
       if (!block)
         return;
       return { content: [...event.content, block] };
-    } catch (err6) {
-      log(`tool_result hook failed (continuing): ${err6 instanceof Error ? err6.message : String(err6)}`);
+    } catch (err5) {
+      log(`tool_result hook failed (continuing): ${err5 instanceof Error ? err5.message : String(err5)}`);
     }
   });
   pi.on("session_before_compact", async (_event, ctx) => {
@@ -211852,8 +211629,8 @@ async function src_default2(pi) {
       if (msg !== null && typeof msg === "object") {
         stripTagPrefixFromAssistantMessage(msg);
       }
-    } catch (err6) {
-      warn("message_end: stripTagPrefixFromAssistantMessage threw:", err6);
+    } catch (err5) {
+      warn("message_end: stripTagPrefixFromAssistantMessage threw:", err5);
     }
     try {
       const sm = ctx.sessionManager;
@@ -211903,11 +211680,11 @@ async function src_default2(pi) {
             persist: true
           });
         }
-      } catch (err6) {
-        warn("message_end: synthetic todowrite capture failed:", err6);
+      } catch (err5) {
+        warn("message_end: synthetic todowrite capture failed:", err5);
       }
-    } catch (err6) {
-      warn("message_end: persist session_meta usage failed:", err6);
+    } catch (err5) {
+      warn("message_end: persist session_meta usage failed:", err5);
     }
     try {
       const sm = ctx.sessionManager;
@@ -211929,33 +211706,33 @@ async function src_default2(pi) {
       const modelKey = typeof msg.provider === "string" && typeof msg.model === "string" && msg.provider.length > 0 && msg.model.length > 0 ? `${msg.provider}/${msg.model}` : undefined;
       recordOverflowDetected(db, sessionId, detection.reportedLimit, modelKey);
       log(`[magic-context][${sessionId}] overflow detected: reportedLimit=${detection.reportedLimit ?? "?"} pattern=${detection.matchedPattern ?? "?"}`);
-    } catch (err6) {
-      warn("message_end: overflow detection failed:", err6);
+    } catch (err5) {
+      warn("message_end: overflow detection failed:", err5);
     }
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     const SHUTDOWN_DRAIN_MS = 5000;
     try {
       await withTimeout(awaitInFlightHistorians(), SHUTDOWN_DRAIN_MS);
-    } catch (err6) {
-      warn("shutdown: historian drain threw:", err6);
+    } catch (err5) {
+      warn("shutdown: historian drain threw:", err5);
     }
     try {
       await withTimeout(awaitInFlightRecomps(), SHUTDOWN_DRAIN_MS);
-    } catch (err6) {
-      warn("shutdown: recomp drain threw:", err6);
+    } catch (err5) {
+      warn("shutdown: recomp drain threw:", err5);
     }
     try {
       await withTimeout(awaitInFlightDreamers(), SHUTDOWN_DRAIN_MS);
-    } catch (err6) {
-      warn("shutdown: dreamer drain threw:", err6);
+    } catch (err5) {
+      warn("shutdown: dreamer drain threw:", err5);
     }
     try {
       for (const identity of seenDreamerProjectIdentities) {
         unregisterPiDreamerProject({ projectIdentity: identity });
       }
-    } catch (err6) {
-      warn("shutdown: unregisterPiDreamerProject threw:", err6);
+    } catch (err5) {
+      warn("shutdown: unregisterPiDreamerProject threw:", err5);
     }
     try {
       const sm = ctx.sessionManager;

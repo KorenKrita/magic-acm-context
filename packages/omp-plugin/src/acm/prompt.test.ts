@@ -1,95 +1,86 @@
 import { describe, expect, test } from "bun:test";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { z } from "zod";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { ACM_CORE, ACM_CORE_MARKER } from "./generated-guidance";
 import {
 	CLOSING_SECTION,
 	FOREWORD_SECTION,
 	MAGIC_CONTEXT_FOREWORD_MARKER,
 	MAGIC_CONTEXT_TAIL_MARKER,
-	composeMagicContextSegments,
+	applyProcessedPromptToSegments,
+	composeIntegratedPromptSegments,
 } from "./prompt";
-import registerACMExtension from "./tools";
 
-interface BeforeAgentStartEvent {
-	type: "before_agent_start";
-	prompt: string;
-	systemPrompt: string[];
-}
+const repositoryRoot = fileURLToPath(new URL("../../../../", import.meta.url));
 
-type BeforeAgentStartHandler = (
-	event: BeforeAgentStartEvent,
-	ctx: unknown,
-) => Promise<{ systemPrompt: string[] } | undefined> | { systemPrompt: string[] } | undefined;
-
-function captureACMHandler(): BeforeAgentStartHandler {
-	const handlers: BeforeAgentStartHandler[] = [];
-	const pi = {
-		zod: z,
-		on(name: string, handler: BeforeAgentStartHandler) {
-			if (name === "before_agent_start") handlers.push(handler);
-		},
-		registerTool() {},
-	};
-	// The fixture supplies the narrow ExtensionAPI surface exercised during registration.
-	registerACMExtension(pi as unknown as ExtensionAPI);
-	const handler = handlers[0];
-	expect(handler).toBeDefined();
-	return handler!;
-}
-
-async function applyHandler(
-	handler: BeforeAgentStartHandler,
-	segments: string[],
-): Promise<string[]> {
-	const result = await handler(
-		{ type: "before_agent_start", prompt: "go", systemPrompt: segments },
-		{},
-	);
-	return result?.systemPrompt ?? segments;
-}
-
-describe("integrated ACM prompt composition", () => {
-	test("keeps canonical injection composable before and after unrelated handlers", async () => {
-		const acmHandler = captureACMHandler();
-		const otherBefore: BeforeAgentStartHandler = (event) => ({
-			systemPrompt: [...event.systemPrompt, "other-before"],
-		});
-		const otherAfter: BeforeAgentStartHandler = (event) => ({
-			systemPrompt: [...event.systemPrompt, "other-after"],
-		});
-
-		let segments = ["base"];
-		segments = await applyHandler(otherBefore, segments);
-		segments = await applyHandler(acmHandler, segments);
-		segments = await applyHandler(otherAfter, segments);
-		segments = await applyHandler(acmHandler, segments);
-
-		expect(segments).toEqual([
-			"base",
-			"other-before",
-			`${ACM_CORE_MARKER}\n${ACM_CORE}`,
-			"other-after",
-		]);
+describe("single-owner ACM prompt composition", () => {
+	test("adds canonical CORE exactly once even when Magic Context injection is disabled", () => {
+		const first = composeIntegratedPromptSegments(["base"], null);
+		const second = composeIntegratedPromptSegments(first, null);
+		expect(first).toEqual(["base", `${ACM_CORE_MARKER}\n${ACM_CORE}`]);
+		expect(second).toEqual(first);
 	});
 
-	test("wraps the canonical ACM segment with Magic Context-owned material only", () => {
-		const acmSegment = `${ACM_CORE_MARKER}\n${ACM_CORE}`;
-		const input = ["base", "other-before", acmSegment, "other-after"];
-		const composed = composeMagicContextSegments(input, "## Magic Context\nMC guidance");
-
+	test("wraps canonical CORE while preserving unrelated segment boundaries", () => {
+		const input = ["base", "other-before", "other-after"];
+		const composed = composeIntegratedPromptSegments(
+			input,
+			"## Magic Context\nMC guidance",
+		);
 		expect(composed).toEqual([
 			"base",
 			"other-before",
-			`${MAGIC_CONTEXT_FOREWORD_MARKER}\n${FOREWORD_SECTION}`,
-			acmSegment,
-			`${MAGIC_CONTEXT_TAIL_MARKER}\n## Magic Context\nMC guidance\n\n${CLOSING_SECTION}`,
 			"other-after",
+			`${MAGIC_CONTEXT_FOREWORD_MARKER}\n${FOREWORD_SECTION}`,
+			`${ACM_CORE_MARKER}\n${ACM_CORE}`,
+			`${MAGIC_CONTEXT_TAIL_MARKER}\n## Magic Context\nMC guidance\n\n${CLOSING_SECTION}`,
 		]);
-		expect(composeMagicContextSegments(composed, "## Magic Context\nMC guidance")).toEqual(
-			composed,
-		);
+		expect(
+			composeIntegratedPromptSegments(composed, "## Magic Context\nMC guidance"),
+		).toEqual(composed);
 		for (const segment of input) expect(composed).toContain(segment);
 		expect(composed.join("\n").split(ACM_CORE_MARKER)).toHaveLength(2);
+	});
+
+	test("applies sticky-date processing without flattening segments", () => {
+		const segments = [
+			"base",
+			"Today's date: 2026-07-12",
+			`${ACM_CORE_MARKER}\n${ACM_CORE}`,
+		];
+		const processed = segments.join("\n").replace(
+			"Today's date: 2026-07-12",
+			"Today's date: 2026-07-11",
+		);
+		expect(applyProcessedPromptToSegments(segments, processed)).toEqual([
+			"base",
+			"Today's date: 2026-07-11",
+			`${ACM_CORE_MARKER}\n${ACM_CORE}`,
+		]);
+		expect(() =>
+			applyProcessedPromptToSegments(segments, `${processed}\nunexpected`),
+		).toThrow("changed segment structure");
+	});
+});
+
+describe("consumer ACM ownership", () => {
+	test("registers one prompt owner while disabling canonical prompt registration", () => {
+		const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+		expect(source.match(/pi\.on\("before_agent_start"/g)).toHaveLength(1);
+		expect(source).toContain("registerACMExtension(pi, { promptInjection: false })");
+		expect(source).toContain("composeIntegratedPromptSegments");
+	});
+
+	test("scheduled OMP sync uses only the canonical manifest publisher", () => {
+		const workflow = readFileSync(
+			`${repositoryRoot}/.github/workflows/sync-mc.yml`,
+			"utf8",
+		);
+		expect(workflow).not.toContain("scripts/sync-acm.sh");
+		expect(workflow).not.toContain("inject-acm.mjs");
+		expect(workflow).toContain("/tmp/omp-context/scripts/sync-acm.mjs");
+		expect(workflow).toContain("--verify-only");
+		expect(readFileSync(`${repositoryRoot}/scripts/omp-integration.patch`, "utf8"))
+			.toContain("registerACMExtension(pi, { promptInjection: false })");
 	});
 });

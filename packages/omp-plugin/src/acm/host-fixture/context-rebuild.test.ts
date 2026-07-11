@@ -7,7 +7,7 @@ import type {
   ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import * as zod from "zod/v4";
-import registerACMExtension from "./.acm-build/index.js";
+import registerACMExtension from "./.acm-build/tools.js";
 import { RECOVERY_GUIDANCE } from "./.acm-build/generated-guidance.js";
 import { useHostSessionHarnesses } from "./harness.js";
 const VALID_HANDOFF = [

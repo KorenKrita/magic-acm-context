@@ -1,3 +1,4 @@
+import { ensureAcmCoreSegment } from "./prompt-registration";
 import { ACM_CORE_MARKER } from "./generated-guidance";
 
 export const MAGIC_CONTEXT_FOREWORD_MARKER =
@@ -18,25 +19,20 @@ export const CLOSING_SECTION = `## Closing
 
 Use ACM for semantic boundaries and Magic Context for spent individual outputs. Preserve the current action's exact working detail; archive or reduce only material that action no longer needs.`;
 
-/**
- * Compose Magic Context-owned prompt segments around the canonical ACM CORE.
- * Existing segments are copied byte-for-byte and retain their relative order.
- */
-export function composeMagicContextSegments(
+/** The single consumer-owned prompt composition seam. */
+export function composeIntegratedPromptSegments(
 	segments: readonly string[],
-	magicContextSection: string,
+	magicContextSection: string | null,
 ): string[] {
-	const composed = [...segments];
+	const composed = ensureAcmCoreSegment([...segments]);
+	if (magicContextSection === null) return composed;
 
-	if (
-		!composed.some((segment) => segment.includes(MAGIC_CONTEXT_FOREWORD_MARKER))
-	) {
+	if (!composed.some((segment) => segment.includes(MAGIC_CONTEXT_FOREWORD_MARKER))) {
 		const acmIndex = composed.findIndex((segment) =>
 			segment.includes(ACM_CORE_MARKER),
 		);
-		const insertionIndex = acmIndex >= 0 ? acmIndex : composed.length;
 		composed.splice(
-			insertionIndex,
+			acmIndex,
 			0,
 			`${MAGIC_CONTEXT_FOREWORD_MARKER}\n${FOREWORD_SECTION}`,
 		);
@@ -46,13 +42,31 @@ export function composeMagicContextSegments(
 		const acmIndex = composed.findIndex((segment) =>
 			segment.includes(ACM_CORE_MARKER),
 		);
-		const insertionIndex = acmIndex >= 0 ? acmIndex + 1 : composed.length;
 		composed.splice(
-			insertionIndex,
+			acmIndex + 1,
 			0,
 			`${MAGIC_CONTEXT_TAIL_MARKER}\n${magicContextSection}\n\n${CLOSING_SECTION}`,
 		);
 	}
-
 	return composed;
+}
+
+/** Preserve segment boundaries when cache processing freezes only the sticky date. */
+export function applyProcessedPromptToSegments(
+	segments: readonly string[],
+	processedPrompt: string,
+): string[] {
+	const originalPrompt = segments.join("\n");
+	if (processedPrompt === originalPrompt) return [...segments];
+	const datePattern = /Today's date: .+/;
+	const originalDate = originalPrompt.match(datePattern)?.[0];
+	const processedDate = processedPrompt.match(datePattern)?.[0];
+	if (!originalDate || !processedDate) {
+		throw new Error("Prompt cache processing changed content outside the sticky date");
+	}
+	const updated = segments.map((segment) => segment.replace(originalDate, processedDate));
+	if (updated.join("\n") !== processedPrompt) {
+		throw new Error("Prompt cache processing changed segment structure");
+	}
+	return updated;
 }

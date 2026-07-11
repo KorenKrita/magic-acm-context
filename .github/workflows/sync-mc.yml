@@ -35,16 +35,26 @@ jobs:
       - name: Sync MC packages
         run: ./scripts/sync-mc.sh /tmp/magic-context
 
-      - name: Sync ACM code
-        run: ./scripts/sync-acm.sh /tmp/pi-context /tmp/omp-context
+      - name: Sync Pi ACM code
+        run: ./scripts/sync-pi-acm.sh /tmp/pi-context
+
+      - name: Publish canonical OMP ACM surface
+        run: |
+          bun /tmp/omp-context/scripts/sync-acm.mjs \
+            --canonical-root /tmp/omp-context \
+            --consumer-root "$GITHUB_WORKSPACE"
+          bun /tmp/omp-context/scripts/sync-acm.mjs \
+            --canonical-root /tmp/omp-context \
+            --consumer-root "$GITHUB_WORKSPACE" \
+            --verify-only
 
       - name: Install dependencies
         run: bun install
 
-      - name: Rebuild dist (includes ACM)
+      - name: Verify and rebuild plugins
         run: |
           cd packages/pi-plugin && bun run build && cd -
-          cd packages/omp-plugin && bun run build && cd -
+          cd packages/omp-plugin && bun run verify:acm && bun run build && cd -
 
       - name: Check for changes
         id: changes
@@ -72,7 +82,7 @@ jobs:
             - [pi-context](https://github.com/KorenKrita/pi-context) `main`
             - [omp-context](https://github.com/KorenKrita/omp-context) `main`
 
-            ACM glue code (import + registration + prompt.ts) is preserved automatically.
+            OMP ACM is published only through omp-context's declarative manifest; the consumer integration patch is checked before application.
 
             Please verify:
             - [ ] `bun install`
