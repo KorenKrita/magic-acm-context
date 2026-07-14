@@ -88,7 +88,6 @@ All commands trigger `triggerTurn: false` (never sent to the LLM):
 
 | Command | What it does |
 |---|---|
-| `/context` | Open the interactive context-usage grid and token-category breakdown |
 | `/ctx-status` | Live token breakdown + queued ops + cache state |
 | `/ctx-flush` | Force-process pending ops queue |
 | `/ctx-recomp` | Rebuild compartments from raw history (heavy operation) |

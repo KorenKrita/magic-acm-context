@@ -80,8 +80,7 @@ import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { log } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
-import registerACMExtension from "./acm/tools";
-import { registerContextCommand } from "./commands/context";
+
 import {
 	type PiSidekickConfig,
 	registerCtxAugCommand,
@@ -144,6 +143,7 @@ import {
 } from "./system-prompt";
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools } from "./tools";
+import registerACMExtension from "./acm/tools";
 import {
 	parseTodos,
 	registerTodoOverlay,
@@ -925,15 +925,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		todowriteEnabled,
 	});
-	// Register ACM tools (acm_checkpoint, acm_timeline, acm_travel) and the
-	// interactive context-usage visualization inherited from pi-context.
+	// Register ACM tools (acm_checkpoint, acm_timeline, acm_travel)
 	registerACMExtension(pi);
-	registerContextCommand(pi);
 
 	info(
 		todowriteEnabled
-			? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos and /context"
-			: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce; registered /context (todowrite disabled)",
+			? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos"
+			: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
 	);
 
 	const readLastTodoState = (sessionId: string) =>
